@@ -1,5 +1,7 @@
 # API reference
 
+*Independent implementation of the documented System One wire format — not affiliated with TypeSafe.*
+
 Everything below is importable from the package root:
 
 ```python

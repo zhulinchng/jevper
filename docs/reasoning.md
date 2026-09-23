@@ -1,5 +1,7 @@
 # Reasoning
 
+*Independent implementation of the documented System One wire format — not affiliated with TypeSafe.*
+
 `reasoning=ReasoningConfig(...)` asks the model to think before it commits to an answer. There are two ways to
 get that, and the config's `mode` decides which one is used.
 

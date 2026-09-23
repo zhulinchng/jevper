@@ -1,5 +1,7 @@
 # Internals
 
+*Independent implementation of the documented System One wire format — not affiliated with TypeSafe.*
+
 ## Module map
 
 | Module | Responsibility |

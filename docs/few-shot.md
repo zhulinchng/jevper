@@ -1,5 +1,7 @@
 # Few-shot examples
 
+*Independent implementation of the documented System One wire format — not affiliated with TypeSafe.*
+
 A few-shot example is rendered as a chat turn pair: a `user` turn holding the example state plus the same
 question block the real call uses, then an `assistant` turn holding the answer in the format the active method
 expects. Because the demonstration goes through the same renderers as the real call, the model sees exactly the

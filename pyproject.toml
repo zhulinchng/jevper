@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "jevper"
 version = "0.1.0"
-description = "Jev/System One classification over any OpenAI-like client: probabilities and confidence instead of prose"
+description = "The Jev (System One) interface over any OpenAI-compatible model: noul, choice and score questions in one call"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"

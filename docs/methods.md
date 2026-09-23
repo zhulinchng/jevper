@@ -1,5 +1,7 @@
 # Methods
 
+*Independent implementation of the documented System One wire format — not affiliated with TypeSafe.*
+
 `method=` picks how the model is asked to decide, and how its answer is turned back into a distribution. All
 four methods share the same label machinery: options are labelled `A`, `B`, `C`, … in criteria order, and
 `label_to_key` maps a label back to the option key (`Choice`), the zero-based level index (`Score`) or `True`/

@@ -477,7 +477,7 @@ class _BaseClient:
 
 
 class SystemOneClient(_BaseClient):
-    """Blocking Jev-shaped client over any OpenAI-like client object.
+    """Blocking Jev-shaped client over any OpenAI-compatible client object.
 
     ``method`` selects how the decision is elicited; ``api`` selects the surface (auto-detected by
     default). ``examples`` provides few-shot demonstrations for every question in the call, and each

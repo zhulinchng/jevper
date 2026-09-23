@@ -1,4 +1,7 @@
-"""jevper — a Jev-shaped (TypeSafe System One) classification wrapper over OpenAI-like clients."""
+"""jevper — the Jev (System One) interface over any OpenAI-compatible client.
+
+Independent implementation of the documented System One wire format; not affiliated with TypeSafe.
+"""
 
 from __future__ import annotations
 

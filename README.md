@@ -1,16 +1,18 @@
 # jevper
 
-Ask a language model for a label and you get prose back. Ask through `jevper` and you get numbers instead: a
-probability for every option, and a confidence for the decision. You send a `state` plus typed `questions`
-(`noul` = yes/no, `choice` = pick one of your options, `score` = rate on an ordered scale) and read the answer
-as a distribution.
+The [Jev](https://docs.typesafe.ai) interface — `state` in, typed `questions` (`noul`, `choice`, `score`) out,
+answers carrying probabilities and confidence — on top of any OpenAI-compatible model.
 
-That distribution is the shape the [Jev](https://docs.typesafe.ai) (TypeSafe System One) API returns, so code
-written against the hosted API can swap in `jevper` and run against any OpenAI-compatible endpoint.
+Same call as `typesafe-sdk`, different backend: point `jevper` at a hosted LLM or a self-hosted llama.cpp
+server and code written for Jev keeps working, unchanged.
 
 It does not call the hosted TypeSafe API and does not depend on `typesafe-sdk` or `openai` at runtime — the
 client object is duck-typed. Any object exposing `responses.create` or `chat.completions.create` works,
 including a self-hosted llama.cpp server.
+
+> `jevper` is an independent implementation of the documented System One wire format. It is not affiliated
+> with, endorsed by, or supported by TypeSafe AI — questions about the API itself belong in
+> [their docs](https://docs.typesafe.ai).
 
 ```python
 from openai import OpenAI
