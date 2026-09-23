@@ -715,3 +715,83 @@ def test_status_carried_on_the_response_is_read():
     with pytest.raises(ProviderError) as error:
         permanent.system_one(state="s", questions=question)
     assert len(error.value.attempts) == 1
+
+
+def test_discrete_readout_prefers_an_exact_key_over_a_label(stub_server):
+    """A model that echoes the option key must not have it read as the first label."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps({"choice": "a"}))))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="discrete", api="chat_completions"
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria={"b": None, "a": None})})
+
+    assert response.answers["q"].choice == "a"
+
+
+def test_per_call_reasoning_must_be_a_config(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    with pytest.raises(JevperError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}, reasoning="native")
+
+    assert "reasoning must be a ReasoningConfig" in str(error.value)
+    assert stub.requests == []
+
+
+def test_extra_body_and_headers_must_be_mappings():
+    with pytest.raises(JevperError) as error:
+        SystemOneClient(object(), model="m", extra_body=["provider", "flags"])
+    assert "extra_body must be a mapping" in str(error.value)
+
+    with pytest.raises(JevperError) as error:
+        SystemOneClient(object(), model="m", extra_headers=["Authorization: nope"])
+    assert "extra_headers must be a mapping" in str(error.value)
+
+
+def test_retry_policy_rejects_non_finite_delays():
+    with pytest.raises(JevperError) as error:
+        SystemOneClient(object(), model="m", retry=RetryPolicy(base_delay=float("nan")))
+    assert "finite" in str(error.value)
+
+    with pytest.raises(JevperError):
+        SystemOneClient(object(), model="m", retry=RetryPolicy(max_delay=float("inf")))
+
+
+def test_a_huge_retry_count_does_not_overflow_the_backoff():
+    """``3**attempt`` overflows a float past attempt 646: the backoff has to cap, not raise."""
+    client = SystemOneClient(
+        RaisingClient(StatusError(503)),
+        model="m",
+        method="discrete",
+        api="chat_completions",
+        retry=RetryPolicy(n_retries=648, base_delay=0.0, max_delay=0.0),
+    )
+
+    with pytest.raises(ProviderError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert len(error.value.attempts) == 649  # 648 retries past the point the old arithmetic raised
+
+
+def test_label_methods_reject_a_single_alternative():
+    with pytest.raises(JevperError) as error:
+        SystemOneClient(object(), model="m", method="logprobs", top_logprobs=1)
+    assert "at least 2" in str(error.value)
+
+    # auto answers in JSON when logprobs are unusable, so one alternative is only fatal when pinned.
+    SystemOneClient(object(), model="m", method="auto", top_logprobs=1)
+
+
+def test_a_per_call_method_cannot_ask_for_one_alternative(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", top_logprobs=1
+    )
+
+    with pytest.raises(JevperError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}, method="logprobs")
+
+    assert "at least 2" in str(error.value)
+    assert stub.requests == []

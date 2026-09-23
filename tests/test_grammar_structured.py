@@ -10,13 +10,16 @@ from fakes import chat_body, openai_client, responses_body
 
 from jevper import (
     Choice,
+    Example,
     LabelReadoutError,
     MalformedAnswerError,
     Noul,
+    ReasoningConfig,
     Score,
     SystemOneClient,
     UnsupportedMethodError,
 )
+from jevper.prompts import STRUCTURED_ANSWER_CUE, STRUCTURED_SYSTEM_PROMPT
 
 CHOICE_LOGS = [("A", -0.12), ("B", -2.47), ("C", -3.48)]
 CRITERIA = {"billing": None, "technical": None, "sales": None}
@@ -329,3 +332,83 @@ def test_grammar_without_logprobs_spends_no_corrective_retry(stub_server):
 
     assert "grammar mode needs logprobs in the response" in str(error.value)
     assert len(stub.bodies("/chat/completions")) == 1
+
+
+def test_discrete_asks_for_the_json_object_it_reads(stub_server):
+    """The discrete schema is a JSON object, so the prompt, the demonstrations and the cue all say JSON."""
+
+    def script(body):
+        if "response_format" not in body:
+            return 200, chat_body(content="The options differ in what the customer is asking about.")
+        payload = {
+            "jevper_choice": {"choice": "A"},
+            "jevper_noul": {"noul": True},
+            "jevper_score": {"score": 0},
+        }[body["response_format"]["json_schema"]["name"]]
+        return 200, chat_body(content=json.dumps(payload))
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="discrete",
+        api="chat_completions",
+        reasoning=ReasoningConfig(mode="two_step"),
+    )
+
+    response = client.system_one(
+        state="s",
+        questions={
+            "intent": Choice(
+                criteria=CRITERIA, examples=[Example(state="duplicate charge", answer="billing")]
+            ),
+            "verdict": Noul(examples=[Example(state="clear yes", answer=True)]),
+            "anger": Score(criteria=["Calm", "Frustrated"], examples=[Example(state="very calm", answer=0)]),
+        },
+    )
+
+    answers = [body for body in stub.bodies("/chat/completions") if "response_format" in body]
+    assert len(answers) == 3
+    for body in answers:
+        assert body["messages"][0]["content"] == STRUCTURED_SYSTEM_PROMPT
+        assert body["messages"][-1] == {"role": "user", "content": STRUCTURED_ANSWER_CUE}
+    demonstrated = {
+        message["content"]
+        for body in answers
+        for message in body["messages"]
+        if message["role"] == "assistant" and message["content"].startswith("{")
+    }
+    assert demonstrated == {'{"choice": "A"}', '{"noul": true}', '{"score": 0}'}
+    assert response.answers["intent"].choice == "billing"
+    assert response.answers["verdict"].noul == 1.0
+    assert response.answers["anger"].score == 0.0
+
+
+def test_schemas_bound_probabilities(stub_server):
+    """A schema-valid answer is always a readable one, so a bad number costs no corrective retry."""
+    stub = stub_server(
+        chat=lambda _: (
+            200,
+            chat_body(content=json.dumps({"probabilities": {"billing": 1.0, "technical": 0.0, "sales": 0.0}})),
+        )
+    )
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions"
+    )
+
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    schema = stub.bodies("/chat/completions")[0]["response_format"]["json_schema"]["schema"]
+    assert schema["properties"]["probabilities"]["properties"] == {
+        key: {"type": "number", "minimum": 0} for key in CRITERIA
+    }
+
+    noul_stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps({"noul": 1.0}))))
+    noul = SystemOneClient(
+        openai_client(noul_stub), model="stub", method="structured", api="chat_completions"
+    )
+
+    noul.system_one(state="s", questions={"q": Noul()})
+
+    noul_schema = noul_stub.bodies("/chat/completions")[0]["response_format"]["json_schema"]["schema"]
+    assert noul_schema["properties"]["noul"] == {"type": "number", "minimum": 0, "maximum": 1}

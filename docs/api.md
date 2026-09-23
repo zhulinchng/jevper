@@ -31,7 +31,7 @@ caller (`close()` only shuts down jevper's own thread pool).
 | `examples` | `()` | Default few-shot examples: a sequence for all questions, or a mapping keyed by question id |
 | `structured_outputs` | `True` | Send a strict `json_schema` response format; `False` falls back to `{"type": "json_object"}` with the schema left in the prompt |
 | `normalize_probabilities` | `True` | Rescale `structured` distributions that are off by more than `1e-6`; `False` returns the model's numbers verbatim |
-| `top_logprobs` | `20` | Requested alternatives for `logprobs`/`grammar`; must be in `[0, 20]` |
+| `top_logprobs` | `20` | Requested alternatives for `logprobs`/`grammar`; must be in `[0, 20]`, and at least 2 when the method is pinned to `logprobs`/`grammar` — the sampled token alone is not a distribution |
 | `max_concurrency` | `8` | Questions in flight at once (thread pool, or asyncio semaphore) |
 | `n_retry_malformed` | `1` | Corrective retries when an answer cannot be read |
 | `retry` | `None` | Transient-failure retries; `RetryPolicy()` (2 retries, 0.5s base, 8s cap) when unset |
@@ -39,9 +39,10 @@ caller (`close()` only shuts down jevper's own thread pool).
 | `extra_body` | `None` | Merged into every request body (the grammar field is merged here too) |
 | `extra_headers` | `None` | Sent with every request |
 
-Constructor validation is eager: an unknown `method`/`api`, `top_logprobs` outside `[0, 20]`,
-`max_concurrency < 1`, a negative `n_retry_malformed`, a non-`ReasoningConfig` `reasoning`, a `retry` that is
-not a `RetryPolicy` or has a negative field raises `JevperError`.
+Constructor validation is eager: an unknown `method`/`api`, `top_logprobs` outside `[0, 20]` or below 2 with a
+pinned `logprobs`/`grammar`, `max_concurrency < 1`, a negative `n_retry_malformed`, a non-`ReasoningConfig`
+`reasoning`, a `retry` that is not a `RetryPolicy` or has a negative or non-finite field, and an `extra_body` or
+`extra_headers` that is not a mapping all raise `JevperError`.
 
 ### `system_one`
 
@@ -63,7 +64,9 @@ system_one(*, state, questions, examples=(), model=None, method=None, api=None, 
 
 Per-call values win over constructor defaults. Everything is resolved and validated before the first provider
 call, so a bad question, an empty `questions` mapping, an unusable `state`, or `grammar` on the Responses
-surface costs zero requests.
+surface costs zero requests. The same holds for a per-call `reasoning` that is not a `ReasoningConfig` and a
+per-call `method` of `logprobs`/`grammar` with `top_logprobs` below 2, and for an example whose `answer` or
+`probabilities` do not fit its question.
 
 `state` forms:
 
@@ -205,10 +208,12 @@ class in its MRO — contains `Connection` or
 `Timeout`, or is an `httpx`-family transport failure (`TransportError`, `TimeoutException`). That last clause
 is what covers `httpx.ConnectError`, `ReadError` and `RemoteProtocolError`, whose names carry neither marker;
 a client-side `LocalProtocolError` is not retried. The delay before retry
-`n` is `min(base_delay · 3ⁿ, max_delay)` (so 0.5s, 1.5s, … by default). Anything else — and a transient
+`n` is `min(base_delay · 3ⁿ, max_delay)` (so 0.5s, 1.5s, … by default). That backoff is the only thing that
+shapes the wait: the `Retry-After` and `X-RateLimit-*` headers a 429 carries are *not* read, even though
+providers such as OpenRouter recommend honoring them. Anything else — and a transient
 failure with the retries exhausted — is raised as `ProviderError` carrying `.attempts` and `.status_code`. A
-`RetryPolicy` with a negative field, or a `retry` that is not a `RetryPolicy`, raises `JevperError` at
-construction.
+`RetryPolicy` with a negative or non-finite field (`NaN`, `inf`), or a `retry` that is not a `RetryPolicy`,
+raises `JevperError` at construction.
 
 ## `ReasoningConfig`
 
@@ -241,7 +246,9 @@ The provider-side logprob failures — a rejected logprob request, no logprobs a
 answer token — are raised as `_LogprobsUnavailable`, a private `LabelReadoutError` subclass. It is private
 because `method="auto"` is the only thing that reads it: its `capability` attribute records whether the failure
 is evidence about the provider (`True`, which `auto` remembers) or a bad minute (`False`, which it does not).
-Catch the public `LabelReadoutError`.
+Catch the public `LabelReadoutError`. `capability=True` from a rejection is remembered at once; the same verdict
+read out of an answer that carried no usable logprobs needs a second one, because a single anomalous response is
+not evidence about the provider — [`internals.md`](internals.md#invariants) has the rule.
 
 ## Constants
 

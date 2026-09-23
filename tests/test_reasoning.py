@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from typing import Any
+
 import pytest
 from fakes import chat_body, openai_client, reasoning_item, responses_body
 
@@ -181,3 +184,73 @@ def test_two_step_falls_back_to_reasoning_text_when_the_analysis_is_silent(stub_
     # the provider's own item carries the trace: no synthetic part, so no duplicated text
     assert len(response.reasoning) == 1
     assert reasoning_text(response.reasoning) == TRACE
+
+
+def test_a_null_reasoning_payload_does_not_cost_the_answer(stub_server):
+    """Null reasoning fields are the provider's business; the answer is still right there."""
+    empty = reasoning_item("dropped")
+    empty["summary"] = None
+    empty["content"] = None
+    partial = reasoning_item("kept summary")
+    partial["content"] = None
+    stub = stub_server(
+        responses=lambda _: (
+            200,
+            responses_body(text="A", logprobs=CHOICE_LOGS, reasoning=[empty, partial]),
+        )
+    )
+    client = SystemOneClient(openai_client(stub), model="stub", api="responses")
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+    # A null field is emptied, not fatal: the summary that came with it is still read.
+    assert reasoning_text(response.reasoning) == "kept summary"
+
+
+def test_an_unreadable_reasoning_part_is_skipped(stub_server):
+    """One malformed part among readable ones is dropped, not fatal."""
+    body = chat_body(content="A", logprobs=CHOICE_LOGS)
+    body["choices"][0]["message"]["reasoning"] = [
+        {"type": "reasoning", "summary": [{"type": "summary_text"}]},  # a summary_text without its text
+        {"type": "reasoning", "summary": None, "content": None},  # null fields
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "kept"}]},
+    ]
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+    assert reasoning_text(response.reasoning) == "kept"
+
+
+def test_a_reasoning_part_without_a_dict_is_skipped():
+    """A duck-typed client can return parts that are neither mappings nor pydantic models."""
+
+    class SlotsPart:
+        __slots__ = ("summary", "type")
+
+        def __init__(self) -> None:
+            self.type = "reasoning"
+            self.summary = None
+
+    class ObjectClient:
+        def __init__(self) -> None:
+            part = SlotsPart()
+
+            class Completions:
+                def create(self, **kwargs: Any) -> Any:
+                    message = SimpleNamespace(content='{"choice": "A"}', reasoning=[part])
+                    return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=None)
+
+            class Chat:
+                completions = Completions()
+
+            self.chat = Chat()
+
+    client = SystemOneClient(ObjectClient(), model="m", method="discrete", api="chat_completions")
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"

@@ -23,7 +23,11 @@ MAX_CHOICE_OPTIONS = 255  # Jev API limit
 
 
 def labels_for(count: int) -> tuple[str, ...]:
-    """Labels for ``count`` options: ``A``..``Z``, then two letters (``AA``, ``AB``, ...)."""
+    """Labels for ``count`` options: ``A``..``Z`` up to 26, then two letters from ``AA`` onwards.
+
+    Past 26 options *every* label is two letters — 27 options are ``AA``..``AZ`` and ``BA``, never
+    ``A``..``Z`` plus ``AA`` — so a label readout cannot be confused by a prefix.
+    """
     if not 0 <= count <= MAX_LABEL_OPTIONS**2:
         raise InvalidQuestionError(
             f"labels_for supports 0..{MAX_LABEL_OPTIONS**2} options, got {count}"

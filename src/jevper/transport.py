@@ -148,12 +148,45 @@ def _get(obj: Any, name: str, default: Any = None) -> Any:
 
 
 def _as_mapping(obj: Any) -> dict[str, Any]:
+    """Best-effort mapping view of a provider object; an unreadable object maps to nothing."""
     if isinstance(obj, Mapping):
         return dict(obj)
     dump = getattr(obj, "model_dump", None)
     if callable(dump):
         return dump()
-    return dict(vars(obj))
+    try:
+        return dict(vars(obj))
+    except TypeError:
+        # Objects with __slots__ and plain scalars have no __dict__.
+        return {}
+
+
+def _reasoning_part(obj: Any) -> ReasoningContentPart | None:
+    """One reasoning part, or ``None`` when the provider sent something unreadable.
+
+    Reasoning is decoration: a null ``summary``/``content``, or a part that is not a reasoning item at
+    all, must never cost the caller an answer that is otherwise right there.
+    """
+    payload = _as_mapping(obj)
+    for name in ("summary", "content"):
+        if payload.get(name) is None and name in payload:
+            payload[name] = []
+    try:
+        return ReasoningContentPart.model_validate(payload)
+    except ValueError:
+        return None
+
+
+def _reasoning_parts(items: Any) -> tuple[ReasoningContentPart, ...]:
+    """The readable reasoning parts of a provider list, skipping everything else."""
+    parts = []
+    for item in items or ():
+        if _get(item, "type") != "reasoning":
+            continue
+        part = _reasoning_part(item)
+        if part is not None:
+            parts.append(part)
+    return tuple(parts)
 
 
 def _token_logprobs(logprobs: Any) -> tuple[TokenLogprob, ...]:
@@ -203,22 +236,12 @@ def _chat_reasoning(message: Any) -> tuple[ReasoningContentPart, ...]:
         if isinstance(value, str) and value.strip():
             return (ReasoningContentPart(content=[ReasoningTextPart(text=value)]),)
         if isinstance(value, (list, tuple)) and value:
-            parts = [
-                ReasoningContentPart.model_validate(_as_mapping(part))
-                for part in value
-                if _get(part, "type") == "reasoning"
-            ]
+            parts = _reasoning_parts(value)
             if parts:
-                return tuple(parts)
+                return parts
     content = _get(message, "content")
     if isinstance(content, (list, tuple)):
-        parts = [
-            ReasoningContentPart.model_validate(_as_mapping(part))
-            for part in content
-            if _get(part, "type") == "reasoning"
-        ]
-        if parts:
-            return tuple(parts)
+        return _reasoning_parts(content)
     return ()
 
 
@@ -289,11 +312,7 @@ def _responses_token_logprobs(response: Any) -> tuple[TokenLogprob, ...]:
 
 
 def _responses_reasoning(response: Any) -> tuple[ReasoningContentPart, ...]:
-    parts = []
-    for item in _get(response, "output") or []:
-        if _get(item, "type") == "reasoning":
-            parts.append(ReasoningContentPart.model_validate(_as_mapping(item)))
-    return tuple(parts)
+    return _reasoning_parts(_get(response, "output"))
 
 
 def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:

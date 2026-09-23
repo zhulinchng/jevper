@@ -42,12 +42,17 @@ Three things count as *this provider cannot do logprobs*:
 | --- | --- |
 | The provider rejects the logprob fields with a 4xx that names them — Gemini's OpenAI-compatibility layer answers `Unknown name "logprobs": Cannot find field.`, a reasoning model behind an OpenAI-shaped gateway answers `logprobs are not supported with reasoning models.` | Re-ask the question with `structured`, and remember the verdict |
 | The provider refuses the `include` entry a Responses request carries them in — OpenRouter answers `400 Invalid option: expected one of …` for `path: ["include", 0]`, without ever writing the word "logprob" | same |
-| The answer carries no logprobs at all (`logprobs: null`, or a compatibility layer that drops the field) | same |
+| The answer carries no logprobs at all (`logprobs: null`, or a compatibility layer that drops the field) | Re-ask the question with `structured`, and remember the verdict once a second response confirms it |
 | The answer token's logprobs carry no alternatives — `top_logprobs` empty, or nothing but the sampled token — so there is no distribution to read | same |
 
 A server error (5xx) that survives the transient retries also falls back for that question, because a request
-carrying `top_logprobs` is what some OpenAI models fail on; unlike the three above it is *not* remembered, so
-one bad minute does not downgrade a working provider.
+carrying `top_logprobs` is what some OpenAI models fail on; unlike the two rejections above it is *not*
+remembered, so one bad minute does not downgrade a working provider.
+
+The last two rows are the weak kind of evidence: a truncated answer, a reasoning-only reply or a provider
+hiccup looks exactly like a provider that never implemented logprobs. `auto` therefore answers that question
+with `structured` right away but only stops asking for logprobs once a second response says the same thing —
+and a readable distribution in between resets the count, because it proves the provider can do it.
 
 Cost and consequences:
 
@@ -63,7 +68,8 @@ Cost and consequences:
   cannot distinguish `AA` from `A`.
 - The verdict lives on the client instance and is keyed by model and surface: a new client, or an explicit
   `method="logprobs"`, starts over. Passing `method` to `system_one` overrides it for that call.
-- Only a rejection that refuses the *field* is remembered. A 4xx that complains about the value it was sent —
+- Only a rejection that refuses the *field* is remembered at once; a response-level absence is remembered on the
+  second one (see above). A 4xx that complains about the value it was sent —
   a server whose `top_logprobs` cap is lower than the default answers `Invalid 'top_logprobs': integer must be
   between 0 and 5, but got 20.` — still falls back to `structured` for that question, but nothing is cached:
   the next call tries logprobs again.
@@ -248,14 +254,15 @@ Request: a strict JSON schema asking for one option and nothing else.
 | `score` | `{"score": {"type": "integer", "enum": [0, 1, 2]}}` |
 
 Readout: one-hot over the chosen option. `choice` accepts a label (`"B"`, case-insensitive) or a criteria key
-(`"billing"`); `noul` requires a JSON boolean or its string form (`"true"`/`"false"`); `score` requires a level
-index — an integer, an integral float such as `2.0`, or a number in a string such as `"2"`. The string forms
-are what models tend to emit when the schema is only in the prompt (`structured_outputs=False`). A bool is
-rejected as a score, since `true` would otherwise read as level 1. Anything else raises `MalformedAnswerError`.
+(`"billing"`); an exact criteria key wins over a label spelled the same way, so an option keyed `"a"` is read as
+that option and not as the first label. `noul` requires a JSON boolean or its string form (`"true"`/`"false"`);
+`score` requires a level index — an integer, an integral float such as `2.0`, or a number in a string such as
+`"2"`. The string forms are what models tend to emit when the schema is only in the prompt
+(`structured_outputs=False`). A bool is rejected as a score, since `true` would otherwise read as level 1.
+Anything else raises `MalformedAnswerError`.
 
-One ambiguity to know about: the label is tried first, so an option *key* that is itself a label
-(`criteria={"A": ..., "B": ...}` in a different order) is read as the label. Give options keys that are not
-single letters when the distinction matters.
+Because the readout parses a JSON object, the system prompt, the few-shot demonstrations and the two-step answer
+cue all ask for that JSON object rather than for a bare label.
 
 The resulting `confidence` is `1.0` for `choice` and `score` — all the mass sits on one option, which is
 maximal confidence under both formulas. `noul` answers carry no confidence.

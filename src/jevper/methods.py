@@ -70,11 +70,13 @@ def _object_schema(properties: dict[str, Any]) -> dict[str, Any]:
 
 
 def choice_schema(keys: Sequence[str]) -> dict[str, Any]:
+    # The bounds are the readout's: a schema-valid answer is always a readable one, so a negative
+    # number costs no corrective retry.
     return _object_schema(
         {
             "probabilities": {
                 "type": "object",
-                "properties": {key: {"type": "number"} for key in keys},
+                "properties": {key: {"type": "number", "minimum": 0} for key in keys},
                 "required": list(keys),
                 "additionalProperties": False,
             }
@@ -83,7 +85,7 @@ def choice_schema(keys: Sequence[str]) -> dict[str, Any]:
 
 
 def noul_schema() -> dict[str, Any]:
-    return _object_schema({"noul": {"type": "number"}})
+    return _object_schema({"noul": {"type": "number", "minimum": 0, "maximum": 1}})
 
 
 def score_schema(level_count: int) -> dict[str, Any]:
@@ -187,7 +189,8 @@ def first_answer_token(result: CallResult, labels: Sequence[str], *, method: Met
         raise _LogprobsUnavailable(
             f"no logprobs returned for the answer token (method={method!r}); this provider does not "
             f"report them — use method='structured' for the model's own probabilities, or "
-            f"method='discrete' for one label, neither of which needs logprobs"
+            f"method='discrete' for one label, neither of which needs logprobs",
+            evidence="readout",
         )
     for token in result.token_logprobs:
         if not token.token.strip():
@@ -220,7 +223,8 @@ def _logprob_readout(
         raise _LogprobsUnavailable(
             f"the provider returned {token.reported_alternatives} top_logprobs for the answer token "
             f"{token.token!r} (method={method!r}), which is not a distribution over the options; use "
-            f"method='structured' for the model's own probabilities, or method='discrete' for one label"
+            f"method='structured' for the model's own probabilities, or method='discrete' for one label",
+            evidence="readout",
         )
     answer_label = token.token.strip().upper()
     logprobs: dict[str, float] = {label: float("-inf") for label in labels}
@@ -250,7 +254,8 @@ def readout_grammar(result: CallResult, question: Question, labels: Sequence[str
         # A provider-side fact, so no corrective retry is spent on it — another turn cannot change
         # what the server reports. Same message, same public class (a LabelReadoutError subclass).
         raise _LogprobsUnavailable(
-            "grammar mode needs logprobs in the response; pass method='discrete' to skip probabilities"
+            "grammar mode needs logprobs in the response; pass method='discrete' to skip probabilities",
+            evidence="readout",
         )
     return _logprob_readout(result, question, labels, "grammar", "grammar")
 
@@ -351,10 +356,12 @@ def readout_discrete(result: CallResult, question: Question, labels: Sequence[st
         label = None
         if isinstance(raw, str):
             candidate = raw.strip()
-            if candidate.upper() in labels:
-                label = candidate.upper()
-            elif candidate in keys:
+            # An exact option key wins over a label, the same way an example's answer does: a key that
+            # is also a label ("a" and "A") must not be read as the first option by accident.
+            if candidate in keys:
                 label = labels[keys.index(candidate)]
+            elif candidate.upper() in labels:
+                label = candidate.upper()
         if label is None:
             raise MalformedAnswerError(
                 f"'choice' must be one of the labels {list(labels)!r} or the option keys {keys!r}, got {raw!r}"

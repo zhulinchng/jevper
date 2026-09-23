@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .errors import InvalidQuestionError, JevperError
-from .labels import MAX_LABEL_OPTIONS, label_to_key
+from .labels import label_to_key
 from .types import Example, JSONContent, Method, Question
 
 SYSTEM_PROMPT = (
@@ -28,6 +28,7 @@ ANALYSIS_SYSTEM_PROMPT = (
     "final label; explain your considerations and the trade-offs between the options."
 )
 ANSWER_CUE = "Now reply with the label only."
+STRUCTURED_ANSWER_CUE = "Now reply with the JSON object only."
 
 _STATE_ROLES = ("system", "user", "assistant", "developer")
 
@@ -117,23 +118,44 @@ def example_answer_label(question: Question, labels: Sequence[str], answer: Any,
             return labels[0] if answer else labels[1]
         raise problem
     if isinstance(answer, str):
-        candidate = answer.strip().upper()
-        if candidate in labels:
-            return candidate
         if question.type == "choice":
+            # An exact criteria key wins over a label: with criteria {"b", "a"}, answer "a" names the
+            # option keyed "a", not the first label "A" — the two readings disagree, so the explicit
+            # one is the only safe choice.
             for label, key in zip(labels, question.criteria):
                 if key == answer:
                     return label
+        candidate = answer.strip().upper()
+        if candidate in labels:
+            return candidate
         raise problem
     if isinstance(answer, int) and question.type == "score" and 0 <= answer < len(question.criteria):
         return labels[answer]
     raise problem
 
 
-def _example_probabilities(
+def validate_example_probabilities(
     question: Question, probabilities: Mapping[Any, float], index: int
-) -> dict[str, float]:
-    """An example's own distribution, keyed the way the answer schema is and checked against the question."""
+) -> None:
+    """Check an example's own numbers against its question, whatever method answers the call.
+
+    Only ``method="structured"`` renders them — no other answer shape carries a distribution — but a
+    caller mistake fails here, before any provider call, instead of silently disappearing for a method
+    that cannot show it. ``Example`` itself already rejects non-finite numbers; what is left is the
+    shape: the keys, a non-negative weight, and a ``Noul`` weight within [0, 1].
+    """
+    if question.type == "noul":
+        for name, value in probabilities.items():
+            if name not in (True, False) and str(name).lower() not in ("true", "false"):
+                raise InvalidQuestionError(
+                    f"example {index}: probabilities must have a True or False key, "
+                    f"got {sorted(str(name) for name in probabilities)}"
+                )
+            if not 0.0 <= float(value) <= 1.0:
+                raise InvalidQuestionError(
+                    f"example {index}: noul probability must be in [0, 1], got {value!r}"
+                )
+        return
     expected = (
         [str(level) for level in range(len(question.criteria))]
         if question.type == "score"
@@ -149,6 +171,19 @@ def _example_probabilities(
             raise InvalidQuestionError(
                 f"example {index}: probability for {name!r} must be >= 0, got {value!r}"
             )
+
+
+def _example_probabilities(
+    question: Question, probabilities: Mapping[Any, float], index: int
+) -> dict[str, float]:
+    """An example's own distribution, keyed the way the answer schema is."""
+    validate_example_probabilities(question, probabilities, index)
+    expected = (
+        [str(level) for level in range(len(question.criteria))]
+        if question.type == "score"
+        else list(question.criteria)
+    )
+    given = {str(name): float(value) for name, value in probabilities.items()}
     return {name: given[name] for name in expected}
 
 
@@ -159,21 +194,13 @@ def _structured_example_answer(
     key = keys[label]
     probabilities = example.probabilities
     if question.type == "noul":
+        # The key set and the [0, 1] range were checked by ``validate_example_probabilities``.
         if probabilities is None:
             value = 1.0 if key is True else 0.0
         elif _present(probabilities, True):
             value = float(_lookup(probabilities, True))
-        elif _present(probabilities, False):
-            value = 1.0 - float(_lookup(probabilities, False))
         else:
-            raise InvalidQuestionError(
-                f"example {index}: probabilities must have a True or False key, "
-                f"got {sorted(str(name) for name in probabilities)}"
-            )
-        if not 0.0 <= value <= 1.0:
-            raise InvalidQuestionError(
-                f"example {index}: noul probability must be in [0, 1], got {value!r}"
-            )
+            value = 1.0 - float(_lookup(probabilities, False))
         payload: dict[str, Any] = {"noul": value}
     elif probabilities is not None:
         payload = {"probabilities": _example_probabilities(question, probabilities, index)}
@@ -185,6 +212,24 @@ def _structured_example_answer(
                 str(level): (1.0 if level == key else 0.0) for level in range(len(question.criteria))
             }
         }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _discrete_example_answer(
+    question: Question, labels: Sequence[str], example: Example, index: int, keys: Mapping[str, Any]
+) -> str:
+    """The one-hot answer ``method="discrete"`` reads: one label, one level index or one boolean.
+
+    That schema cannot carry a distribution, so ``Example.probabilities`` is validated in
+    ``_resolve_examples`` and never rendered here.
+    """
+    label = example_answer_label(question, labels, example.answer, index)
+    if question.type == "choice":
+        payload: dict[str, Any] = {"choice": label}
+    elif question.type == "noul":
+        payload = {"noul": bool(keys[label])}
+    else:
+        payload = {"score": int(keys[label])}
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -203,7 +248,7 @@ def render_examples(
 ) -> list[dict[str, str]]:
     """One user turn (example state + question block) and one assistant turn (expected answer) per example."""
     turns: list[dict[str, str]] = []
-    keys = label_to_key(question, labels) if method == "structured" else {}
+    keys = label_to_key(question, labels) if method in ("structured", "discrete") else {}
     for index, example in enumerate(examples):
         try:
             turn = render_question_turn(example.state, question, labels)
@@ -212,6 +257,8 @@ def render_examples(
         turns.append({"role": "user", "content": turn})
         if method == "structured":
             content = _structured_example_answer(question, labels, example, index, keys)
+        elif method == "discrete":
+            content = _discrete_example_answer(question, labels, example, index, keys)
         else:
             content = example_answer_label(question, labels, example.answer, index)
         turns.append({"role": "assistant", "content": content})
@@ -232,8 +279,13 @@ class PromptParts:
 
 
 def system_prompt(method: Method) -> str:
-    """The answer-pass system prompt for a method."""
-    return STRUCTURED_SYSTEM_PROMPT if method == "structured" else SYSTEM_PROMPT
+    """The answer-pass system prompt for a method: the JSON one whenever the answer is a JSON object."""
+    return STRUCTURED_SYSTEM_PROMPT if method in ("structured", "discrete") else SYSTEM_PROMPT
+
+
+def answer_cue(method: Method) -> str:
+    """The two-step cue for the answer pass, phrased for the shape that pass has to produce."""
+    return STRUCTURED_ANSWER_CUE if method in ("structured", "discrete") else ANSWER_CUE
 
 
 def build_parts(
@@ -267,12 +319,7 @@ def assemble(parts: PromptParts, *, system: str) -> list[dict[str, str]]:
 
 
 def correction_message(reason: str, labels: Sequence[str]) -> str:
-    if len(labels) > MAX_LABEL_OPTIONS:
-        # Listing 100+ labels would dwarf the question; the labels are already in the options block.
-        return (
-            f"Your previous reply was invalid: {reason}. Reply with exactly one of the labels listed "
-            f"with the options above, and nothing else."
-        )
+    """The corrective turn for a label readout; a JSON answer uses ``structured_correction_message``."""
     return (
         f"Your previous reply was invalid: {reason}. Reply with exactly one of these labels and nothing "
         f"else: {', '.join(labels)}."

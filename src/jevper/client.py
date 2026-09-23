@@ -37,7 +37,7 @@ from .normalize import (
 )
 from .prompts import (
     ANALYSIS_SYSTEM_PROMPT,
-    ANSWER_CUE,
+    answer_cue,
     assemble,
     build_parts,
     correction_message,
@@ -45,6 +45,7 @@ from .prompts import (
     render_state_messages,
     structured_correction_message,
     system_prompt,
+    validate_example_probabilities,
 )
 from .reasoning import (
     ReasoningConfig,
@@ -106,6 +107,9 @@ METHOD_SELECTIONS: tuple[MethodSelection, ...] = ("auto", *METHODS)
 APIS: tuple[Api, ...] = ("auto", "chat_completions", "responses")
 AUTO_METHOD: Method = "logprobs"  # what method="auto" tries first
 FALLBACK_METHOD: Method = "structured"  # what it answers with when logprobs are unavailable
+# Readout-level absences auto needs before it treats a provider as unable to return logprobs. One
+# response with unreadable logprobs is a bad minute; two are a pattern.
+AUTO_ABSENCES_BEFORE_REMEMBERING = 2
 MAX_TOP_LOGPROBS = 20
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens")
 
@@ -148,7 +152,27 @@ def _is_transient(exc: BaseException) -> bool:
 
 def _retry_delay(policy: RetryPolicy, attempt: int) -> float:
     """Exponential backoff for transient retries, capped by the policy."""
-    return min(policy.base_delay * 3**attempt, policy.max_delay)
+    if policy.base_delay >= policy.max_delay:
+        return policy.max_delay
+    # The cap is reached by multiplying, not by computing ``3**attempt``: that overflows a float past
+    # attempt 646 (and ``base_delay * inf`` cannot be recovered from), while this stops the moment the
+    # policy's own cap is reached — a handful of steps for any usable policy, and attempt steps at
+    # worst when the delay never grows.
+    delay = policy.base_delay
+    for _ in range(attempt):
+        delay *= 3.0
+        if delay >= policy.max_delay:
+            return policy.max_delay
+    return delay
+
+
+def _require_top_logprobs(method: Method, top_logprobs: int) -> None:
+    """A label readout needs the sampled token and at least one alternative to compare it with."""
+    if method in ("logprobs", "grammar") and top_logprobs < 2:
+        raise JevperError(
+            f"top_logprobs must be at least 2 for method={method!r}: a distribution needs the sampled "
+            f"token and at least one alternative, got {top_logprobs!r}"
+        )
 
 
 def _logprob_evidence(exc: BaseException) -> str:
@@ -329,10 +353,21 @@ class _BaseClient:
             raise JevperError(f"reasoning must be a ReasoningConfig, got {type(reasoning).__name__}")
         if retry is not None and not isinstance(retry, RetryPolicy):
             raise JevperError(f"retry must be a RetryPolicy, got {type(retry).__name__}")
+        if extra_body is not None and not isinstance(extra_body, Mapping):
+            raise JevperError(f"extra_body must be a mapping, got {type(extra_body).__name__}")
+        if extra_headers is not None and not isinstance(extra_headers, Mapping):
+            raise JevperError(f"extra_headers must be a mapping, got {type(extra_headers).__name__}")
+        if method in ("logprobs", "grammar"):
+            _require_top_logprobs(method, top_logprobs)
         policy = retry or RetryPolicy()
-        if policy.n_retries < 0 or policy.base_delay < 0 or policy.max_delay < 0:
+        if (
+            policy.n_retries < 0
+            or policy.base_delay < 0
+            or policy.max_delay < 0
+            or not (math.isfinite(policy.base_delay) and math.isfinite(policy.max_delay))
+        ):
             raise JevperError(
-                f"retry needs n_retries, base_delay and max_delay >= 0, got {policy!r}"
+                f"retry needs n_retries >= 0 and finite base_delay/max_delay >= 0, got {policy!r}"
             )
         self.client = client
         self.model = model
@@ -353,6 +388,7 @@ class _BaseClient:
         self._executor_lock = threading.Lock()
         # What method="auto" has learned about this provider, per (model, surface).
         self._auto_methods: dict[tuple[str, Surface], Method] = {}
+        self._auto_misses: dict[tuple[str, Surface], int] = {}
         self._auto_lock = threading.Lock()
 
     # -- shared helpers ----------------------------------------------------------------
@@ -385,6 +421,18 @@ class _BaseClient:
         """Remember that this provider cannot return logprobs, for the rest of this client's life."""
         with self._auto_lock:
             self._auto_methods[(model, surface)] = FALLBACK_METHOD
+
+    def _note_absent_logprobs(self, model: str, surface: Surface) -> int:
+        """Count one response whose logprobs could not be read, for this (model, surface)."""
+        with self._auto_lock:
+            misses = self._auto_misses.get((model, surface), 0) + 1
+            self._auto_misses[(model, surface)] = misses
+            return misses
+
+    def _note_logprobs_present(self, model: str, surface: Surface) -> None:
+        """A readable distribution retires the absences counted so far."""
+        with self._auto_lock:
+            self._auto_misses.pop((model, surface), None)
 
     def _call_failure(
         self, exc: Exception, spec: CallSpec, context: _CallContext, log: _CallLog
@@ -445,6 +493,9 @@ class _BaseClient:
     ) -> tuple[_CallContext, dict[str, Question]]:
         if not questions:
             raise InvalidQuestionError("at least one question is required")
+        if reasoning is not None and not isinstance(reasoning, ReasoningConfig):
+            # Without this the mode lookup dereferences a string and the caller sees an AttributeError.
+            raise JevperError(f"reasoning must be a ReasoningConfig, got {type(reasoning).__name__}")
         # Fail fast, before any provider call, and reuse the rendered turns for every question.
         state_messages = tuple(render_state_messages(state))
         parsed = {question_id: parse_question(question_id, raw) for question_id, raw in questions.items()}
@@ -462,6 +513,7 @@ class _BaseClient:
             # auto never reaches the label-readout cap: a wide Choice is answered in JSON.
             for question_id, question in parsed.items():
                 methods.require_label_readout(effective_method, question, question_id)
+            _require_top_logprobs(effective_method, self.top_logprobs)
         effective_reasoning = reasoning if reasoning is not None else self.reasoning
         mode = resolve_reasoning_mode(effective_reasoning, surface)
         context = _CallContext(
@@ -502,6 +554,10 @@ class _BaseClient:
         for index, example in enumerate(resolved):
             try:
                 example_answer_label(question, labels, example.answer, index)
+                if example.probabilities is not None:
+                    # Checked whatever the method renders: a bad distribution must not wait for the
+                    # one method that happens to show it.
+                    validate_example_probabilities(question, example.probabilities, index)
             except InvalidQuestionError as exc:
                 raise InvalidQuestionError(f"question {question_id!r}: {exc}") from exc
         return resolved
@@ -526,7 +582,11 @@ class _BaseClient:
                     raise
                 fell_back = True
                 retry_reasons.append(f"{exc} — answering with method={FALLBACK_METHOD!r}")
-                if exc.capability:
+                if exc.capability and (
+                    exc.evidence == "provider"
+                    or self._note_absent_logprobs(context.model, context.transport.surface)
+                    >= AUTO_ABSENCES_BEFORE_REMEMBERING
+                ):
                     self._remember_logprobs_unavailable(context.model, context.transport.surface)
                 # Questions that have not started yet take the fallback without paying for it.
                 context.method = FALLBACK_METHOD
@@ -555,13 +615,14 @@ class _BaseClient:
             # servers reject empty content, and it would teach the answer pass nothing.
             trace = result.text.strip() or None
             trace_text = trace or reasoning_text(native_reasoning).strip() or None
+            cue = answer_cue(method)
             messages = messages + (
                 [
                     {"role": "assistant", "content": trace_text},
-                    {"role": "user", "content": ANSWER_CUE},
+                    {"role": "user", "content": cue},
                 ]
                 if trace_text is not None
-                else [{"role": "user", "content": ANSWER_CUE}]
+                else [{"role": "user", "content": cue}]
             )
 
         correction: str | None = None
@@ -591,6 +652,9 @@ class _BaseClient:
                 )
                 continue
             break
+        if method in ("logprobs", "grammar"):
+            # A readable distribution is proof the provider can supply one: retire earlier absences.
+            self._note_logprobs_present(context.model, context.transport.surface)
         native_reasoning = native_reasoning + result.reasoning
         return self._finalize(
             question, labels, readout, method, context, trace, native_reasoning, retry_reasons, log

@@ -60,15 +60,17 @@ sequenceDiagram
     participant P as provider
     C->>P: analysis system prompt, state, few-shot, question block
     P-->>C: free-form considerations
-    C->>P: answer messages + assistant(trace) + "Now reply with the label only."
+    C->>P: answer messages + assistant(trace) + the answer cue
     P-->>C: label or JSON answer
     Note over C: readout, then finalize
 ```
 
 - The analysis call sends no schema and no logprobs: it is plain text, so the model reasons freely. It is also
   where few-shot turns appear, exactly as in the answer call.
-- The answer call reuses the full message list, appends `{"role": "assistant", "content": trace}` and then
-  `{"role": "user", "content": "Now reply with the label only."}`. Corrective retries append after that cue.
+- The answer call reuses the full message list, appends `{"role": "assistant", "content": trace}` and then the
+  answer cue: `{"role": "user", "content": "Now reply with the label only."}` for `logprobs`/`grammar`, and
+  `"Now reply with the JSON object only."` for `structured`/`discrete`, whose answers are JSON. Corrective
+  retries append after that cue.
 - An analysis pass that returns no text — a reasoning model that thinks without writing output — is handled
   without sending an empty assistant turn, which several OpenAI-compatible servers reject. If the call did
   return reasoning, that reasoning text becomes the trace for the answer call; if it returned neither, the

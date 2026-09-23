@@ -277,3 +277,41 @@ def test_examples_reach_both_two_step_passes(stub_server):
     assert "duplicate charge" in json.dumps(analysis["messages"])
     assert "duplicate charge" in json.dumps(answer["messages"])
     assert answer["messages"][-2]["content"] == "analysis"
+
+
+def test_example_probabilities_are_validated_for_every_method(stub_server):
+    """Only structured renders the numbers, but a bad distribution fails before any request anyway."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    wrong_keys = Example(state="s", answer="billing", probabilities={"billing": 0.6, "sales": 0.4})
+    with pytest.raises(InvalidQuestionError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA, examples=[wrong_keys])})
+    assert "must have exactly the keys" in str(error.value)
+
+    negative = Example(
+        state="s", answer="billing", probabilities={"billing": 1.2, "technical": -0.1, "sales": -0.1}
+    )
+    with pytest.raises(InvalidQuestionError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA, examples=[negative])})
+    assert "must be >= 0" in str(error.value)
+
+    out_of_range = Noul(examples=[Example(state="s", answer=True, probabilities={True: 1.4})])
+    with pytest.raises(InvalidQuestionError) as error:
+        client.system_one(state="s", questions={"verdict": out_of_range})
+    assert "noul probability must be in [0, 1]" in str(error.value)
+
+    assert stub.requests == []
+
+
+def test_example_answer_prefers_an_exact_key_over_a_label(stub_server):
+    """Criteria keys that look like labels: the exact key wins, so the demonstration matches the answer."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+    question = Choice(criteria={"b": None, "a": None}, examples=[Example(state="s", answer="a")])
+
+    client.system_one(state="s", questions={"q": question})
+
+    sent = stub.bodies("/chat/completions")[0]
+    demonstrated = [m["content"] for m in sent["messages"] if m["role"] == "assistant"]
+    assert demonstrated == ["B"]  # the label of the option keyed "a", not the first label "A"

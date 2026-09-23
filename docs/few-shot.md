@@ -5,8 +5,8 @@
 A few-shot example is rendered as a chat turn pair: a `user` turn holding the example state plus the same
 question block the real call uses, then an `assistant` turn holding the answer in the format the active method
 expects. Because the demonstration goes through the same renderers as the real call, the model sees exactly the
-answer shape it is being asked for — a label for `logprobs`/`grammar`/`discrete`, a JSON object for
-`structured`.
+answer shape it is being asked for — a label for `logprobs`/`grammar`, a JSON object for
+`structured`/`discrete`.
 
 ```python
 Example(state="Charged twice for one order", answer="billing")
@@ -14,8 +14,11 @@ Example(state="Login fails after reset", answer="technical", probabilities={"bil
 ```
 
 `answer` accepts a label (`"B"`, case-insensitive; two letters such as `"AB"` past 26 options), a `Choice`
-criteria key, a `Score` level index, or a bool for `Noul`. `probabilities` is only read by
-`method="structured"`.
+criteria key, a `Score` level index, or a bool for `Noul`. An exact criteria key wins over a label spelled the
+same way, so `answer="a"` with criteria `{"b": ..., "a": ...}` demonstrates the option keyed `a` rather than the
+first label. `probabilities` is rendered only by `method="structured"` — no other answer shape carries a
+distribution — but it is validated for every method, before any provider call: the keys must be exactly the
+question's, every weight must be non-negative, and a `Noul` weight must be within `[0, 1]`.
 
 ## Where examples come from
 
@@ -58,11 +61,13 @@ Expected answers per method:
 
 | Method | Assistant turn |
 | --- | --- |
-| `logprobs`, `grammar`, `discrete` | the label, e.g. `B` |
+| `logprobs`, `grammar` | the label, e.g. `B` |
 | `structured` | `{"probabilities": {"billing": 1.0, "technical": 0.0, "sales": 0.0}}` — one-hot from `answer` when `Example.probabilities` is omitted, otherwise your numbers verbatim |
+| `discrete` | the one-hot shape that method reads: `{"choice": "B"}`, `{"noul": true}` or `{"score": 0}` |
 
 For `Noul` in structured mode the payload is `{"noul": 1.0}` (or `{"noul": 0.0}`); supplying
-`probabilities={True: 0.9}` gives `{"noul": 0.9}`, and `{False: 0.1}` gives `{"noul": 0.9}` as well.
+`probabilities={True: 0.9}` gives `{"noul": 0.9}`, and `{False: 0.1}` gives `{"noul": 0.9}` as well. In
+`discrete` mode it is `{"noul": true}` or `{"noul": false}` — that schema has no room for a weight.
 
 Use explicit probabilities when the demonstration should teach calibration, not just format: a one-hot example
 teaches the model that answers are certain.

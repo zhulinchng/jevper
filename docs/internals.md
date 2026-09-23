@@ -183,10 +183,13 @@ Worth keeping when editing:
 - `method="auto"` never changes what a pinned method does. It resolves to a concrete method before any spec is
   built, so a provider that returns logprobs sees byte-identical requests whether the method was pinned or
   resolved, and a pinned `logprobs` call still raises `ProviderError` on a rejection.
-- Only evidence about the provider is remembered. A response with no logprobs, a response whose only logprob
-  is the sampled token, and a 4xx that *refuses the field* — naming it in the message, `param` or `code`
-  alongside an unsupported/unknown signal — are all `_LogprobsUnavailable(capability=True)` and are cached per
-  `(model, surface)`. A 4xx that only complains about the value it was sent (a server whose `top_logprobs` cap
+- Only evidence about the provider is remembered, and a rejection is stronger evidence than a readout. A 4xx
+  that *refuses the field* — naming it in the message, `param` or `code` alongside an unsupported/unknown
+  signal — is cached per `(model, surface)` at once. A response with no logprobs, or one whose only logprob is
+  the sampled token, is the same verdict read from weaker evidence: `auto` counts it and caches only on the
+  second one (`AUTO_ABSENCES_BEFORE_REMEMBERING`), and any readable distribution resets the count. A truncated
+  answer, a reasoning-only reply or a provider hiccup must not downgrade a working provider for the life of the
+  client. A 4xx that only complains about the value it was sent (a server whose `top_logprobs` cap
   is below the default) and a 5xx that survived the retries are `capability=False` and are *not* cached: the
   question is answered with a logprob-free method, but the next call tries logprobs again.
 - Capability failures are not corrective-retried: a correction turn changes the prompt, not what the provider

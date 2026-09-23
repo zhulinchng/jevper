@@ -437,3 +437,64 @@ def test_auto_remembers_a_rejection_that_names_the_field_only_in_param():
     assert first.debug["methods"] == {"q": "structured"}
     assert len(stub.requests) == 3
     assert "logprobs" not in stub.requests[2]  # the verdict was remembered
+
+
+def drops_logprobs(body):
+    """A provider that answers every request but never returns logprobs for the answer token."""
+    if body.get("logprobs"):
+        return 200, chat_body(content="A")
+    return 200, chat_body(content=STRUCTURED)
+
+
+def test_one_absent_logprob_response_does_not_pin_the_method(stub_server):
+    """One response without readable logprobs is a bad minute, not a verdict on the provider."""
+    stub = stub_server(chat=drops_logprobs)
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    assert len(stub.bodies("/chat/completions")) == 2  # the probe, then the JSON fallback
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert stub.bodies("/chat/completions")[2]["logprobs"] is True  # logprobs are tried again
+    assert response.debug["methods"] == {"q": "structured"}
+
+
+def test_two_absent_logprob_responses_pin_the_method(stub_server):
+    stub = stub_server(chat=drops_logprobs)
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    assert len(stub.bodies("/chat/completions")) == 4
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert len(stub.bodies("/chat/completions")) == 5  # no probe this time
+    assert "logprobs" not in stub.bodies("/chat/completions")[-1]
+    assert response.debug["methods"] == {"q": "structured"}
+
+
+def test_a_readable_distribution_retires_earlier_absences(stub_server):
+    """A success in between proves the provider can do it, so the count starts over."""
+    probes = 0
+
+    def script(body):
+        nonlocal probes
+        if not body.get("logprobs"):
+            return 200, chat_body(content=STRUCTURED)
+        probes += 1
+        if probes == 2:
+            return 200, chat_body(content="A", logprobs=CHOICE_LOGS)
+        return 200, chat_body(content="A")
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})  # absent
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})  # readable: resets
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})  # absent again
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    # Two absences separated by a readable distribution are still only one absence in a row.
+    assert stub.bodies("/chat/completions")[5]["logprobs"] is True
