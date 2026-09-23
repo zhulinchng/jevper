@@ -18,8 +18,8 @@
 | `__init__.py` | Public re-exports and `__version__` |
 
 The dependency direction is one-way: `client → {methods, prompts, transport, types, normalize, labels,
-reasoning}` and `types → {errors, labels, reasoning}`. `labels.py` deliberately never imports `types.py` at
-runtime (it is duck-typed on `question.type`) so the graph stays acyclic.
+reasoning}`, `types → {errors, labels, reasoning}` and `labels → errors`. `labels.py` deliberately never
+imports `types.py` at runtime (it is duck-typed on `question.type`) so the graph stays acyclic.
 
 ## Call flow
 
@@ -76,7 +76,7 @@ driver (`_call` uses the sync or async transport), which keeps the two implement
 
 | Kind | Trigger | Counted in |
 | --- | --- | --- |
-| Transient | `status_code` in `{429, 500, 502, 503, 504, 529}` or a class name containing `Connection`/`Timeout` | `usage.n_retries`, with delays `min(base_delay · 3ⁿ, max_delay)` |
+| Transient | `status_code` in `{429, 500, 502, 503, 504, 529}`, or `Connection`/`Timeout` in the name of the exception class or any base class, or an `httpx`-family `TransportError`/`TimeoutException` in the MRO | `usage.n_retries`, with delays `min(base_delay · 3ⁿ, max_delay)` |
 | Corrective | `LabelReadoutError` or `MalformedAnswerError` on the answer call | `usage.n_calls` (each is a provider call) and `debug["retry_reasons"]` |
 
 Transient retries wrap the failing call; a non-transient error, or a transient one with the retries exhausted,
@@ -116,7 +116,13 @@ Worth keeping when editing:
 - The provider client is never closed by jevper. `close()` shuts down the thread pool only, and
   `AsyncSystemOneClient.aclose()` is a no-op.
 - Readouts raise `LabelReadoutError`/`MalformedAnswerError` for recoverable shapes and never guess; the client
-  decides whether to retry.
+  decides whether to retry. A number the provider did not report stays missing (`TokenLogprob.logprob` is
+  `float | None`) rather than defaulting to `0.0`, which would read as certainty, and a non-finite logprob
+  raises instead of propagating a `nan` distribution into `confidence` and `score`.
+- An empty assistant turn is never sent. Two-step analysis output that is blank falls back to the call's
+  reasoning text, and if there is none the answer call goes from the question block straight to the cue.
+- Content is rendered with `allow_nan=False`: `NaN`/`Infinity` are not valid JSON, so they raise `JevperError`
+  instead of putting an unparseable prompt or example in front of the model.
 - Probability normalization never raises: out-of-tolerance distributions are recorded in `debug` and either
   rescaled (default) or passed through.
 

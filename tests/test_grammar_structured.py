@@ -9,6 +9,7 @@ from fakes import chat_body, openai_client, responses_body
 
 from jevper import (
     Choice,
+    MalformedAnswerError,
     Noul,
     Score,
     SystemOneClient,
@@ -236,6 +237,39 @@ def test_discrete_labels_grow_to_two_letters_beyond_26_options(stub_server):
     assert (enum[:3], enum[25:27], enum[-1]) == (["AA", "AB", "AC"], ["AZ", "BA"], "BD")
     assert len(enum) == 30
     assert "BD: option_29" in sent["messages"][-1]["content"]
+
+
+def test_discrete_accepts_equivalent_score_index_forms(stub_server):
+    answers = [{"score": 2.0}, {"score": "2"}, {"score": "2.0"}]
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps(answers.pop(0)))))
+    client = SystemOneClient(openai_client(stub), model="stub", method="discrete", api="chat_completions")
+
+    for _ in range(3):
+        response = client.system_one(
+            state="s", questions={"anger": Score(criteria=["Calm", "Frustrated", "Very angry"])}
+        )
+        assert response.answers["anger"].probabilities == {0: 0.0, 1: 0.0, 2: 1.0}
+        assert response.answers["anger"].score == 2.0
+
+
+def test_discrete_accepts_the_string_form_of_a_boolean(stub_server):
+    answers = [{"noul": "false"}, {"noul": "TRUE"}]
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps(answers.pop(0)))))
+    client = SystemOneClient(openai_client(stub), model="stub", method="discrete", api="chat_completions")
+
+    assert client.system_one(state="s", questions={"v": Noul()}).answers["v"].noul == 0.0
+    assert client.system_one(state="s", questions={"v": Noul()}).answers["v"].noul == 1.0
+
+
+def test_discrete_rejects_a_score_that_is_not_a_level_index(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps({"score": "very angry"}))))
+    client = SystemOneClient(openai_client(stub), model="stub", method="discrete", api="chat_completions")
+
+    with pytest.raises(MalformedAnswerError) as error:
+        client.system_one(state="s", questions={"anger": Score(criteria=["Calm", "Frustrated", "Very angry"])})
+
+    assert "must be one of the level indexes" in str(error.value)
+    assert len(stub.bodies("/chat/completions")) == 2  # one corrective retry, then the error
 
 
 def test_responses_surface_logprobs(stub_server):

@@ -12,6 +12,8 @@ import string
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
+from .errors import InvalidQuestionError
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .types import Question
 
@@ -22,6 +24,10 @@ MAX_CHOICE_OPTIONS = 255  # Jev API limit
 
 def labels_for(count: int) -> tuple[str, ...]:
     """Labels for ``count`` options: ``A``..``Z``, then two letters (``AA``, ``AB``, ...)."""
+    if not 0 <= count <= MAX_LABEL_OPTIONS**2:
+        raise InvalidQuestionError(
+            f"labels_for supports 0..{MAX_LABEL_OPTIONS**2} options, got {count}"
+        )
     if count <= MAX_LABEL_OPTIONS:
         return LABELS[:count]
     return tuple(

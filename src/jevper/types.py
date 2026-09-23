@@ -24,7 +24,8 @@ from .errors import InvalidQuestionError
 from .labels import MAX_CHOICE_OPTIONS
 from .reasoning import ReasoningContentPart
 
-JSONContent = str | dict[str, Any] | list[Any]
+JSONContent = str | int | float | bool | None | dict[str, Any] | list[Any]
+Probability = Annotated[float, Field(allow_inf_nan=False)]
 
 CHOICE_MIN_OPTIONS = 2
 CHOICE_MAX_OPTIONS = MAX_CHOICE_OPTIONS
@@ -44,7 +45,7 @@ class Example(BaseModel):
 
     state: Any
     answer: str | int | bool
-    probabilities: Mapping[str | int, float] | None = None
+    probabilities: Mapping[str | int, Probability] | None = None
 
 
 class NoulCriteria(BaseModel):
@@ -162,7 +163,7 @@ class ChoiceAnswer(BaseModel):
 class ScoreAnswer(BaseModel):
     type: Literal["score"] = "score"
     score: float
-    legend: dict[int, str | dict[str, Any] | list[Any]]
+    legend: dict[int, JSONContent]
     probabilities: dict[int, float]
     confidence: float
 

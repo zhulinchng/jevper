@@ -12,6 +12,7 @@ from jevper import (
     AsyncSystemOneClient,
     Choice,
     InvalidQuestionError,
+    JevperError,
     Noul,
     ProviderError,
     RetryPolicy,
@@ -272,3 +273,175 @@ def test_missing_client_surface_is_reported(stub_server):
             state="s", questions={"q": Choice(criteria=CRITERIA)}
         )
     assert "responses.create" in str(error.value) and "chat.completions.create" in str(error.value)
+
+
+class TransportError(Exception):
+    """Stand-in for ``httpx.TransportError`` (same class name, same position in the MRO)."""
+
+
+class ConnectError(TransportError):
+    """Stand-in for ``httpx.ConnectError``: the name carries no Connection/Timeout marker."""
+
+
+class LocalProtocolError(Exception):
+    """Stand-in for ``httpx.LocalProtocolError``: a client-side bug, never transient."""
+
+
+class _FailingChatClient:
+    """Duck client whose transport raises once, then answers — the shape of a dropped connection."""
+
+    def __init__(self, failure: Exception) -> None:
+        self.failure = failure
+        self.calls = 0
+        outer = self
+
+        class Completions:
+            def create(self, **kwargs):
+                outer.calls += 1
+                if outer.calls == 1:
+                    raise outer.failure
+                return chat_body(content="A", logprobs=CHOICE_LOGS)
+
+        class Chat:
+            completions = Completions()
+
+        self.chat = Chat()
+
+
+def test_transport_level_failures_are_retried():
+    duck = _FailingChatClient(ConnectError("connection dropped"))
+    client = SystemOneClient(
+        duck,
+        model="stub",
+        api="chat_completions",
+        retry=RetryPolicy(n_retries=2, base_delay=0.0),
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+    assert duck.calls == 2
+    assert response.usage.n_retries == 1
+    assert response.debug["llm_attempts"][0]["error"].startswith("ConnectError")
+
+
+def test_client_side_protocol_errors_are_not_retried():
+    duck = _FailingChatClient(LocalProtocolError("bad request construction"))
+    client = SystemOneClient(
+        duck, model="stub", api="chat_completions", retry=RetryPolicy(n_retries=2, base_delay=0.0)
+    )
+
+    with pytest.raises(ProviderError):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert duck.calls == 1
+
+
+def test_string_status_codes_are_still_transient():
+    class SlowDown(Exception):
+        status_code = "429"
+
+    duck = _FailingChatClient(SlowDown("slow down"))
+    client = SystemOneClient(
+        duck, model="stub", api="chat_completions", retry=RetryPolicy(n_retries=1, base_delay=0.0)
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.usage.n_retries == 1
+    assert duck.calls == 2
+
+
+def test_unreadable_status_codes_do_not_mask_the_provider_error():
+    class Weird(Exception):
+        status_code = [429]  # noqa: RUF012 - an unhashable status is the point
+
+    duck = _FailingChatClient(Weird("boom"))
+    client = SystemOneClient(
+        duck, model="stub", api="chat_completions", retry=RetryPolicy(n_retries=1, base_delay=0.0)
+    )
+
+    with pytest.raises(ProviderError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "Weird: boom" in str(error.value)
+    assert duck.calls == 1
+
+
+def test_retry_policy_is_validated(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+
+    for policy in (RetryPolicy(n_retries=-1), RetryPolicy(base_delay=-1), RetryPolicy(max_delay=-1)):
+        with pytest.raises(JevperError) as error:
+            SystemOneClient(openai_client(stub), model="stub", retry=policy)
+        assert ">= 0" in str(error.value)
+
+    with pytest.raises(JevperError) as error:
+        SystemOneClient(openai_client(stub), model="stub", retry={"n_retries": 1})  # type: ignore[arg-type]
+    assert "RetryPolicy" in str(error.value)
+
+
+def test_failed_attempt_records_the_provider_request(stub_server):
+    stub = stub_server(chat=lambda _: (400, {"error": {"message": "bad", "type": "invalid_request_error"}}))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", method="structured"
+    )
+
+    with pytest.raises(ProviderError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    request = error.value.attempts[0]["request"]
+    assert request["model"] == "stub"
+    assert request["response_format"]["json_schema"]["name"] == "jevper_choice"
+    assert request["messages"][-1]["content"].startswith("Options:")
+
+
+def test_non_string_instructions_and_criteria_render_as_json(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    response = client.system_one(
+        state="s",
+        questions={
+            "intent": Choice(instructions=42, criteria={"low": 1, "high": 5}),
+            "anger": Score(criteria=[1, 2, 3]),
+        },
+    )
+
+    bodies = stub.bodies("/chat/completions")
+    choice_block = next(
+        body["messages"][-1]["content"] for body in bodies if "A: low" in body["messages"][-1]["content"]
+    )
+    assert "Question:\n42" in choice_block
+    assert "A: low — 1" in choice_block and "B: high — 5" in choice_block
+    score_block = next(
+        body["messages"][-1]["content"] for body in bodies if "A: 0" in body["messages"][-1]["content"]
+    )
+    assert "A: 0 — 1" in score_block and "C: 2 — 3" in score_block
+    assert response.scores["anger"].legend == {0: 1, 1: 2, 2: 3}
+
+
+def test_state_must_be_json_serializable_with_finite_numbers(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    with pytest.raises(JevperError) as error:
+        client.system_one(state={1, 2}, questions={"q": Choice(criteria=CRITERIA)})
+    assert "JSON-serializable" in str(error.value)
+
+    with pytest.raises(JevperError) as error:
+        client.system_one(state={"latency": float("nan")}, questions={"q": Choice(criteria=CRITERIA)})
+    assert "finite" in str(error.value)
+
+    assert stub.requests == []
+
+
+def test_labels_cover_the_two_letter_range_and_stop_there():
+    from jevper.labels import labels_for
+
+    assert labels_for(676)[-1] == "ZZ"
+    assert labels_for(27)[26] == "BA"
+
+    with pytest.raises(InvalidQuestionError) as error:
+        labels_for(677)
+    assert "0..676" in str(error.value)

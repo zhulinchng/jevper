@@ -70,7 +70,9 @@ Readout:
 1. The first non-whitespace token of the answer must be a label (compared case-insensitively).
 2. Its logprob is taken from the token itself, and the rest of the distribution from the token's
    `top_logprobs` entries. A label the provider did not report gets probability exactly `0.0` and is listed in
-   `debug["labels_missing"]`.
+   `debug["labels_missing"]`. A provider that reports `logprob: null` — some OpenAI-compatible servers do — is
+   treated the same way: no number is invented, so a missing alternative is `0.0` and a missing logprob *for
+   the answer token* raises `LabelReadoutError` instead of reading as certainty.
 3. The logprobs are softmaxed over the labels only. A grammar masks logits but never renormalizes them, so
    renormalizing over the label set gives the post-mask distribution — which is why `grammar` reuses this
    readout unchanged.
@@ -87,11 +89,14 @@ Caveats:
   that matters.
 - The distribution is the model's preference over the *next token*, so the prompt must leave the label as the
   only sensible continuation — that is what the system prompt and the `Options:` block are for.
+- OpenAI reports `-9999.0` for tokens outside the top 20 rather than omitting them; that underflows to `0.0`
+  like any other very low logprob, so it needs no special handling.
 
 Failure modes, each raising `LabelReadoutError`: no logprobs at all (`no logprobs returned for the answer
-token (method='logprobs')`), no non-whitespace token, or a first token that is not a label (`first
-non-whitespace token 'The' is not one of the labels [...]`). The client retries once with a correction message
-before giving up.
+token (method='logprobs')`), no non-whitespace token, a first token that is not a label (`first
+non-whitespace token 'The' is not one of the labels [...]`), no logprob for the answer token, or a non-finite
+logprob (`nan`/`inf`) from the provider — a `nan` distribution would otherwise poison `confidence` and
+`score`. The client retries once with a correction message before giving up.
 
 ## `grammar`
 
@@ -121,8 +126,9 @@ Constraints:
 
 Request: a strict JSON schema, with the model reporting a probability per option. Schema names are
 `jevper_choice`, `jevper_noul` and `jevper_score`; every object sets `additionalProperties: false` and lists
-all properties in `required`, and no numeric `minimum`/`maximum` is used (strict mode rejects them, so range
-checks are client-side).
+all properties in `required`. The schemas carry no numeric bounds: strict mode does accept `minimum`/`maximum`
+(though not for fine-tuned models), but the constraint that matters here — the distribution summing to 1 — is
+not expressible in JSON Schema, so range checks are client-side either way.
 
 ```json
 {"type": "object",
@@ -167,8 +173,14 @@ Request: a strict JSON schema asking for one option and nothing else.
 | `score` | `{"score": {"type": "integer", "enum": [0, 1, 2]}}` |
 
 Readout: one-hot over the chosen option. `choice` accepts a label (`"B"`, case-insensitive) or a criteria key
-(`"billing"`); `noul` requires a JSON boolean; `score` requires an integer level index (a bool is rejected,
-since `true` would otherwise read as level 1). Anything else raises `MalformedAnswerError`.
+(`"billing"`); `noul` requires a JSON boolean or its string form (`"true"`/`"false"`); `score` requires a level
+index — an integer, an integral float such as `2.0`, or a number in a string such as `"2"`. The string forms
+are what models tend to emit when the schema is only in the prompt (`structured_outputs=False`). A bool is
+rejected as a score, since `true` would otherwise read as level 1. Anything else raises `MalformedAnswerError`.
+
+One ambiguity to know about: the label is tried first, so an option *key* that is itself a label
+(`criteria={"A": ..., "B": ...}` in a different order) is read as the label. Give options keys that are not
+single letters when the distinction matters.
 
 The resulting `confidence` is `1.0` for `choice` and `score` — all the mass sits on one option, which is
 maximal confidence under both formulas. `noul` answers carry no confidence.

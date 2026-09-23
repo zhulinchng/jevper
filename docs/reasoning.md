@@ -69,9 +69,14 @@ sequenceDiagram
   where few-shot turns appear, exactly as in the answer call.
 - The answer call reuses the full message list, appends `{"role": "assistant", "content": trace}` and then
   `{"role": "user", "content": "Now reply with the label only."}`. Corrective retries append after that cue.
+- An analysis pass that returns no text — a reasoning model that thinks without writing output — is handled
+  without sending an empty assistant turn, which several OpenAI-compatible servers reject. If the call did
+  return reasoning, that reasoning text becomes the trace for the answer call; if it returned neither, the
+  answer call runs straight from the question block to the cue.
 - The trace is `response.reasoning[0]` — a `ReasoningContentPart` whose summary text is the analysis output —
   followed by any native reasoning items the two calls returned, so `reasoning_text(response.reasoning)`
-  returns the trace.
+  returns the trace. When the analysis produced no text of its own, no synthetic part is added and the
+  provider's own item is the trace, so the text is not duplicated.
 - Both calls count towards `usage`: `n_calls` is 2 per question (plus corrective retries), and both calls'
   tokens are summed. Two-step reasoning is therefore roughly twice the cost of a plain call.
 

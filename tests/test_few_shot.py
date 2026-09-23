@@ -6,11 +6,13 @@ import json
 
 import pytest
 from fakes import chat_body, openai_client
+from pydantic import ValidationError
 
 from jevper import (
     Choice,
     Example,
     InvalidQuestionError,
+    JevperError,
     Noul,
     ReasoningConfig,
     SystemOneClient,
@@ -203,6 +205,51 @@ def test_example_answer_forms_resolve_to_labels(stub_server):
     labels = lambda body: [message["content"] for message in body["messages"] if message["role"] == "assistant"]
     assert labels(verdict) == ["A", "B"]
     assert labels(intent) == ["C", "C"]
+
+
+def test_example_probabilities_must_match_the_question(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions"
+    )
+
+    wrong_keys = Example(state="s", answer="billing", probabilities={"billing": 0.6, "sales": 0.4})
+    with pytest.raises(InvalidQuestionError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA, examples=[wrong_keys])})
+    assert "example 0" in str(error.value) and "must have exactly the keys" in str(error.value)
+
+    negative = Example(
+        state="s", answer="billing", probabilities={"billing": 1.2, "technical": -0.1, "sales": -0.1}
+    )
+    with pytest.raises(InvalidQuestionError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA, examples=[negative])})
+    assert "must be >= 0" in str(error.value)
+
+    noul = Noul(examples=[Example(state="s", answer=True, probabilities={"yes": 0.9})])
+    with pytest.raises(InvalidQuestionError) as error:
+        client.system_one(state="s", questions={"verdict": noul})
+    assert "True or False key" in str(error.value)
+
+    assert stub.requests == []
+
+
+def test_non_finite_example_probabilities_are_rejected_at_construction():
+    with pytest.raises(ValidationError):
+        Example(state="s", answer="billing", probabilities={"billing": float("nan")})
+    with pytest.raises(ValidationError):
+        Example(state="s", answer=True, probabilities={True: float("inf")})
+
+
+def test_unserializable_example_state_names_the_example(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+    question = Choice(criteria=CRITERIA, examples=[Example(state={1, 2}, answer="billing")])
+
+    with pytest.raises(JevperError) as error:
+        client.system_one(state="s", questions={"q": question})
+
+    assert "example 0" in str(error.value) and "JSON-serializable" in str(error.value)
+    assert stub.requests == []
 
 
 def test_examples_reach_both_two_step_passes(stub_server):

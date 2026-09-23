@@ -40,8 +40,8 @@ caller (`close()` only shuts down jevper's own thread pool).
 | `extra_headers` | `None` | Sent with every request |
 
 Constructor validation is eager: an unknown `method`/`api`, `top_logprobs` outside `[0, 20]`,
-`max_concurrency < 1`, a negative `n_retry_malformed` or a non-`ReasoningConfig` `reasoning` raises
-`JevperError`.
+`max_concurrency < 1`, a negative `n_retry_malformed`, a non-`ReasoningConfig` `reasoning`, a `retry` that is
+not a `RetryPolicy` or has a negative field raises `JevperError`.
 
 ### `system_one`
 
@@ -111,8 +111,21 @@ Score(instructions=None, criteria=["level description"], examples=())
 Example(state=..., answer="billing" | "B" | 2 | True, probabilities={"billing": 0.6, ...} | None = None)
 ```
 
-`answer` may be a label (`"B"`), a `Choice` criteria key, a `Score` level index, or a bool for `Noul`.
-`probabilities` is only read by `method="structured"` and defaults to a one-hot distribution over `answer`.
+`answer` may be a label (`"B"`), a `Choice` criteria key, a `Score` level index, or a bool for `Noul`. The
+label is tried first, so an option key that is itself a label is read as the label. `probabilities` is only
+read by `method="structured"` and defaults to a one-hot distribution over `answer`.
+
+When given, `probabilities` is validated, because the example is replayed into the prompt as the answer the
+model is asked to imitate:
+
+- it must carry exactly the option keys of a `Choice`, the level indexes of a `Score`, or a `True`/`False`
+  (`"true"`/`"false"`) key for a `Noul` — a wrong key set raises `InvalidQuestionError` naming the example
+  index;
+- values must be finite (rejected by the `Example` model itself) and `>= 0`, and a `Noul` value must be in
+  `[0, 1]`.
+
+A non-finite number or a non-JSON-serializable `state` is refused rather than rendered: `NaN`/`Infinity` are
+not valid JSON, so they would put an unparseable example in front of the model.
 
 ## Answers
 
@@ -171,10 +184,11 @@ wall-clock seconds for the whole `system_one` call.
 | `labels_missing` | Labels the provider did not report a logprob for, per question |
 
 Every key is always present; the last three are empty mappings when nothing applies. `request` holds the exact
-kwargs sent to the provider (for a failed call, the request spec that was about to be sent), `response` holds
-the provider object dumped with `model_dump(mode="json")` when available, `error` is a `"Type: message"`
-string, and `readout` is the parsed readout: `source`, `probabilities` (string keys), `missing_labels` and
-`observed_text`. `debug["llm_attempts"][-1]["readout"]` is set for the attempt that produced the final answer.
+kwargs sent to the provider — for a failed call, the kwargs that were about to be sent, so the shape is the
+same either way — `response` holds the provider object dumped with `model_dump(mode="json")` when available,
+`error` is a `"Type: message"` string, and `readout` is the parsed readout: `source`, `probabilities` (string
+keys), `missing_labels` and `observed_text`. `debug["llm_attempts"][-1]["readout"]` is set for the attempt
+that produced the final answer.
 
 ## `RetryPolicy`
 
@@ -182,10 +196,15 @@ string, and `readout` is the parsed readout: `source`, `probabilities` (string k
 RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0)
 ```
 
-Applies per provider call. A failure is transient when the exception exposes `status_code` in
-`{429, 500, 502, 503, 504, 529}` or its class name contains `Connection` or `Timeout`. The delay before retry
+Applies per provider call. A failure is transient when the exception exposes a `status_code` reading as one of
+`{429, 500, 502, 503, 504, 529}` (an int, an `http.HTTPStatus`, or a digit string), or when its class — or any
+class in its MRO — contains `Connection` or
+`Timeout`, or is an `httpx`-family transport failure (`TransportError`, `TimeoutException`). That last clause
+is what covers `httpx.ConnectError`, `ReadError` and `RemoteProtocolError`, whose names carry neither marker;
+a client-side `LocalProtocolError` is not retried. The delay before retry
 `n` is `min(base_delay · 3ⁿ, max_delay)` (so 0.5s, 1.5s, … by default). Anything else — and a transient
-failure with the retries exhausted — is raised as `ProviderError` carrying `.attempts`.
+failure with the retries exhausted — is raised as `ProviderError` carrying `.attempts`. A `RetryPolicy` with a
+negative field, or a `retry` that is not a `RetryPolicy`, raises `JevperError` at construction.
 
 ## `ReasoningConfig`
 
@@ -209,10 +228,10 @@ All inherit from `JevperError`.
 | `InvalidQuestionError` | question or example is locally invalid; also raised when `logprobs`/`grammar` get a `Choice` with more than 26 options |
 | `UnsupportedMethodError` | `method="grammar"` and the selected surface is not Chat Completions |
 | `ClientCapabilityError` | the client lacks the attribute a surface needs, or a chat response carried no choices |
-| `LabelReadoutError` | no logprobs, no non-whitespace token, a first token that is not a label, or no probability mass on any label |
-| `MalformedAnswerError` | JSON answer missing/extra keys, a non-finite or out-of-range number, an unknown label |
+| `LabelReadoutError` | no logprobs, no non-whitespace token, a first token that is not a label, no logprob for the answer token, a non-finite logprob, or no probability mass on any label |
+| `MalformedAnswerError` | JSON answer missing/extra keys, a non-finite or out-of-range number, an unknown label, a score that is not a level index |
 | `ProviderError` | provider failure after transient retries; `.attempts` holds the attempt records |
-| `JevperError` | base class, and the type used for constructor misuse and bad `state` messages |
+| `JevperError` | base class, and the type used for constructor misuse, bad `state` messages, and content that is not JSON-serializable or contains a non-finite number |
 
 ## Constants
 

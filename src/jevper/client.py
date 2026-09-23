@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import math
+import threading
 import time
 from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -45,6 +46,7 @@ from .reasoning import (
     ReasoningConfig,
     ReasoningContentPart,
     ReasoningSummaryPart,
+    reasoning_text,
     resolve_reasoning_mode,
 )
 from .transport import CallResult, CallSpec, Transport, make_transport, select_surface
@@ -63,6 +65,8 @@ from .types import (
 )
 
 TRANSIENT_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 529})
+_TRANSIENT_NAME_MARKERS = ("Connection", "Timeout")
+_TRANSIENT_TRANSPORT_CLASSES = frozenset({"TransportError", "TimeoutException"})
 METHODS: tuple[Method, ...] = ("logprobs", "grammar", "structured", "discrete")
 APIS: tuple[Api, ...] = ("auto", "chat_completions", "responses")
 MAX_TOP_LOGPROBS = 20
@@ -79,11 +83,26 @@ class RetryPolicy(BaseModel):
     max_delay: float = 8.0
 
 
+def _status_code(exc: BaseException) -> int | None:
+    """The provider's HTTP status, when the exception carries one in a readable form."""
+    status = getattr(exc, "status_code", None)
+    if status is None or isinstance(status, bool):
+        return None
+    try:
+        return int(status)
+    except (TypeError, ValueError):
+        return None
+
+
 def _is_transient(exc: BaseException) -> bool:
-    if getattr(exc, "status_code", None) in TRANSIENT_STATUS_CODES:
+    if _status_code(exc) in TRANSIENT_STATUS_CODES:
         return True
-    name = type(exc).__name__
-    return "Connection" in name or "Timeout" in name
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    # Transport failures of the httpx family (ConnectError, ReadError, RemoteProtocolError, ...) are
+    # named after neither "Connection" nor "Timeout"; their base classes are the reliable marker.
+    if names & _TRANSIENT_TRANSPORT_CLASSES:
+        return True
+    return any(marker in name for name in names for marker in _TRANSIENT_NAME_MARKERS)
 
 
 def _dump_model(obj: Any) -> Any:
@@ -94,20 +113,6 @@ def _dump_model(obj: Any) -> Any:
         except TypeError:  # pragma: no cover - non-pydantic objects with a model_dump()
             return dump()
     return obj
-
-
-def _spec_debug(spec: CallSpec) -> dict[str, Any]:
-    return {
-        "messages": spec.messages,
-        "logprobs": spec.logprobs,
-        "top_logprobs": spec.top_logprobs,
-        "schema_name": spec.schema_name,
-        "json_schema": spec.json_schema,
-        "grammar": spec.grammar,
-        "reasoning": spec.reasoning.model_dump(exclude_none=True) if spec.reasoning else None,
-        "temperature": spec.temperature,
-        "stop": spec.stop,
-    }
 
 
 def _pick_examples(examples: Examples, question_id: str) -> Sequence[Example]:
@@ -216,6 +221,13 @@ class _BaseClient:
             raise JevperError(f"n_retry_malformed must be >= 0, got {n_retry_malformed!r}")
         if reasoning is not None and not isinstance(reasoning, ReasoningConfig):
             raise JevperError(f"reasoning must be a ReasoningConfig, got {type(reasoning).__name__}")
+        if retry is not None and not isinstance(retry, RetryPolicy):
+            raise JevperError(f"retry must be a RetryPolicy, got {type(retry).__name__}")
+        policy = retry or RetryPolicy()
+        if policy.n_retries < 0 or policy.base_delay < 0 or policy.max_delay < 0:
+            raise JevperError(
+                f"retry needs n_retries, base_delay and max_delay >= 0, got {policy!r}"
+            )
         self.client = client
         self.model = model
         self.method = method
@@ -227,11 +239,12 @@ class _BaseClient:
         self.top_logprobs = top_logprobs
         self.max_concurrency = max_concurrency
         self.n_retry_malformed = n_retry_malformed
-        self.retry = retry or RetryPolicy()
+        self.retry = policy
         self.temperature = temperature
         self.extra_body = extra_body
         self.extra_headers = extra_headers
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._executor_lock = threading.Lock()
 
     # -- shared helpers ----------------------------------------------------------------
 
@@ -317,12 +330,20 @@ class _BaseClient:
         if context.mode == "two_step":
             analysis = build_analysis_messages(state, question, labels, examples, method=context.method)
             result = yield CallSpec(messages=analysis, reasoning=context.analysis_reasoning)
-            trace = result.text
             native_reasoning = result.reasoning
-            messages = messages + [
-                {"role": "assistant", "content": trace},
-                {"role": "user", "content": ANSWER_CUE},
-            ]
+            # A model that reasons without writing output leaves `text` empty; its reasoning items are
+            # then the analysis. An empty assistant turn is never sent: several OpenAI-compatible
+            # servers reject empty content, and it would teach the answer pass nothing.
+            trace = result.text.strip() or None
+            trace_text = trace or reasoning_text(native_reasoning).strip() or None
+            messages = messages + (
+                [
+                    {"role": "assistant", "content": trace_text},
+                    {"role": "user", "content": ANSWER_CUE},
+                ]
+                if trace_text is not None
+                else [{"role": "user", "content": ANSWER_CUE}]
+            )
 
         correction: str | None = None
         for attempt in range(self.n_retry_malformed + 1):
@@ -513,7 +534,7 @@ class SystemOneClient(_BaseClient):
                 log.add_attempt(
                     question_id,
                     surface=context.transport.surface,
-                    request=_spec_debug(spec),
+                    request=context.transport.kwargs(spec, context.model),
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 if not _is_transient(exc) or attempt >= self.retry.n_retries:
@@ -554,10 +575,14 @@ class SystemOneClient(_BaseClient):
             except BaseException as exc:  # noqa: BLE001 - re-raised below, in question order
                 failure = exc
         else:
-            if self._executor is None:
-                self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_concurrency)
+            with self._executor_lock:
+                if self._executor is None:
+                    self._executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=self.max_concurrency
+                    )
+                executor = self._executor
             futures = {
-                question_id: self._executor.submit(self._run, question_id, question, state, context)
+                question_id: executor.submit(self._run, question_id, question, state, context)
                 for question_id, question in parsed.items()
             }
             for question_id, future in futures.items():
@@ -572,9 +597,10 @@ class SystemOneClient(_BaseClient):
 
     def close(self) -> None:
         """Shut down the internal thread pool. The caller owns ``client``."""
-        if self._executor is not None:
-            self._executor.shutdown(wait=True)
-            self._executor = None
+        with self._executor_lock:
+            executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     def __enter__(self) -> SystemOneClient:
         return self
@@ -609,7 +635,7 @@ class AsyncSystemOneClient(_BaseClient):
                 log.add_attempt(
                     question_id,
                     surface=context.transport.surface,
-                    request=_spec_debug(spec),
+                    request=context.transport.kwargs(spec, context.model),
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 if not _is_transient(exc) or attempt >= self.retry.n_retries:

@@ -134,3 +134,50 @@ def test_reasoning_mode_must_be_a_config(stub_server):
     with pytest.raises(Exception) as error:
         SystemOneClient(openai_client(stub), model="stub", reasoning={"effort": "medium"})  # type: ignore[arg-type]
     assert "ReasoningConfig" in str(error.value)
+
+
+def test_two_step_without_analysis_text_sends_no_empty_assistant_turn(stub_server):
+    calls: list[dict] = []
+
+    def script(body):
+        calls.append(body)
+        if len(calls) == 1:
+            return 200, chat_body(content="")
+        return 200, chat_body(content="A", logprobs=CHOICE_LOGS)
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", reasoning=ReasoningConfig(mode="two_step")
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    answer = stub.bodies("/chat/completions")[1]
+    assert [message["role"] for message in answer["messages"]] == ["system", "user", "user", "user"]
+    assert answer["messages"][-1]["content"] == ANSWER_CUE
+    assert response.answers["q"].choice == "billing"
+    assert response.reasoning == ()
+
+
+def test_two_step_falls_back_to_reasoning_text_when_the_analysis_is_silent(stub_server):
+    calls: list[dict] = []
+
+    def script(body):
+        calls.append(body)
+        if len(calls) == 1:
+            return 200, responses_body(text="", reasoning=[reasoning_item(TRACE)])
+        return 200, responses_body(text="A", logprobs=CHOICE_LOGS)
+
+    stub = stub_server(responses=script)
+    client = SystemOneClient(
+        openai_client(stub), model="stub", reasoning=ReasoningConfig(effort="medium", mode="two_step")
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    answer = stub.bodies("/responses")[1]
+    assert answer["input"][-2] == {"role": "assistant", "content": TRACE}
+    assert response.answers["q"].choice == "billing"
+    # the provider's own item carries the trace: no synthetic part, so no duplicated text
+    assert len(response.reasoning) == 1
+    assert reasoning_text(response.reasoning) == TRACE

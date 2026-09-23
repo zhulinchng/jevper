@@ -167,6 +167,9 @@ def softmax_over_labels(values: Mapping[str, float]) -> dict[str, float]:
     A grammar masks logits but never renormalizes them, so renormalizing the pre-mask distribution
     over the label set equals the post-mask distribution: one code path is correct for both.
     """
+    for key, value in values.items():
+        if value != float("-inf") and (math.isnan(value) or value == float("inf")):
+            raise LabelReadoutError(f"logprob for {key!r} must be finite or -inf, got {value!r}")
     best = max(values.values(), default=float("-inf"))
     if best == float("-inf"):
         raise LabelReadoutError("no probability mass on any label")
@@ -200,6 +203,10 @@ def _logprob_readout(
     method: Method,
 ) -> Readout:
     token = first_answer_token(result, labels, method=method)
+    if token.logprob is None:
+        raise LabelReadoutError(
+            f"the provider returned no logprob for the answer token {token.token!r} (method={method!r})"
+        )
     answer_label = token.token.strip().upper()
     logprobs: dict[str, float] = {label: float("-inf") for label in labels}
     logprobs[answer_label] = token.logprob
@@ -291,6 +298,34 @@ def readout_structured(result: CallResult, question: Question) -> Readout:
     )
 
 
+def _level_index(value: Any, levels: Sequence[int]) -> int | None:
+    """A level index given as an int, an integral float or an integral number in a string."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        index = value
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not number.is_integer():
+            return None
+        index = int(number)
+    return index if index in levels else None
+
+
+def _boolean(value: Any) -> bool | None:
+    """A JSON boolean, or its string form; ``None`` when it is neither."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "false"):
+            return text == "true"
+    return None
+
+
 def readout_discrete(result: CallResult, question: Question, labels: Sequence[str]) -> Readout:
     payload = parse_json_object(result.text)
     if question.type == "choice":
@@ -314,19 +349,21 @@ def readout_discrete(result: CallResult, question: Question, labels: Sequence[st
         )
     if question.type == "noul":
         raw = payload.get("noul")
-        if not isinstance(raw, bool):
+        flag = _boolean(raw)
+        if flag is None:
             raise MalformedAnswerError(f"'noul' must be a boolean, got {raw!r}")
         return Readout(
-            probabilities={True: 1.0 if raw else 0.0, False: 0.0 if raw else 1.0},
+            probabilities={True: 1.0 if flag else 0.0, False: 0.0 if flag else 1.0},
             source="discrete",
             observed_text=result.text,
         )
     levels = list(range(len(question.criteria)))
     raw = payload.get("score")
-    if isinstance(raw, bool) or not isinstance(raw, int) or raw not in levels:
+    level = _level_index(raw, levels)
+    if level is None:
         raise MalformedAnswerError(f"'score' must be one of the level indexes {levels!r}, got {raw!r}")
     return Readout(
-        probabilities={level: (1.0 if level == raw else 0.0) for level in levels},
+        probabilities={candidate: (1.0 if candidate == level else 0.0) for candidate in levels},
         source="discrete",
         observed_text=result.text,
     )

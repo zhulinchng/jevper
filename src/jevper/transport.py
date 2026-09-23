@@ -35,7 +35,7 @@ class CallSpec:
 @dataclass(frozen=True)
 class TokenLogprob:
     token: str
-    logprob: float
+    logprob: float | None
     top_logprobs: tuple[tuple[str, float], ...] = ()
 
 
@@ -168,11 +168,21 @@ def _token_logprobs(logprobs: Any) -> tuple[TokenLogprob, ...]:
         if token is None:
             continue
         logprob = _get(entry, "logprob")
-        tops = tuple(
-            (str(_get(top, "token")), float(_get(top, "logprob", 0.0) or 0.0))
-            for top in (_get(entry, "top_logprobs") or ())
+        tops: list[tuple[str, float]] = []
+        for top in _get(entry, "top_logprobs") or ():
+            top_token = _get(top, "token")
+            top_logprob = _get(top, "logprob")
+            if top_token is None or top_logprob is None:
+                continue
+            tops.append((str(top_token), float(top_logprob)))
+        tokens.append(
+            TokenLogprob(
+                token=str(token),
+                # A missing logprob stays missing: 0.0 would read as certainty.
+                logprob=None if logprob is None else float(logprob),
+                top_logprobs=tuple(tops),
+            )
         )
-        tokens.append(TokenLogprob(token=str(token), logprob=float(logprob or 0.0), top_logprobs=tops))
     return tuple(tokens)
 
 
@@ -309,7 +319,7 @@ class Transport:
 class ChatCompletionsTransport(Transport):
     surface: Surface = "chat_completions"
 
-    def _kwargs(self, spec: CallSpec, model: str) -> dict[str, Any]:
+    def kwargs(self, spec: CallSpec, model: str) -> dict[str, Any]:
         return build_chat_kwargs(
             spec,
             model=model,
@@ -319,11 +329,11 @@ class ChatCompletionsTransport(Transport):
         )
 
     def call(self, spec: CallSpec, model: str) -> CallResult:
-        kwargs = self._kwargs(spec, model)
+        kwargs = self.kwargs(spec, model)
         return _chat_result(self.client.chat.completions.create(**kwargs), kwargs)
 
     async def acall(self, spec: CallSpec, model: str) -> CallResult:
-        kwargs = self._kwargs(spec, model)
+        kwargs = self.kwargs(spec, model)
         response = await self.client.chat.completions.create(**kwargs)
         return _chat_result(response, kwargs)
 
@@ -331,7 +341,7 @@ class ChatCompletionsTransport(Transport):
 class ResponsesTransport(Transport):
     surface: Surface = "responses"
 
-    def _kwargs(self, spec: CallSpec, model: str) -> dict[str, Any]:
+    def kwargs(self, spec: CallSpec, model: str) -> dict[str, Any]:
         return build_responses_kwargs(
             spec,
             model=model,
@@ -341,11 +351,11 @@ class ResponsesTransport(Transport):
         )
 
     def call(self, spec: CallSpec, model: str) -> CallResult:
-        kwargs = self._kwargs(spec, model)
+        kwargs = self.kwargs(spec, model)
         return _responses_result(self.client.responses.create(**kwargs), kwargs)
 
     async def acall(self, spec: CallSpec, model: str) -> CallResult:
-        kwargs = self._kwargs(spec, model)
+        kwargs = self.kwargs(spec, model)
         response = await self.client.responses.create(**kwargs)
         return _responses_result(response, kwargs)
 

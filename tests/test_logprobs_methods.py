@@ -137,3 +137,61 @@ def test_corrective_retry_succeeds_and_records_reason(stub_server):
     assert len(stub.bodies("/chat/completions")) == 2
     assert len(response.debug["retry_reasons"]) == 1
     assert response.usage.n_calls == 2
+
+
+def _logprobs_body(tokens: list[dict]) -> dict:
+    body = chat_body(content="A")
+    body["choices"][0]["logprobs"] = {"content": tokens}
+    return body
+
+
+def test_missing_logprob_on_the_answer_token_is_an_error_not_certainty(stub_server):
+    body = _logprobs_body(
+        [
+            {"token": "A", "logprob": None, "top_logprobs": [{"token": "A", "logprob": None}, {"token": "B", "logprob": -2.0}]},
+            {"token": "B", "logprob": -2.0, "top_logprobs": []},
+        ]
+    )
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    with pytest.raises(LabelReadoutError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria={"billing": None, "sales": None})})
+
+    assert "no logprob for the answer token 'A'" in str(error.value)
+    assert len(stub.bodies("/chat/completions")) == 2  # one corrective retry, not a silent 1.0
+
+
+def test_alternative_without_a_logprob_is_reported_missing(stub_server):
+    body = _logprobs_body(
+        [
+            {
+                "token": "A",
+                "logprob": -0.12,
+                "top_logprobs": [{"token": "A", "logprob": -0.12}, {"token": "B", "logprob": None}],
+            }
+        ]
+    )
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    response = client.system_one(
+        state="s", questions={"q": Choice(criteria={"billing": None, "sales": None})}
+    )
+
+    assert response.answers["q"].probabilities == {"billing": 1.0, "sales": 0.0}
+    assert response.debug["labels_missing"] == {"q": ["B"]}
+
+
+def test_non_finite_logprobs_raise_instead_of_poisoning_the_distribution():
+    from jevper.methods import softmax_over_labels
+
+    with pytest.raises(LabelReadoutError) as error:
+        softmax_over_labels({"A": float("nan"), "B": -1.0})
+    assert "'A'" in str(error.value) and "nan" in str(error.value)
+
+    with pytest.raises(LabelReadoutError):
+        softmax_over_labels({"A": float("inf"), "B": -1.0})
+
+    # -inf is a legitimate zero, not an error
+    assert softmax_over_labels({"A": float("-inf"), "B": -1.0}) == {"A": 0.0, "B": 1.0}

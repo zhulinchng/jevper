@@ -183,12 +183,14 @@ unusable `state`, or `grammar` on a surface that cannot carry a grammar.
 | `InvalidQuestionError` | question or few-shot example is locally invalid |
 | `UnsupportedMethodError` | `method="grammar"` on the Responses surface |
 | `ClientCapabilityError` | the client lacks the attribute the chosen surface needs, or returned no choices |
-| `LabelReadoutError` | the first answer token is not a label, or no logprobs came back |
+| `LabelReadoutError` | the first answer token is not a label, or no logprobs (or no logprob for that token) came back |
 | `MalformedAnswerError` | the JSON answer had an unusable shape after corrective retries |
 | `ProviderError` | a provider call failed; `.attempts` carries the attempt history |
+| `JevperError` | constructor misuse, a bad `state` message, or content that is not JSON-serializable |
 
-Transient failures (HTTP 429/500/502/503/504/529, or an exception whose class name contains `Connection` or
-`Timeout`) are retried per call with `RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0)` and exponential
+Transient failures (HTTP 429/500/502/503/504/529, connection and timeout errors — including the `httpx`
+transport errors whose class names carry neither word) are retried per call with
+`RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0)` and exponential
 backoff `min(base_delay · 3ⁿ, max_delay)`. Unreadable answers get one corrective retry
 (`n_retry_malformed`) with the failure appended to the conversation. `ProviderError` propagates after all
 questions have settled, in question insertion order.

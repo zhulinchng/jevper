@@ -34,7 +34,10 @@ _STATE_ROLES = ("system", "user", "assistant", "developer")
 def render_content(value: JSONContent) -> str:
     if isinstance(value, str):
         return value
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2)
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise JevperError(f"content must be JSON-serializable with finite numbers: {exc}") from exc
 
 
 def render_state_messages(state: Any) -> list[dict[str, str]]:
@@ -126,20 +129,51 @@ def example_answer_label(question: Question, labels: Sequence[str], answer: Any,
     raise problem
 
 
+def _example_probabilities(
+    question: Question, probabilities: Mapping[Any, float], index: int
+) -> dict[str, float]:
+    """An example's own distribution, keyed the way the answer schema is and checked against the question."""
+    expected = (
+        [str(level) for level in range(len(question.criteria))]
+        if question.type == "score"
+        else list(question.criteria)
+    )
+    given = {str(name): float(value) for name, value in probabilities.items()}
+    if set(given) != set(expected):
+        raise InvalidQuestionError(
+            f"example {index}: probabilities must have exactly the keys {expected}, got {sorted(given)}"
+        )
+    for name, value in given.items():
+        if value < 0:
+            raise InvalidQuestionError(
+                f"example {index}: probability for {name!r} must be >= 0, got {value!r}"
+            )
+    return {name: given[name] for name in expected}
+
+
 def _structured_example_answer(question: Question, labels: Sequence[str], example: Example, index: int) -> str:
     label = example_answer_label(question, labels, example.answer, index)
     key = label_to_key(question, labels)[label]
     probabilities = example.probabilities
     if question.type == "noul":
-        if probabilities is not None and _present(probabilities, True):
+        if probabilities is None:
+            value = 1.0 if key is True else 0.0
+        elif _present(probabilities, True):
             value = float(_lookup(probabilities, True))
-        elif probabilities is not None and _present(probabilities, False):
+        elif _present(probabilities, False):
             value = 1.0 - float(_lookup(probabilities, False))
         else:
-            value = 1.0 if key is True else 0.0
+            raise InvalidQuestionError(
+                f"example {index}: probabilities must have a True or False key, "
+                f"got {sorted(str(name) for name in probabilities)}"
+            )
+        if not 0.0 <= value <= 1.0:
+            raise InvalidQuestionError(
+                f"example {index}: noul probability must be in [0, 1], got {value!r}"
+            )
         payload: dict[str, Any] = {"noul": value}
     elif probabilities is not None:
-        payload = {"probabilities": {str(name): float(value) for name, value in probabilities.items()}}
+        payload = {"probabilities": _example_probabilities(question, probabilities, index)}
     elif question.type == "choice":
         payload = {"probabilities": {name: (1.0 if name == key else 0.0) for name in question.criteria}}
     else:
@@ -167,7 +201,11 @@ def render_examples(
     """One user turn (example state + question block) and one assistant turn (expected answer) per example."""
     turns: list[dict[str, str]] = []
     for index, example in enumerate(examples):
-        turns.append({"role": "user", "content": render_question_turn(example.state, question, labels)})
+        try:
+            turn = render_question_turn(example.state, question, labels)
+        except JevperError as exc:
+            raise JevperError(f"example {index}: {exc}") from exc
+        turns.append({"role": "user", "content": turn})
         if method == "structured":
             content = _structured_example_answer(question, labels, example, index)
         else:
