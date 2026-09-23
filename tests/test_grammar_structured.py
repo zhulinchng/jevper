@@ -1,0 +1,217 @@
+"""Grammar, structured and discrete methods, plus the Responses surface."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+from fakes import chat_body, openai_client, responses_body
+
+from jevper import (
+    Choice,
+    Noul,
+    Score,
+    SystemOneClient,
+    UnsupportedMethodError,
+)
+
+CHOICE_LOGS = [("A", -0.12), ("B", -2.47), ("C", -3.48)]
+CRITERIA = {"billing": None, "technical": None, "sales": None}
+
+
+def test_grammar_sends_gbnf_on_the_chat_surface(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", method="grammar")
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert stub.paths == ["/v1/chat/completions"]
+    sent = stub.bodies("/chat/completions")[0]
+    assert sent["grammar"] == 'root ::= "A" | "B" | "C"\n'
+    assert sent["logprobs"] is True
+    assert sent["top_logprobs"] == 20
+    assert response.answers["q"].choice == "billing"
+    assert response.debug["method"] == "grammar"
+
+
+def test_grammar_on_the_responses_surface_fails_before_any_request(stub_server):
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content="A")),
+        responses=lambda _: (200, responses_body(text="A")),
+    )
+    client = SystemOneClient(openai_client(stub), model="stub", method="grammar", api="responses")
+
+    with pytest.raises(UnsupportedMethodError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "chat_completions" in str(error.value)
+    assert stub.requests == []
+
+
+def test_grammar_without_logprobs_points_at_discrete(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A")))
+    client = SystemOneClient(openai_client(stub), model="stub", method="grammar")
+
+    from jevper import LabelReadoutError
+
+    with pytest.raises(LabelReadoutError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "method='discrete'" in str(error.value)
+
+
+def test_structured_reads_probabilities_verbatim(stub_server):
+    payload = {"probabilities": {"billing": 0.8, "technical": 0.1, "sales": 0.1}}
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps(payload))))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions"
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    answer = response.answers["q"]
+    assert answer.probabilities == {"billing": 0.8, "technical": 0.1, "sales": 0.1}
+    assert answer.choice == "billing"
+    assert answer.confidence == pytest.approx(0.7, abs=1e-12)
+    assert response.debug["probability_errors"] == {}
+    assert response.debug["original_probabilities"] == {}
+    sent = stub.bodies("/chat/completions")[0]
+    response_format = sent["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["name"] == "jevper_choice"
+    assert response_format["json_schema"]["strict"] is True
+    schema = response_format["json_schema"]["schema"]
+    assert schema["properties"]["probabilities"]["additionalProperties"] is False
+    assert schema["required"] == ["probabilities"]
+
+
+def test_structured_rescales_off_distribution_and_keeps_the_original(stub_server):
+    payload = {"probabilities": {"billing": 0.5, "technical": 0.1, "sales": 0.1}}
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps(payload))))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions"
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    answer = response.answers["q"]
+    assert answer.probabilities["billing"] == pytest.approx(0.5 / 0.7, abs=1e-12)
+    assert answer.probabilities["technical"] == pytest.approx(0.1 / 0.7, abs=1e-12)
+    assert response.debug["probability_errors"]["q"] == pytest.approx(0.3, abs=1e-12)
+    assert response.debug["original_probabilities"]["q"] == {
+        "billing": 0.5,
+        "technical": 0.1,
+        "sales": 0.1,
+    }
+
+
+def test_structured_normalization_can_be_disabled(stub_server):
+    payload = {"probabilities": {"billing": 0.5, "technical": 0.1, "sales": 0.1}}
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps(payload))))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="structured",
+        api="chat_completions",
+        normalize_probabilities=False,
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].probabilities == {"billing": 0.5, "technical": 0.1, "sales": 0.1}
+    assert response.debug["probability_errors"]["q"] == pytest.approx(0.3, abs=1e-12)
+    assert response.debug["original_probabilities"] == {}
+
+
+def test_structured_without_strict_outputs_falls_back_to_json_object(stub_server):
+    payload = {"probabilities": {"billing": 0.5, "sales": 0.5}}
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps(payload))))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="structured",
+        api="chat_completions",
+        structured_outputs=False,
+    )
+
+    client.system_one(state="s", questions={"q": Choice(criteria={"billing": None, "sales": None})})
+
+    assert stub.bodies("/chat/completions")[0]["response_format"] == {"type": "json_object"}
+
+
+def test_structured_noul_and_score_shapes(stub_server):
+    bodies = {
+        "jevper_noul": {"noul": 0.9},
+        "jevper_score": {"probabilities": {"0": 0.1, "1": 0.2, "2": 0.7}},
+    }
+
+    def script(body):
+        name = body["response_format"]["json_schema"]["name"]
+        return 200, chat_body(content=json.dumps(bodies[name]))
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions"
+    )
+
+    response = client.system_one(
+        state="s",
+        questions={"verdict": Noul(), "anger": Score(criteria=["Calm", "Frustrated", "Very angry"])},
+    )
+
+    assert response.answers["verdict"].noul == pytest.approx(0.9, abs=1e-12)
+    score = response.answers["anger"]
+    assert score.probabilities == {0: 0.1, 1: 0.2, 2: 0.7}
+    assert score.score == pytest.approx(1.6, abs=1e-12)
+    assert score.legend == {0: "Calm", 1: "Frustrated", 2: "Very angry"}
+
+
+def test_discrete_reports_one_hot_distributions(stub_server):
+    bodies = {
+        "jevper_choice": {"choice": "technical"},
+        "jevper_noul": {"noul": True},
+        "jevper_score": {"score": 2},
+    }
+
+    def script(body):
+        name = body["response_format"]["json_schema"]["name"]
+        return 200, chat_body(content=json.dumps(bodies[name]))
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(openai_client(stub), model="stub", method="discrete", api="chat_completions")
+
+    response = client.system_one(
+        state="s",
+        questions={
+            "q": Choice(criteria=CRITERIA),
+            "verdict": Noul(),
+            "anger": Score(criteria=["Calm", "Frustrated", "Very angry"]),
+        },
+    )
+
+    choice = response.answers["q"]
+    assert choice.probabilities == {"billing": 0.0, "technical": 1.0, "sales": 0.0}
+    assert choice.choice == "technical"
+    assert choice.confidence == pytest.approx(1.0, abs=1e-12)
+    assert response.answers["verdict"].noul == 1.0
+    assert response.answers["anger"].probabilities == {0: 0.0, 1: 0.0, 2: 1.0}
+    assert response.answers["anger"].score == 2.0
+    assert response.debug["method"] == "discrete"
+
+
+def test_responses_surface_logprobs(stub_server):
+    stub = stub_server(responses=lambda _: (200, responses_body(text="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub")
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert stub.paths == ["/v1/responses"]
+    sent = stub.bodies("/responses")[0]
+    assert sent["top_logprobs"] == 20
+    assert sent["store"] is False
+    assert sent["include"] == ["message.output_text.logprobs"]
+    assert "logprobs" not in sent
+    answer = response.answers["q"]
+    assert answer.choice == "billing"
+    assert answer.probabilities["billing"] == pytest.approx(0.884873983, abs=1e-9)
+    assert response.debug["api"] == "responses"
