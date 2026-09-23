@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "jevper"
 version = "0.1.0"
-description = "Jev-shaped (TypeSafe System One) classification wrapper over OpenAI-like clients"
+description = "Jev/System One classification over any OpenAI-like client: probabilities and confidence instead of prose"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"

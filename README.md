@@ -1,8 +1,12 @@
 # jevper
 
-`jevper` wraps any OpenAI-like client and gives you a [Jev](https://docs.typesafe.ai) (TypeSafe System One)
-shaped answer instead of prose: you send a `state` plus typed `questions`, and you get back probabilities and
-confidence.
+Ask a language model for a label and you get prose back. Ask through `jevper` and you get numbers instead: a
+probability for every option, and a confidence for the decision. You send a `state` plus typed `questions`
+(`noul` = yes/no, `choice` = pick one of your options, `score` = rate on an ordered scale) and read the answer
+as a distribution.
+
+That distribution is the shape the [Jev](https://docs.typesafe.ai) (TypeSafe System One) API returns, so code
+written against the hosted API can swap in `jevper` and run against any OpenAI-compatible endpoint.
 
 It does not call the hosted TypeSafe API and does not depend on `typesafe-sdk` or `openai` at runtime — the
 client object is duck-typed. Any object exposing `responses.create` or `chat.completions.create` works,
@@ -74,7 +78,8 @@ Each question becomes its own provider call, so questions are independent and ru
 
 ## Questions
 
-Three types, mirroring the Jev API:
+Three types, mirroring the Jev API — `Noul` answers yes/no with one probability, `Choice` picks one of your
+labelled options, `Score` rates on an ordered scale:
 
 | Type | Criteria | Answer |
 | --- | --- | --- |
