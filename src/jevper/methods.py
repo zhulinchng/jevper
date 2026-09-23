@@ -13,8 +13,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .errors import LabelReadoutError, MalformedAnswerError, UnsupportedMethodError
-from .labels import label_to_key
+from .errors import (
+    InvalidQuestionError,
+    LabelReadoutError,
+    MalformedAnswerError,
+    UnsupportedMethodError,
+)
+from .labels import MAX_CHOICE_OPTIONS, MAX_LABEL_OPTIONS, label_to_key
 from .reasoning import ReasoningConfig
 from .transport import CallResult, CallSpec, TokenLogprob
 from .types import Method, Question
@@ -23,6 +28,23 @@ GRAMMAR_SURFACE_HINT = (
     "grammar requires a Chat Completions surface that accepts a `grammar` field (llama-cpp-python and "
     "similar servers); pass api='chat_completions'"
 )
+
+
+def require_label_readout(method: Method, question: Question, question_id: str) -> None:
+    """``logprobs``/``grammar`` read one label token, so they cannot go past the single-letter alphabet.
+
+    ``structured`` and ``discrete`` answer in JSON, where a label is just a string, so they carry the
+    full Jev API range and two-letter labels.
+    """
+    if method not in ("logprobs", "grammar") or question.type != "choice":
+        return
+    count = len(question.criteria)
+    if count > MAX_LABEL_OPTIONS:
+        raise InvalidQuestionError(
+            f"question {question_id!r}: {count} options exceed the {MAX_LABEL_OPTIONS} labels a "
+            f"single-token {method} readout can distinguish (the first token of 'AA' is 'A'); use "
+            f"method='structured' or method='discrete', which handle up to {MAX_CHOICE_OPTIONS}"
+        )
 
 
 @dataclass(frozen=True)

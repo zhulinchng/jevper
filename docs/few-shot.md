@@ -13,8 +13,9 @@ Example(state="Charged twice for one order", answer="billing")
 Example(state="Login fails after reset", answer="technical", probabilities={"billing": 0.05, "technical": 0.9})
 ```
 
-`answer` accepts a label (`"B"`, case-insensitive), a `Choice` criteria key, a `Score` level index, or a bool
-for `Noul`. `probabilities` is only read by `method="structured"`.
+`answer` accepts a label (`"B"`, case-insensitive; two letters such as `"AB"` past 26 options), a `Choice`
+criteria key, a `Score` level index, or a bool for `Noul`. `probabilities` is only read by
+`method="structured"`.
 
 ## Where examples come from
 

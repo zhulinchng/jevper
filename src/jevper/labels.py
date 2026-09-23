@@ -1,7 +1,9 @@
 """Label allocation and label -> answer-key mapping.
 
-Single-letter labels only: multi-letter labels break first-token logprob readout (the first token of
-``"AA"`` is ``"A"``), so every method shares the 26-option cap.
+Labels are single letters ``A``..``Z`` for up to 26 options; past that they become two letters
+(``AA``, ``AB``, ...), which only methods that never read a label *token* can use: a first-token
+logprob readout cannot tell ``"AA"`` from ``"A"``, so ``logprobs`` and ``grammar`` stay capped at
+``MAX_LABEL_OPTIONS`` (enforced by ``methods.require_label_readout``).
 """
 
 from __future__ import annotations
@@ -10,22 +12,21 @@ import string
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
-from .errors import InvalidQuestionError
-
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .types import Question
 
 LABELS = tuple(string.ascii_uppercase)
-MAX_LABEL_OPTIONS = len(LABELS)
+MAX_LABEL_OPTIONS = len(LABELS)  # what one label token can distinguish
+MAX_CHOICE_OPTIONS = 255  # Jev API limit
 
 
 def labels_for(count: int) -> tuple[str, ...]:
-    """The first ``count`` labels, or ``InvalidQuestionError`` when they do not exist."""
-    if count > MAX_LABEL_OPTIONS:
-        raise InvalidQuestionError(
-            f"{count} options exceed the {MAX_LABEL_OPTIONS}-label cap; split the question into smaller ones"
-        )
-    return LABELS[:count]
+    """Labels for ``count`` options: ``A``..``Z``, then two letters (``AA``, ``AB``, ...)."""
+    if count <= MAX_LABEL_OPTIONS:
+        return LABELS[:count]
+    return tuple(
+        LABELS[index // MAX_LABEL_OPTIONS] + LABELS[index % MAX_LABEL_OPTIONS] for index in range(count)
+    )
 
 
 def label_to_key(question: Question, labels: Sequence[str]) -> dict[str, Any]:

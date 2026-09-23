@@ -86,20 +86,23 @@ labelled options, `Score` rates on an ordered scale:
 | Type | Criteria | Answer |
 | --- | --- | --- |
 | `Noul(instructions=..., criteria={"true": ..., "false": ...})` | optional | `{"type": "noul", "noul": 0.93}` |
-| `Choice(instructions=..., criteria={"billing": "...", ...})` | 2–26 keys | `{"type": "choice", "choice": "billing", "probabilities": {...}, "confidence": 0.83}` |
+| `Choice(instructions=..., criteria={"billing": "...", ...})` | 2–255 keys | `{"type": "choice", "choice": "billing", "probabilities": {...}, "confidence": 0.83}` |
 | `Score(instructions=..., criteria=["Calm", "Frustrated", "Very angry"])` | 2–10 levels | `{"type": "score", "score": 1.05, "legend": {...}, "probabilities": {...}, "confidence": 0.92}` |
 
 `Score.score` is the probability-weighted level index (`Σ i·pᵢ`, levels zero-based), as in the Jev API.
-`Choice` is capped at 26 options because every method labels options with single letters `A`–`Z`; a larger
-question raises `InvalidQuestionError` telling you to split it.
+`Choice` takes up to 255 options, the Jev API limit. The two methods that read a label *token* —
+`logprobs` and `grammar` — stop at 26, because the first token of `"AA"` is `"A"`; past 26 options they
+raise `InvalidQuestionError` pointing at `structured` and `discrete`, which answer in JSON and use
+two-letter labels.
 
 Questions can also be passed as raw mappings (`{"type": "choice", "criteria": {...}}`) and are validated the
 same way.
 
 ## Methods
 
-`method=` decides how the decision is elicited. All four share the same 26-label cap and the same
-label→option mapping, so switching methods does not change your types.
+`method=` decides how the decision is elicited. All four share the same label→option mapping, so switching
+methods does not change your types; only the label alphabet differs (`logprobs` and `grammar` need
+single-letter labels, so they cap at 26 options).
 
 | Method | Request | Readout | Needs |
 | --- | --- | --- | --- |

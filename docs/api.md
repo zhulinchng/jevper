@@ -98,7 +98,9 @@ Score(instructions=None, criteria=["level description"], examples=())
   pretty-printed JSON.
 - `criteria` is required for `Choice` and `Score`, optional for `Noul`. `Noul` criteria keys must be `true`
   and/or `false`; anything else raises `InvalidQuestionError`.
-- Limits: `Choice` 2–26 options, `Score` 2–10 levels. Unknown fields are rejected (`extra="forbid"`).
+- Limits: `Choice` 2–255 options (the Jev API limit), `Score` 2–10 levels. `logprobs` and `grammar` cap a
+  `Choice` at 26 options, because they read one label token; `structured` and `discrete` carry the full range
+  with two-letter labels past `Z`. Unknown fields are rejected (`extra="forbid"`).
 - `examples` is a tuple of `Example` and is excluded from `model_dump()`, so dumps keep exactly the Jev wire
   keys `{"type", "instructions", "criteria"}`.
 - Validation runs on construction and again in `system_one`, so both paths fail identically. A mapping passed
@@ -204,7 +206,7 @@ All inherit from `JevperError`.
 
 | Error | Raised when |
 | --- | --- |
-| `InvalidQuestionError` | question or example is locally invalid; also raised by `labels_for` past 26 options |
+| `InvalidQuestionError` | question or example is locally invalid; also raised when `logprobs`/`grammar` get a `Choice` with more than 26 options |
 | `UnsupportedMethodError` | `method="grammar"` and the selected surface is not Chat Completions |
 | `ClientCapabilityError` | the client lacks the attribute a surface needs, or a chat response carried no choices |
 | `LabelReadoutError` | no logprobs, no non-whitespace token, a first token that is not a label, or no probability mass on any label |
@@ -216,6 +218,7 @@ All inherit from `JevperError`.
 
 `Method` and `Api` are `Literal` aliases; the runtime tuples are `jevper.client.METHODS` and
 `jevper.client.APIS`. `jevper.client.TRANSIENT_STATUS_CODES`, `jevper.client.MAX_TOP_LOGPROBS` (`20`),
-`jevper.labels.MAX_LABEL_OPTIONS` (`26`), `jevper.types.CHOICE_MAX_OPTIONS`, `jevper.types.SCORE_MAX_LEVELS`
-(`10`) and `jevper.normalize.PROBABILITY_TOLERANCE` (`1e-6`) are available for callers that need to validate
-their own inputs before constructing a question.
+`jevper.labels.MAX_LABEL_OPTIONS` (`26`, the single-token alphabet), `jevper.labels.MAX_CHOICE_OPTIONS` and
+`jevper.types.CHOICE_MAX_OPTIONS` (`255`), `jevper.types.SCORE_MAX_LEVELS` (`10`) and
+`jevper.normalize.PROBABILITY_TOLERANCE` (`1e-6`) are available for callers that need to validate their own
+inputs before constructing a question.

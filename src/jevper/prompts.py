@@ -11,7 +11,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from .errors import InvalidQuestionError, JevperError
-from .labels import label_to_key
+from .labels import MAX_LABEL_OPTIONS, label_to_key
 from .types import Example, JSONContent, Method, Question
 
 SYSTEM_PROMPT = (
@@ -216,6 +216,12 @@ def build_analysis_messages(
 
 
 def correction_message(reason: str, labels: Sequence[str]) -> str:
+    if len(labels) > MAX_LABEL_OPTIONS:
+        # Listing 100+ labels would dwarf the question; the labels are already in the options block.
+        return (
+            f"Your previous reply was invalid: {reason}. Reply with exactly one of the labels listed "
+            f"with the options above, and nothing else."
+        )
     return (
         f"Your previous reply was invalid: {reason}. Reply with exactly one of these labels and nothing "
         f"else: {', '.join(labels)}."

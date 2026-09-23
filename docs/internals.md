@@ -8,7 +8,7 @@
 | --- | --- |
 | `errors.py` | The exception hierarchy; `ProviderError.attempts` carries the attempt records |
 | `types.py` | Wire-shaped Pydantic models: questions, answers, `Usage`, `SystemOneResponse`, question validation |
-| `labels.py` | `A`–`Z` allocation, the 26-option cap, label → answer-key mapping |
+| `labels.py` | Label allocation (`A`–`Z`, then `AA`–`ZZ`) and label → answer-key mapping |
 | `reasoning.py` | Reasoning config and content types, `reasoning_text`, mode resolution |
 | `prompts.py` | Message rendering: state turns, question blocks, few-shot turns, correction messages |
 | `transport.py` | The two surfaces: request builders, response normalizers, surface selection |
@@ -105,9 +105,10 @@ Worth keeping when editing:
 
 - No request ever carries `max_tokens`, `max_completion_tokens` or `max_output_tokens`. Reasoning tokens count
   against those caps, and a small cap truncates a reasoning model.
-- Options are labelled with single letters only. Multi-letter labels break first-token logprob readout, so the
-  26-option cap is shared by all four methods and `InvalidQuestionError` names it and says to split the
-  question.
+- Labels are single letters up to 26 options, two letters above that. Only `structured` and `discrete` may use
+  the two-letter range: multi-letter labels break first-token logprob readout, so `logprobs`/`grammar` raise
+  `InvalidQuestionError` past 26 options (`methods.require_label_readout`), and `Choice` itself stops at the Jev
+  API limit of 255.
 - `examples` never reaches the wire: `Field(exclude=True)` keeps question dumps and `SystemOneResponse` dumps
   at the Jev shape.
 - The caller's state turns are preserved verbatim and the question block is the final turn; the state is never

@@ -21,13 +21,13 @@ from pydantic import (
 )
 
 from .errors import InvalidQuestionError
-from .labels import MAX_LABEL_OPTIONS
+from .labels import MAX_CHOICE_OPTIONS
 from .reasoning import ReasoningContentPart
 
 JSONContent = str | dict[str, Any] | list[Any]
 
 CHOICE_MIN_OPTIONS = 2
-CHOICE_MAX_OPTIONS = MAX_LABEL_OPTIONS
+CHOICE_MAX_OPTIONS = MAX_CHOICE_OPTIONS
 SCORE_MIN_LEVELS = 2
 SCORE_MAX_LEVELS = 10  # Jev API limit
 
@@ -117,7 +117,7 @@ def validate_question(question: Question, question_id: str | None = None) -> Non
         if not CHOICE_MIN_OPTIONS <= count <= CHOICE_MAX_OPTIONS:
             raise InvalidQuestionError(
                 f"{where}: choice needs {CHOICE_MIN_OPTIONS}..{CHOICE_MAX_OPTIONS} options "
-                f"({CHOICE_MAX_OPTIONS} is the label cap; split the question to exceed it), got {count}"
+                f"({CHOICE_MAX_OPTIONS} is the Jev API limit; split the question to exceed it), got {count}"
             )
     elif isinstance(question, Score):
         count = len(question.criteria)

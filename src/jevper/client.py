@@ -256,6 +256,8 @@ class _BaseClient:
         surface = select_surface(self.client, api or self.api, effective_method)
         if effective_method == "grammar":
             methods.require_grammar_surface(surface)
+        for question_id, question in parsed.items():
+            methods.require_label_readout(effective_method, question, question_id)
         effective_reasoning = reasoning if reasoning is not None else self.reasoning
         mode = resolve_reasoning_mode(effective_reasoning, surface)
         context = _CallContext(

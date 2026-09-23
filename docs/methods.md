@@ -8,6 +8,12 @@ four methods share the same label machinery: options are labelled `A`, `B`, `C`,
 `False` (`Noul`). Switching methods never changes your question or answer types — only the request body and the
 readout.
 
+Labels are single letters while a question has 26 options or fewer. Past that they become two letters (`AA`,
+`AB`, … `ZZ`), which only `structured` and `discrete` can use: they answer in JSON, where a label is just a
+string. `logprobs` and `grammar` read the label *token*, and the first token of `"AA"` is `"A"`, so they raise
+`InvalidQuestionError` past 26 options and name the two methods that can take more (up to the Jev API limit of
+255).
+
 | Method | Asks for | Distribution comes from |
 | --- | --- | --- |
 | `logprobs` | one label, plus the logprobs of the alternatives | the model's own next-token distribution |

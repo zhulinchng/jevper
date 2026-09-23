@@ -199,6 +199,45 @@ def test_discrete_reports_one_hot_distributions(stub_server):
     assert response.debug["method"] == "discrete"
 
 
+def test_structured_handles_more_than_26_options(stub_server):
+    options = {f"option_{index}": None for index in range(30)}
+    payload = {"probabilities": {name: (1.0 if name == "option_29" else 0.0) for name in options}}
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps(payload))))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions"
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=options)})
+
+    answer = response.answers["q"]
+    assert answer.choice == "option_29"
+    assert len(answer.probabilities) == 30
+    assert sum(answer.probabilities.values()) == pytest.approx(1.0, abs=1e-12)
+    assert answer.confidence == pytest.approx(1.0, abs=1e-12)
+    schema = stub.bodies("/chat/completions")[0]["response_format"]["json_schema"]["schema"]
+    properties = schema["properties"]["probabilities"]
+    assert set(properties["properties"]) == set(options)
+    assert len(properties["required"]) == 30
+    assert properties["additionalProperties"] is False
+
+
+def test_discrete_labels_grow_to_two_letters_beyond_26_options(stub_server):
+    options = {f"option_{index}": None for index in range(30)}
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps({"choice": "BD"}))))
+    client = SystemOneClient(openai_client(stub), model="stub", method="discrete", api="chat_completions")
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=options)})
+
+    # 30 options run AA..AZ then BA..BD, so BD is the thirtieth option
+    assert response.answers["q"].choice == "option_29"
+    assert response.answers["q"].probabilities["option_29"] == 1.0
+    sent = stub.bodies("/chat/completions")[0]
+    enum = sent["response_format"]["json_schema"]["schema"]["properties"]["choice"]["enum"]
+    assert (enum[:3], enum[25:27], enum[-1]) == (["AA", "AB", "AC"], ["AZ", "BA"], "BD")
+    assert len(enum) == 30
+    assert "BD: option_29" in sent["messages"][-1]["content"]
+
+
 def test_responses_surface_logprobs(stub_server):
     stub = stub_server(responses=lambda _: (200, responses_body(text="A", logprobs=CHOICE_LOGS)))
     client = SystemOneClient(openai_client(stub), model="stub")

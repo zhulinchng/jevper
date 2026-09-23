@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from fakes import async_openai_client, chat_body, openai_client, responses_body
@@ -70,8 +71,12 @@ def test_non_transient_failure_is_not_retried(stub_server):
 
 def test_question_limits_are_enforced_at_construction():
     with pytest.raises(InvalidQuestionError) as error:
-        Choice(criteria={f"k{index}": None for index in range(27)})
-    assert "26 is the label cap" in str(error.value)
+        Choice(criteria={f"k{index}": None for index in range(256)})
+    assert "255 is the Jev API limit" in str(error.value)
+
+    with pytest.raises(InvalidQuestionError) as error:
+        Choice(criteria={"only": None})
+    assert "2..255" in str(error.value)
 
     with pytest.raises(InvalidQuestionError) as error:
         Score(criteria=[f"level {index}" for index in range(11)])
@@ -82,14 +87,33 @@ def test_question_limits_are_enforced_at_construction():
     assert "'true'/'false'" in str(error.value)
 
 
+def test_label_readout_methods_stop_at_26_options(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+    wide = {f"k{index}": None for index in range(27)}
+
+    with pytest.raises(InvalidQuestionError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=wide)})
+    assert "27 options exceed the 26 labels" in str(error.value)
+    assert "method='structured'" in str(error.value) and "method='discrete'" in str(error.value)
+    assert stub.requests == []
+
+    # the same question is fine where the answer is a JSON string rather than a label token
+    wide_stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps({"choice": "AA"}))))
+    discrete = SystemOneClient(
+        openai_client(wide_stub), model="stub", method="discrete", api="chat_completions"
+    )
+    response = discrete.system_one(state="s", questions={"q": Choice(criteria=wide)})
+
+    assert response.answers["q"].choice == "k0"
+
+
 def test_raw_question_dicts_are_validated_before_any_request(stub_server):
     stub = stub_server(chat=lambda _: (200, chat_body(content="A")))
     client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
 
     with pytest.raises(InvalidQuestionError):
-        client.system_one(
-            state="s", questions={"q": {"type": "choice", "criteria": {f"k{i}": None for i in range(27)}}}
-        )
+        client.system_one(state="s", questions={"q": {"type": "choice", "criteria": {"only": None}}})
     with pytest.raises(InvalidQuestionError) as error:
         client.system_one(state="s", questions={"q": {"type": "bogus"}})
     assert "question 'q' is invalid" in str(error.value)
