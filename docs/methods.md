@@ -149,6 +149,15 @@ Neither builder ever sends `max_tokens`, `max_completion_tokens` or `max_output_
 against those caps, and a small cap silently truncates a reasoning model. Cost is bounded by reading only the
 first answer token. Any other provider field goes through `extra_body`.
 
+When a server refuses one of the fields above — `400 response_format is not supported`, or the Responses
+`text.format`, or `reasoning_effort`, or the `reasoning.encrypted_content` include — jevper treats it the way it
+treats a surface that cannot carry logprobs: the field is dropped and the same call is re-asked, one step down
+the ladder at a time (`json_schema` → `json_object` → no `response_format` at all, then reasoning, then the
+include), and the limit is remembered for the rest of the client's life. None of the three is needed to answer —
+the prompt already asks for one JSON object and the readout validates it — so the question is answered instead
+of failing. The ladder is finite, so a server that refuses everything still ends in a `ProviderError`, and
+`debug["server_limits"]` reports what was learned.
+
 ## `logprobs`
 
 Request: the label prompt plus `logprobs=true` and `top_logprobs` (default 20, the provider maximum; `0` is
@@ -266,8 +275,10 @@ Readout:
 4. `choice` is the argmax of the final distribution, and `confidence` is computed from it.
 
 `structured_outputs=False` keeps the schema in the prompt but sends `{"type": "json_object"}` instead of a
-strict schema — the documented workaround when a provider rejects `response_format`. The answer is still
-validated client-side, so an unusable shape raises `MalformedAnswerError` after the corrective retry.
+strict schema — the documented workaround when a provider rejects `response_format`. It is also automatic: a
+server that refuses the strict schema is re-asked once with `json_object`, and a server that refuses that too is
+answered with the schema in the prompt alone (see the request table above). The answer is still validated
+client-side, so an unusable shape raises `MalformedAnswerError` after the corrective retry.
 
 `temperature=0.0` is worth setting here (and for `discrete`): the answer is a single sampled JSON object, so
 sampling noise moves the probabilities directly.

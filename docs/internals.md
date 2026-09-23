@@ -177,7 +177,10 @@ Worth keeping when editing:
 - The first token a label readout reads is the answer's, not the completion's. When the provider separates its
   reasoning from the answer *and* the answer text is exactly the tail of the token stream, the answer's own
   tokens start at that offset (`methods._answer_tokens`); anything else — no trace, no exact tail — is read as
-  it arrives, so a stream that cannot be anchored is reported rather than guessed at.
+  it arrives, so a stream that cannot be anchored is reported rather than guessed at. Up to two trailing
+  tokens whose text does not occur in the answer — vLLM's and SGLang's own ``<|im_end|>`` — are dropped
+  first, since a token the provider excluded from ``content`` cannot be part of the answer; a token that
+  could be is kept, which is what makes this a removal rather than a guess.
 - `method="auto"` remembers two kinds of verdict per client, and neither changes a pinned method or a pinned
   surface: which method works per `(model, surface)`, and which surfaces answer 404. A surface that cannot
   deliver a distribution — it withheld logprobs, or refused the fields outright — is worth one request on the
@@ -203,6 +206,18 @@ Worth keeping when editing:
   client. A 4xx that only complains about the value it was sent (a server whose `top_logprobs` cap
   is below the default) and a 5xx that survived the retries are `capability=False` and are *not* cached: the
   question is answered with a logprob-free method, but the next call tries logprobs again.
+- A request field jevper added for capability is dropped, not fatal. A 4xx that refuses structured output, the
+  reasoning parameters or the Responses `include` list moves that field one step down its ladder —
+  `json_schema` → `json_object` → nothing — and the same call is re-asked, with the limit remembered per
+  surface and reported in `debug["server_limits"]`. None of the three is needed to answer, so the question is
+  answered instead of failing. The ladder is finite, so a server that refuses everything still ends in a
+  `ProviderError`, and a rejection that names the logprob fields belongs to the readout fallback instead and
+  never reaches it.
+- An answer that never arrived says why. `CallResult.stop` carries the provider's own reason — `finish_reason`
+  on Chat Completions, `incomplete_details.reason` on the Responses surface — and the readouts append it to
+  the error raised for a missing or unparseable answer. A reasoning model that spends the whole output budget
+  thinking (vLLM and SGLang answer `status: "incomplete"`, llama.cpp and ollama `finish_reason: "length"`)
+  otherwise fails with "no non-whitespace token in the response", which is true and useless.
 - Capability failures are not corrective-retried: a correction turn changes the prompt, not what the provider
   reports. Only the model-side failures (a non-label token, an unusable JSON shape) are worth another call.
 - A logprob readout needs at least two candidates. `top_logprobs` with nothing but the sampled token is not a
@@ -230,6 +245,15 @@ bodies carry every field the `openai` models require, including `usage.*_tokens_
 The suite runs offline. `tests/test_live.py` is skipped unless both `LLM_MODEL` and `OPENAI_API_KEY`
 are set, and then runs one `choice` question with `method="structured"` and one with `method="logprobs"`
 against the real endpoint.
+
+`tests/test_provider_surfaces.py` replays what four real servers answered. The bodies in
+`tests/fixtures/providers/` were recorded with raw HTTP from ollama, llama.cpp, vLLM and SGLang serving
+`Qwen3.5-9B` at 4-bit (recipes in `docs/local-servers.md`, and each file's `_meta` says how it was pruned:
+opaque fields removed, long generated text truncated, every field jevper reads left as recorded). Each case is
+served back through a real `openai` client, so the shapes those servers actually send — an empty logprob array,
+`reasoning` versus `reasoning_content`, `{"detail": "Not Found"}`, a 404 that names the model,
+`status: "incomplete"`, SGLang's bare JSON string errors — stay in front of every change without a GPU. To
+refresh them, capture again and prune the same way; a case whose shape moved is a test that should move with it.
 
 Several tests pin exact numeric literals (softmax results, confidences, scores) that were computed from the
 reference adapter's formulas. They are intentional: do not "recompute" them from the implementation, since a

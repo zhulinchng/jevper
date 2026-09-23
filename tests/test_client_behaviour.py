@@ -26,6 +26,7 @@ from jevper import (
     JevperError,
     Noul,
     ProviderError,
+    ReasoningConfig,
     RetryPolicy,
     Score,
     SystemOneClient,
@@ -819,3 +820,147 @@ def test_a_provider_field_the_sdk_types_differently_is_dumped_without_noise(stub
         {"version": "default", "start": 0, "end": 4}
     ]
     assert response.answers["q"].choice == "billing"
+
+
+# --- a server that refuses a field jevper added for capability ---------------------------------
+
+
+STRUCTURED = '{"probabilities": {"billing": 0.8, "technical": 0.1, "sales": 0.1}}'
+
+
+def unsupported(field: str) -> tuple[int, dict]:
+    """The shape a server uses to refuse a request field it does not implement."""
+    return 400, {
+        "error": {
+            "message": f"{field} is not supported",
+            "param": field,
+            "code": "unsupported_parameter",
+        }
+    }
+
+
+def test_a_refused_json_schema_is_answered_with_json_object(stub_server):
+    def script(body):
+        if (body.get("response_format") or {}).get("type") == "json_schema":
+            return unsupported("response_format")
+        return 200, chat_body(content=STRUCTURED)
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", method="structured"
+    )
+
+    first = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    second = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert first.answers["q"].choice == "billing"
+    assert second.answers["q"].choice == "billing"
+    assert [
+        body["response_format"]["type"] for body in stub.bodies("/chat/completions")
+    ] == ["json_schema", "json_object", "json_object"]
+    assert first.debug["server_limits"]["structured"] == "object"
+
+
+def test_a_refused_json_object_is_answered_without_a_response_format(stub_server):
+    def script(body):
+        if body.get("response_format") is not None:
+            return unsupported("response_format")
+        return 200, chat_body(content=STRUCTURED)
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", method="structured"
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+    bodies = stub.bodies("/chat/completions")
+    assert len(bodies) == 3
+    assert "response_format" not in bodies[2]  # the prompt still asks for one JSON object
+    assert response.debug["server_limits"]["structured"] == "none"
+
+
+def test_a_refused_reasoning_effort_is_answered_without_it(stub_server):
+    def script(body):
+        if "reasoning_effort" in body:
+            return unsupported("reasoning_effort")
+        return 200, chat_body(content="A", logprobs=CHOICE_LOGS)
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", method="logprobs"
+    )
+
+    response = client.system_one(
+        state="s",
+        questions={"q": Choice(criteria=CRITERIA)},
+        reasoning=ReasoningConfig(effort="low", mode="native"),
+    )
+
+    assert response.answers["q"].choice == "billing"
+    assert "reasoning_effort" not in stub.bodies("/chat/completions")[1]
+    assert response.debug["server_limits"]["reasoning"] is False
+
+
+def test_a_refused_include_is_answered_without_it(stub_server):
+    def script(body):
+        if "reasoning.encrypted_content" in (body.get("include") or []):
+            return unsupported("include")
+        return 200, responses_body(text="A", logprobs=CHOICE_LOGS)
+
+    stub = stub_server(responses=script)
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="responses", method="logprobs"
+    )
+
+    response = client.system_one(
+        state="s",
+        questions={"q": Choice(criteria=CRITERIA)},
+        reasoning=ReasoningConfig(mode="native"),
+    )
+
+    assert response.answers["q"].choice == "billing"
+    include = stub.bodies("/responses")[1].get("include") or []
+    assert "message.output_text.logprobs" in include  # the field the readout needs stays
+    assert "reasoning.encrypted_content" not in include
+    assert response.debug["server_limits"]["include"] is False
+
+
+def test_a_server_that_refuses_everything_still_reports_the_error(stub_server):
+    stub = stub_server(chat=lambda _: unsupported("response_format"))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        method="structured",
+        retry=RetryPolicy(n_retries=0),
+    )
+
+    with pytest.raises(ProviderError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "not supported" in str(error.value)
+    assert len(stub.bodies("/chat/completions")) == 3  # schema, object, none — then it gives up
+
+
+def test_the_async_client_drops_a_refused_field_too(stub_server):
+    """The async driver has its own copy of the retry, so it needs its own proof."""
+
+    def script(body):
+        if (body.get("response_format") or {}).get("type") == "json_schema":
+            return unsupported("response_format")
+        return 200, chat_body(content=STRUCTURED)
+
+    stub = stub_server(chat=script)
+    client = AsyncSystemOneClient(
+        async_openai_client(stub), model="stub", api="chat_completions", method="structured"
+    )
+
+    response = asyncio.run(client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}))
+
+    assert response.answers["q"].choice == "billing"
+    assert [
+        body["response_format"]["type"] for body in stub.bodies("/chat/completions")
+    ] == ["json_schema", "json_object"]
+    assert response.debug["server_limits"]["structured"] == "object"

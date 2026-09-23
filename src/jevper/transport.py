@@ -51,6 +51,28 @@ class CallResult:
     input_tokens: int | None = None
     output_tokens: int | None = None
     reasoning_tokens: int | None = None
+    stop: str | None = None
+    """Why generation ended: ``finish_reason`` on Chat Completions, the incompleteness reason on the
+    Responses surface. A reasoning model can spend the whole budget thinking — vLLM and SGLang then
+    report ``status: "incomplete"`` with an empty answer — and the caller deserves to be told that
+    rather than left with "no non-whitespace token in the response"."""
+
+
+@dataclass(frozen=True)
+class Limits:
+    """What a server has been observed to accept, per surface.
+
+    A server that does not implement structured outputs, the reasoning parameters or the Responses
+    ``include`` list answers 400 naming the field it refuses. None of those fields is required to
+    answer a question — the prompt already asks for one JSON object — so jevper drops the field and
+    re-asks, one step down the ladder at a time, and remembers the server's limit the way it remembers
+    a missing surface or a withheld distribution.
+    """
+
+    structured: Literal["schema", "object", "none"] = "schema"
+    """``schema`` sends ``json_schema``, ``object`` sends ``json_object``, ``none`` sends nothing."""
+    reasoning: bool = True
+    include: bool = True
 
 
 def build_chat_kwargs(
@@ -60,20 +82,22 @@ def build_chat_kwargs(
     structured_outputs: bool = True,
     extra_body: Mapping[str, Any] | None = None,
     extra_headers: Mapping[str, str] | None = None,
+    limits: Limits | None = None,
 ) -> dict[str, Any]:
+    limits = limits or Limits()
     kwargs: dict[str, Any] = {"model": model, "messages": spec.messages}
     if spec.logprobs:
         kwargs["logprobs"] = True
         kwargs["top_logprobs"] = spec.top_logprobs
     if spec.json_schema is not None:
-        if structured_outputs:
+        if structured_outputs and limits.structured == "schema":
             kwargs["response_format"] = {
                 "type": JSON_SCHEMA_FORMAT,
                 "json_schema": {"name": spec.schema_name, "schema": spec.json_schema, "strict": True},
             }
-        else:
+        elif limits.structured != "none":
             kwargs["response_format"] = {"type": "json_object"}
-    if spec.reasoning is not None and spec.reasoning.effort is not None:
+    if spec.reasoning is not None and spec.reasoning.effort is not None and limits.reasoning:
         kwargs["reasoning_effort"] = spec.reasoning.effort
     if spec.temperature is not None:
         kwargs["temperature"] = spec.temperature
@@ -94,18 +118,20 @@ def build_responses_kwargs(
     structured_outputs: bool = True,
     extra_body: Mapping[str, Any] | None = None,
     extra_headers: Mapping[str, str] | None = None,
+    limits: Limits | None = None,
 ) -> dict[str, Any]:
+    limits = limits or Limits()
     kwargs: dict[str, Any] = {"model": model, "input": spec.messages, "store": False}
     if spec.logprobs:
         kwargs["top_logprobs"] = spec.top_logprobs
     include: list[str] = []
     if spec.logprobs:
         include.append("message.output_text.logprobs")
-    if spec.reasoning is not None:
+    if spec.reasoning is not None and limits.include:
         include.append("reasoning.encrypted_content")
     if include:
         kwargs["include"] = include
-    if spec.reasoning is not None:
+    if spec.reasoning is not None and limits.reasoning:
         reasoning = {
             name: value
             for name, value in (
@@ -118,7 +144,7 @@ def build_responses_kwargs(
         if reasoning:
             kwargs["reasoning"] = reasoning
     if spec.json_schema is not None:
-        if structured_outputs:
+        if structured_outputs and limits.structured == "schema":
             kwargs["text"] = {
                 "format": {
                     "type": JSON_SCHEMA_FORMAT,
@@ -127,7 +153,7 @@ def build_responses_kwargs(
                     "strict": True,
                 }
             }
-        else:
+        elif limits.structured != "none":
             kwargs["text"] = {"format": {"type": "json_object"}}
     if spec.temperature is not None:
         kwargs["temperature"] = spec.temperature
@@ -281,6 +307,7 @@ def _chat_result(response: Any, request: dict[str, Any]) -> CallResult:
         input_tokens=_get(usage, "prompt_tokens"),
         output_tokens=_get(usage, "completion_tokens"),
         reasoning_tokens=_get(details, "reasoning_tokens"),
+        stop=_get(choice, "finish_reason"),
     )
 
 
@@ -322,6 +349,10 @@ def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
             raise failure
     usage = _get(response, "usage")
     details = _get(usage, "output_tokens_details")
+    # A Responses call that hit the output budget says so here rather than in a finish_reason.
+    stop = None
+    if _get(response, "status") == "incomplete":
+        stop = _get(_get(response, "incomplete_details"), "reason") or "incomplete"
     return CallResult(
         text=_responses_text(response),
         token_logprobs=_responses_token_logprobs(response),
@@ -332,6 +363,7 @@ def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
         input_tokens=_get(usage, "input_tokens"),
         output_tokens=_get(usage, "output_tokens"),
         reasoning_tokens=_get(details, "reasoning_tokens"),
+        stop=stop,
     )
 
 
@@ -360,6 +392,7 @@ class Transport:
         structured_outputs: bool = True,
         extra_body: Mapping[str, Any] | None = None,
         extra_headers: Mapping[str, str] | None = None,
+        limits: Limits | None = None,
     ) -> None:
         self.client = client
         self.surface = surface
@@ -367,6 +400,7 @@ class Transport:
         self.structured_outputs = structured_outputs
         self.extra_body = extra_body
         self.extra_headers = extra_headers
+        self.limits = limits or Limits()
 
     def kwargs(self, spec: CallSpec, model: str) -> dict[str, Any]:
         return self.build_kwargs(
@@ -375,6 +409,7 @@ class Transport:
             structured_outputs=self.structured_outputs,
             extra_body=self.extra_body,
             extra_headers=self.extra_headers,
+            limits=self.limits,
         )
 
     def _endpoint(self) -> Any:
@@ -433,6 +468,7 @@ def make_transport(
     structured_outputs: bool = True,
     extra_body: Mapping[str, Any] | None = None,
     extra_headers: Mapping[str, str] | None = None,
+    limits: Limits | None = None,
 ) -> Transport:
     return Transport(
         client,
@@ -440,4 +476,5 @@ def make_transport(
         structured_outputs=structured_outputs,
         extra_body=extra_body,
         extra_headers=extra_headers,
+        limits=limits,
     )

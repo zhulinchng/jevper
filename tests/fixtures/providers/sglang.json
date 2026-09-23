@@ -1,0 +1,2587 @@
+{
+ "_meta": {
+  "how": "raw HTTP capture from the server, then pruned: opaque fields (ids, timestamps, metrics, logprob byte arrays, encrypted payloads) removed, per-token alternative lists kept only for single-character tokens, and long generated text truncated. Every field jevper reads is as recorded.",
+  "model": "qwen3.5-9b",
+  "server": "sglang",
+  "thinking_off": {
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   }
+  },
+  "thinking_on": {}
+ },
+ "cases": [
+  {
+   "method": "POST",
+   "name": "chat-bad-json-body",
+   "path": "/v1/chat/completions",
+   "raw": "{\"object\":\"error\",\"message\":\"1 validation error:\\n  {'type': 'json_invalid', 'loc': ('body', 1), 'msg': 'JSON decode error', 'input': {}, 'ctx': {'error': 'unexpected character, expected a string key'}}\\n\\n  File \\\"/home/zhu/sglang-env/lib/python3.12/site-packages/sglang/srt/entrypoints/http_server.py\\\", line 1747, in openai_v1_chat_completions\\n    POST /v1/chat/completions [{'type': 'json_invalid', 'loc': ('body', 1), 'msg': 'JSON decode error', 'input': {}, 'ctx': {'error': 'unexpected character, expected a string key'}}]\",\"type\":\"Bad Request\",\"param\":null,\"code\":400}",
+   "request": "{not json",
+   "status": 400
+  },
+  {
+   "body": {
+    "choices": [
+     {
+      "finish_reason": "length",
+      "index": 0,
+      "logprobs": null,
+      "matched_stop": null,
+      "message": {
+       "content": "",
+       "reasoning_content": "Thinking Process:\n",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "metadata": {
+     "weight_version": "default",
+     "weight_versions": [
+      {
+       "end": 4,
+       "start": 0,
+       "version": "default"
+      }
+     ]
+    },
+    "model": "definitely-not-a-model",
+    "usage": {
+     "completion_tokens": 4,
+     "prompt_tokens": 20,
+     "prompt_tokens_details": null,
+     "reasoning_tokens": 4,
+     "total_tokens": 24
+    }
+   },
+   "method": "POST",
+   "name": "chat-bad-model",
+   "path": "/v1/chat/completions",
+   "request": {
+    "max_tokens": 4,
+    "messages": [
+     {
+      "content": "Reply with the single letter A and nothing else.",
+      "role": "user"
+     }
+    ],
+    "model": "definitely-not-a-model"
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "detail": "Not Found"
+   },
+   "method": "GET",
+   "name": "chat-bad-path",
+   "path": "/v1/definitely-not-a-route",
+   "request": null,
+   "status": 404
+  },
+  {
+   "body": {
+    "code": 400,
+    "message": "Unexpected message role.",
+    "param": null,
+    "type": "BadRequest"
+   },
+   "method": "POST",
+   "name": "chat-developer-role",
+   "path": "/v1/chat/completions",
+   "request": {
+    "max_tokens": 4,
+    "messages": [
+     {
+      "content": "Be terse.",
+      "role": "developer"
+     },
+     {
+      "content": "Reply with the single letter A and nothing else.",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3.5-9b"
+   },
+   "status": 400
+  },
+  {
+   "body": {
+    "choices": [
+     {
+      "finish_reason": "length",
+      "index": 0,
+      "logprobs": {
+       "content": [
+        {
+         "logprob": -0.0013915441231802106,
+         "token": "Thinking"
+        },
+        {
+         "logprob": -0.00025961193023249507,
+         "token": " Process"
+        },
+        {
+         "logprob": -1.4662849935120903e-05,
+         "token": ":",
+         "top_logprobs": [
+          {
+           "logprob": -1.4662849935120903e-05,
+           "token": ":"
+          },
+          {
+           "logprob": -11.250014305114746,
+           "token": " for"
+          },
+          {
+           "logprob": -14.562514305114746,
+           "token": "\uff1a"
+          },
+          {
+           "logprob": -15.187514305114746,
+           "token": " that"
+          },
+          {
+           "logprob": -16.062515258789062,
+           "token": " with"
+          }
+         ]
+        },
+        {
+         "logprob": -0.020724181085824966,
+         "token": "\n"
+        }
+       ]
+      },
+      "matched_stop": null,
+      "message": {
+       "content": "",
+       "reasoning_content": "Thinking Process:\n",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "metadata": {
+     "weight_version": "default",
+     "weight_versions": [
+      {
+       "end": 4,
+       "start": 0,
+       "version": "default"
+      }
+     ]
+    },
+    "model": "qwen3.5-9b",
+    "usage": {
+     "completion_tokens": 4,
+     "prompt_tokens": 20,
+     "prompt_tokens_details": null,
+     "reasoning_tokens": 4,
+     "total_tokens": 24
+    }
+   },
+   "method": "POST",
+   "name": "chat-logprobs",
+   "path": "/v1/chat/completions",
+   "request": {
+    "logprobs": true,
+    "max_tokens": 4,
+    "messages": [
+     {
+      "content": "Reply with the single letter A and nothing else.",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3.5-9b",
+    "top_logprobs": 5
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "choices": [
+     {
+      "finish_reason": "length",
+      "index": 0,
+      "logprobs": {
+       "content": [
+        {
+         "logprob": -0.0013915441231802106,
+         "token": "Thinking"
+        },
+        {
+         "logprob": -0.00025961193023249507,
+         "token": " Process"
+        },
+        {
+         "logprob": -1.4662849935120903e-05,
+         "token": ":",
+         "top_logprobs": [
+          {
+           "logprob": -1.4662849935120903e-05,
+           "token": ":"
+          }
+         ]
+        },
+        {
+         "logprob": -0.020724181085824966,
+         "token": "\n"
+        }
+       ]
+      },
+      "matched_stop": null,
+      "message": {
+       "content": "",
+       "reasoning_content": "Thinking Process:\n",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "metadata": {
+     "weight_version": "default",
+     "weight_versions": [
+      {
+       "end": 4,
+       "start": 0,
+       "version": "default"
+      }
+     ]
+    },
+    "model": "qwen3.5-9b",
+    "usage": {
+     "completion_tokens": 4,
+     "prompt_tokens": 20,
+     "prompt_tokens_details": null,
+     "reasoning_tokens": 4,
+     "total_tokens": 24
+    }
+   },
+   "method": "POST",
+   "name": "chat-logprobs-1-top",
+   "path": "/v1/chat/completions",
+   "request": {
+    "logprobs": true,
+    "max_tokens": 4,
+    "messages": [
+     {
+      "content": "Reply with the single letter A and nothing else.",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3.5-9b",
+    "top_logprobs": 1
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "choices": [
+     {
+      "finish_reason": "length",
+      "index": 0,
+      "logprobs": {
+       "content": [
+        {
+         "logprob": -0.0013915441231802106,
+         "token": "Thinking"
+        },
+        {
+         "logprob": -0.00025961193023249507,
+         "token": " Process"
+        },
+        {
+         "logprob": -1.4662849935120903e-05,
+         "token": ":",
+         "top_logprobs": [
+          {
+           "logprob": -1.4662849935120903e-05,
+           "token": ":"
+          },
+          {
+           "logprob": -11.250014305114746,
+           "token": " for"
+          },
+          {
+           "logprob": -14.562514305114746,
+           "token": "\uff1a"
+          },
+          {
+           "logprob": -15.187514305114746,
+           "token": " that"
+          },
+          {
+           "logprob": -16.062515258789062,
+           "token": " with"
+          },
+          {
+           "logprob": -16.437515258789062,
+           "token": " ("
+          },
+          {
+           "logprob": -16.500015258789062,
+           "token": ","
+          },
+          {
+           "logprob": -16.562515258789062,
+           "token": ":*"
+          },
+          {
+           "logprob": -16.562515258789062,
+           "token": ";"
+          },
+          {
+           "logprob": -16.625015258789062,
+           "token": ":**"
+          },
+          {
+           "logprob": -16.687515258789062,
+           "token": " to"
+          },
+          {
+           "logprob": -17.000015258789062,
+           "token": "."
+          },
+          {
+           "logprob": -17.125015258789062,
+           "token": " in"
+          },
+          {
+           "logprob": -17.750015258789062,
+           "token": " and"
+          },
+          {
+           "logprob": -18.000015258789062,
+           "token": "://"
+          },
+          {
+           "logprob": -18.250015258789062,
+           "token": " Outline"
+          },
+          {
+           "logprob": -18.250015258789062,
+           "token": "\n\n"
+          },
+          {
+           "logprob": -18.250015258789062,
+           "token": " of"
+          },
+          {
+           "logprob": -18.312515258789062,
+           "token": " at"
+          },
+          {
+           "logprob": -18.437515258789062,
+           "token": "\n"
+          },
+          {
+           "logprob": -18.687515258789062,
+           "token": "1"
+          }
+         ]
+        },
+        {
+         "logprob": -0.020724181085824966,
+         "token": "\n"
+        }
+       ]
+      },
+      "matched_stop": null,
+      "message": {
+       "content": "",
+       "reasoning_content": "Thinking Process:\n",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "metadata": {
+     "weight_version": "default",
+     "weight_versions": [
+      {
+       "end": 4,
+       "start": 0,
+       "version": "default"
+      }
+     ]
+    },
+    "model": "qwen3.5-9b",
+    "usage": {
+     "completion_tokens": 4,
+     "prompt_tokens": 20,
+     "prompt_tokens_details": null,
+     "reasoning_tokens": 4,
+     "total_tokens": 24
+    }
+   },
+   "method": "POST",
+   "name": "chat-logprobs-21-tops",
+   "path": "/v1/chat/completions",
+   "request": {
+    "logprobs": true,
+    "max_tokens": 4,
+    "messages": [
+     {
+      "content": "Reply with the single letter A and nothing else.",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3.5-9b",
+    "top_logprobs": 21
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "choices": [
+     {
+      "finish_reason": "length",
+      "index": 0,
+      "logprobs": {
+       "content": [
+        {
+         "logprob": -0.0013915441231802106,
+         "token": "Thinking"
+        },
+        {
+         "logprob": -0.00025961193023249507,
+         "token": " Process"
+        },
+        {
+         "logprob": -1.4662849935120903e-05,
+         "token": ":",
+         "top_logprobs": [
+          {
+           "logprob": -1.4662849935120903e-05,
+           "token": ":"
+          },
+          {
+           "logprob": -11.250014305114746,
+           "token": " for"
+          },
+          {
+           "logprob": -14.562514305114746,
+           "token": "\uff1a"
+          },
+          {
+           "logprob": -15.187514305114746,
+           "token": " that"
+          },
+          {
+           "logprob": -16.062515258789062,
+           "token": " with"
+          }
+         ]
+        },
+        {
+         "logprob": -0.020724181085824966,
+         "token": "\n"
+        },
+        {
+         "logprob": -5.161895387573168e-05,
+         "token": "1",
+         "top_logprobs": [
+          {
+           "logprob": -5.161895387573168e-05,
+           "token": "1"
+          },
+          {
+           "logprob": -11.000051498413086,
+           "token": "The"
+          },
+          {
+           "logprob": -11.562551498413086,
+           "token": "-"
+          },
+          {
+           "logprob": -12.437551498413086,
+           "token": "0"
+          },
+          {
+           "logprob": -12.750051498413086,
+           "token": "*"
+          }
+         ]
+        },
+        {
+         "logprob": -3.361758354003541e-05,
+         "token": ".",
+         "top_logprobs": [
+          {
+           "logprob": -3.361758354003541e-05,
+           "token": "."
+          },
+          {
+           "logprob": -10.375033378601074,
+           "token": ":"
+          },
+          {
+           "logprob": -14.500033378601074,
+           "token": " "
+          },
+          {
+           "logprob": -14.562533378601074,
+           "token": ","
+          },
+          {
+           "logprob": -14.625033378601074,
+           "token": "/"
+          }
+         ]
+        },
+        {
+         "logprob": -0.004364823456853628,
+         "token": " "
+        },
+        {
+         "logprob": -0.0025511712301522493,
+         "token": " **"
+        },
+        {
+         "logprob": -0.00017710108659230173,
+         "token": "An"
+        },
+        {
+         "logprob": -1.1920930376163597e-07,
+         "token": "alyze"
+        },
+        {
+         "logprob": -2.908749047492165e-05,
+         "token": " the"
+        },
+        {
+         "logprob": -0.003640594892203808,
+         "token": " Request"
+        },
+        {
+         "logprob": -8.869564771885052e-05,
+         "token": ":**"
+        },
+        {
+         "logprob": -0.0015594596043229103,
+         "token": " The"
+        },
+        {
+         "logprob": -5.006802894058637e-06,
+         "token": " user"
+        },
+        {
+         "logprob": -0.16046912968158722,
+         "token": " wants"
+        },
+        {
+         "logprob": -0.5767337083816528,
+         "token": " a",
+         "top_logprobs": [
+          {
+           "logprob": -0.5767337083816528,
+           "token": " a"
+          },
+          {
+           "logprob": -0.8267337083816528,
+           "token": " me"
+          },
+          {
+           "logprob": -7.326733589172363,
+           "token": " exactly"
+          },
+          {
+           "logprob": -9.326733589172363,
+           "token": " the"
+          },
+          {
+           "logprob": -11.076733589172363,
+           "token": " \""
+          }
+         ]
+        },
+        {
+         "logprob": -0.5290205478668213,
+         "token": " reply"
+        },
+        {
+         "logprob": -0.5854523777961731,
+         "token": " consisting"
+        },
+        {
+         "logprob": -0.28166764974594116,
+         "token": " of"
+        },
+        {
+         "logprob": -1.178701400756836,
+         "token": " exactly"
+        },
+        {
+         "logprob": -0.3666730523109436,
+         "token": " the"
+        },
+        {
+         "logprob": -0.05584678798913956,
+         "token": " single"
+        },
+        {
+         "logprob": -0.0022068514954298735,
+         "token": " letter"
+        },
+        {
+         "logprob": -1.0537127256393433,
+         "token": " '",
+         "top_logprobs": [
+          {
+           "logprob": -0.4287126958370209,
+           "token": " \""
+          },
+          {
+           "logprob": -1.0537127256393433,
+           "token": " '"
+          },
+          {
+           "logprob": -11.928712844848633,
+           "token": " `"
+          },
+          {
+           "logprob": -13.053712844848633,
+           "token": "\"A"
+          },
+          {
+           "logprob": -13.303712844848633,
+           "token": " A"
+          }
+         ]
+        },
+        {
+         "logprob": -8.690734830452129e-05,
+         "token": "A",
+         "top_logprobs": [
+          {
+           "logprob": -8.690734830452129e-05,
+           "token": "A"
+          },
+          {
+           "logprob": -9.375086784362793,
+           "token": "a"
+          },
+          {
+           "logprob": -14.875086784362793,
+           "token": "B"
+          },
+          {
+           "logprob": -15.125086784362793,
+           "token": " A"
+          },
+          {
+           "logprob": -15.500086784362793,
+           "token": "C"
+          }
+         ]
+        },
+        {
+         "logprob": -0.011141686700284481,
+         "token": "'",
+         "top_logprobs": [
+          {
+           "logprob": -0.011141686700284481,
+           "token": "'"
+          },
+          {
+           "logprob": -5.136141777038574,
+           "token": "'."
+          },
+          {
+           "logprob": -5.261141777038574,
+           "token": "',"
+          },
+          {
+           "logprob": -12.511141777038574,
+           "token": " and"
+          },
+          {
+           "logprob": -13.073641777038574,
+           "token": "\""
+          }
+         ]
+        },
+        {
+         "logprob": -0.0015430428320541978,
+         "token": " and"
+        },
+        {
+         "logprob": -0.008868926204741001,
+         "token": " nothing"
+        },
+        {
+         "logprob": -1.8358399756834842e-05,
+         "token": " else"
+        },
+        {
+         "logprob": -0.2519739866256714,
+         "token": ".",
+         "top_logprobs": [
+          {
+           "logprob": -0.2519739866256714,
+           "token": "."
+          },
+          {
+           "logprob": -1.5019739866256714,
+           "token": " ("
+          },
+          {
+           "logprob": -11.126974105834961,
+           "token": " (\""
+          },
+          {
+           "logprob": -11.564474105834961,
+           "token": " no"
+          },
+          {
+           "logprob": -12.064474105834961,
+           "token": ","
+          }
+         ]
+        },
+        {
+         "logprob": -0.006631019059568644,
+         "token": "\n"
+        },
+        {
+         "logprob": -6.246761768124998e-05,
+         "token": "2",
+         "top_logprobs": [
+          {
+           "logprob": -6.246761768124998e-05,
+           "token": "2"
+          },
+          {
+           "logprob": -10.500062942504883,
+           "token": "   "
+          },
+          {
+           "logprob": -11.000062942504883,
+           "token": "</think>"
+          },
+          {
+           "logprob": -11.687562942504883,
+           "token": "3"
+          },
+          {
+           "logprob": -12.125062942504883,
+           "token": "1"
+          }
+         ]
+        },
+        {
+         "logprob": -7.152560215217818e-07,
+         "token": ".",
+         "top_logprobs": [
+          {
+           "logprob": -7.152560215217818e-07,
+           "token": "."
+          },
+          {
+           "logprob": -14.687500953674316,
+           "token": " "
+          },
+          {
+           "logprob": -16.75,
+           "token": ","
+          },
+          {
+           "logprob": -17.3125,
+           "token": ".**"
+          },
+          {
+           "logprob": -17.75,
+           "token": ".."
+          }
+         ]
+        },
+        {
+         "logprob": -3.4570753086882178e-06,
+         "token": " "
+        },
+        {
+         "logprob": -0.00013209260941948742,
+         "token": " **"
+        },
+        {
+         "logprob": -3.2078464031219482,
+         "token": "D",
+         "top_logprobs": [
+          {
+           "logprob": -0.8328464031219482,
+           "token": "Check"
+          },
+          {
+           "logprob": -1.7078464031219482,
+           "token": "Ident"
+          },
+          {
+           "logprob": -1.7078464031219482,
+           "token": "Constraint"
+          },
+          {
+           "logprob": -2.2078464031219482,
+           "token": "Verify"
+          },
+          {
+           "logprob": -3.2078464031219482,
+           "token": "D"
+          }
+         ]
+        },
+        {
+         "logprob": -9.93062712950632e-05,
+         "token": "etermine"
+        },
+        {
+         "logprob": -0.350137323141098,
+         "token": " the"
+        },
+        {
+         "logprob": -0.21446597576141357,
+         "token": " Output"
+        },
+        {
+         "logprob": -0.00044719441211782396,
+         "token": ":**"
+        },
+        {
+         "logprob": -0.05627313628792763,
+         "token": " The"
+        },
+        {
+         "logprob": -0.21215927600860596,
+         "token": " output"
+        },
+        {
+         "logprob": -0.14382219314575195,
+         "token": " must"
+        },
+        {
+         "logprob": -6.246761768124998e-05,
+         "token": " be"
+        },
+        {
+         "logprob": -2.4224817752838135,
+         "token": " just"
+        },
+        {
+         "logprob": -1.2637112140655518,
+         "token": " '",
+         "top_logprobs": [
+          {
+           "logprob": -0.5137112140655518,
+           "token": " \""
+          },
+          {
+           "logprob": -1.2637112140655518,
+           "token": " '"
+          },
+          {
+           "logprob": -2.1387112140655518,
+           "token": " the"
+          },
+          {
+           "logprob": -6.763711452484131,
+           "token": " `"
+          },
+          {
+           "logprob": -9.513710975646973,
+           "token": " character"
+          }
+         ]
+        },
+        {
+         "logprob": -0.001044103060849011,
+         "token": "A",
+         "top_logprobs": [
+          {
+           "logprob": -0.001044103060849011,
+           "token": "A"
+          },
+          {
+           "logprob": -6.876044273376465,
+           "token": "a"
+          },
+          {
+           "logprob": -12.126044273376465,
+           "token": "'."
+          },
+          {
+           "logprob": -14.126044273376465,
+           "token": " A"
+          },
+          {
+           "logprob": -14.438544273376465,
+           "token": "\u0410"
+          }
+         ]
+        },
+        {
+         "logprob": -0.0005486920708790421,
+         "token": "'."
+        },
+        {
+         "logprob": -0.06241034343838692,
+         "token": "\n"
+        },
+        {
+         "logprob": -0.0004452862194739282,
+         "token": "3",
+         "top_logprobs": [
+          {
+           "logprob": -0.0004452862194739282,
+           "token": "3"
+          },
+          {
+           "logprob": -8.125445365905762,
+           "token": "</think>"
+          },
+          {
+           "logprob": -9.562945365905762,
+           "token": "4"
+          },
+          {
+           "logprob": -10.875445365905762,
+           "token": "   "
+          },
+          {
+           "logprob": -11.250445365905762,
+           "token": "6"
+          }
+         ]
+        },
+        {
+         "logprob": -1.561653880344238e-05,
+         "token": ".",
+         "top_logprobs": [
+          {
+           "logprob": -1.561653880344238e-05,
+           "token": "."
+          },
+          {
+           "logprob": -11.375015258789062,
+           "token": " "
+          },
+          {
+           "logprob": -13.187515258789062,
+           "token": ".**"
+          },
+          {
+           "logprob": -14.750015258789062,
+           "token": " Verify"
+          },
+          {
+           "logprob": -15.312515258789062,
+           "token": "  "
+          }
+         ]
+        },
+        {
+         "logprob": -9.89442014542874e-06,
+         "token": " "
+        },
+        {
+         "logprob": -3.588264007703401e-05,
+         "token": " **"
+        },
+        {
+         "logprob": -0.5123636722564697,
+         "token": "Check"
+        },
+        {
+         "logprob": -0.22888606786727905,
+         "token": " Constraints"
+        },
+        {
+         "logprob": -1.5378116586362012e-05,
+         "token": ":**"
+        },
+        {
+         "logprob": -0.4046909511089325,
+         "token": " No"
+        },
+        {
+         "logprob": -1.521206021308899,
+         "token": " punctuation"
+        },
+        {
+         "logprob": -0.0003740294778253883,
+         "token": ",",
+         "top_logprobs": [
+          {
+           "logprob": -0.0003740294778253883,
+           "token": ","
+          },
+          {
+           "logprob": -8.000373840332031,
+           "token": " ("
+          },
+          {
+           "logprob": -11.250373840332031,
+           "token": " marks"
+          },
+          {
+           "logprob": -11.750373840332031,
+           "token": " unless"
+          },
+          {
+           "logprob": -12.125373840332031,
+           "token": " other"
+          }
+         ]
+        },
+        {
+         "logprob": -4.923464803141542e-05,
+         "token": " no"
+        },
+        {
+         "logprob": -1.8783979415893555,
+         "token": " explanations"
+        },
+        {
+         "logprob": -8.344653679159819e-07,
+         "token": ",",
+         "top_logprobs": [
+          {
+           "logprob": -8.344653679159819e-07,
+           "token": ","
+          },
+          {
+           "logprob": -14.562500953674316,
+           "token": " ("
+          },
+          {
+           "logprob": -15.312500953674316,
+           "token": "."
+          },
+          {
+           "logprob": -16.75,
+           "token": "\uff0c"
+          },
+          {
+           "logprob": -18.25,
+           "token": "\u060c"
+          }
+         ]
+        },
+        {
+         "logprob": -0.0033341138623654842,
+         "token": " no"
+        },
+        {
+         "logprob": -3.3941192626953125,
+         "token": " additional"
+        },
+        {
+         "logprob": -1.6333082914352417,
+         "token": " characters"
+        },
+        {
+         "logprob": -0.13056659698486328,
+         "token": ".",
+         "top_logprobs": [
+          {
+           "logprob": -0.13056659698486328,
+           "token": "."
+          },
+          {
+           "logprob": -2.7555665969848633,
+           "token": " ("
+          },
+          {
+           "logprob": -3.1305665969848633,
+           "token": ","
+          },
+          {
+           "logprob": -5.130566596984863,
+           "token": " like"
+          },
+          {
+           "logprob": -6.130566596984863,
+           "token": " other"
+          }
+         ]
+        },
+        {
+         "logprob": -0.049866385757923126,
+         "token": "\n"
+        },
+        {
+         "logprob": -0.00012481991143431515,
+         "token": "4",
+         "top_logprobs": [
+          {
+           "logprob": -0.00012481991143431515,
+           "token": "4"
+          },
+          {
+           "logprob": -9.37512493133545,
+           "token": "</think>"
+          },
+          {
+           "logprob": -10.87512493133545,
+           "token": "5"
+          },
+          {
+           "logprob": -11.37512493133545,
+           "token": "6"
+          },
+          {
+           "logprob": -12.31262493133545,
+           "token": "3"
+          }
+         ]
+        },
+        {
+         "logprob": -2.3841860752327193e-07,
+         "token": ".",
+         "top_logprobs": [
+          {
+           "logprob": -2.3841860752327193e-07,
+           "token": "."
+          },
+          {
+           "logprob": -16.375,
+           "token": " Form"
+          },
+          {
+           "logprob": -16.375,
+           "token": " "
+          },
+          {
+           "logprob": -17.875,
+           "token": "Form"
+          },
+          {
+           "logprob": -17.9375,
+           "token": " form"
+          }
+         ]
+        },
+        {
+         "logprob": -2.7418175250204513e-06,
+         "token": " "
+        },
+        {
+         "logprob": -1.6689314179529902e-06,
+         "token": " **"
+        },
+        {
+         "logprob": -0.14408321678638458,
+         "token": "Form"
+        },
+        {
+         "logprob": -1.1920930376163597e-07,
+         "token": "ulate"
+        },
+        {
+         "logprob": -0.11826620995998383,
+         "token": " Response"
+        },
+        {
+         "logprob": -4.172333774477011e-06,
+         "token": ":**"
+        },
+        {
+         "logprob": -0.4684993028640747,
+         "token": " A",
+         "top_logprobs": [
+          {
+           "logprob": -0.4684993028640747,
+           "token": " A"
+          },
+          {
+           "logprob": -1.5934993028640747,
+           "token": " '"
+          },
+          {
+           "logprob": -2.343499183654785,
+           "token": " \""
+          },
+          {
+           "logprob": -3.718499183654785,
+           "token": " Generate"
+          },
+          {
+           "logprob": -3.718499183654785,
+           "token": " Output"
+          }
+         ]
+        },
+        {
+         "logprob": -0.16701237857341766,
+         "token": ".",
+         "top_logprobs": [
+          {
+           "logprob": -0.16701237857341766,
+           "token": "."
+          },
+          {
+           "logprob": -2.1670124530792236,
+           "token": "\n"
+          },
+          {
+           "logprob": -3.7920124530792236,
+           "token": "\n\n"
+          },
+          {
+           "logprob": -5.3545122146606445,
+           "token": ".c"
+          },
+          {
+           "logprob": -6.2920122146606445,
+           "token": ".A"
+          }
+         ]
+        },
+        {
+         "logprob": -0.08789801597595215,
+         "token": "\n"
+        },
+        {
+         "logprob": -0.07204174995422363,
+         "token": "5",
+         "top_logprobs": [
+          {
+           "logprob": -0.07204174995422363,
+           "token": "5"
+          },
+          {
+           "logprob": -2.6970417499542236,
+           "token": "</think>"
+          },
+          {
+           "logprob": -6.197041988372803,
+           "token": "6"
+          },
+          {
+           "logprob": -11.259541511535645,
+           "token": "4"
+          },
+          {
+           "logprob": -11.447041511535645,
+           "token": "   "
+          }
+         ]
+        },
+        {
+         "logprob": -2.2649790025752736e-06,
+         "token": ".",
+         "top_logprobs": [
+          {
+           "logprob": -2.2649790025752736e-06,
+           "token": "."
+          },
+          {
+           "logprob": -14.812501907348633,
+           "token": " "
+          },
+          {
+           "logprob": -15.12500286102295,
+           "token": "7"
+          },
+          {
+           "logprob": -15.375001907348633,
+           "token": "6"
+          },
+          {
+           "logprob": -15.500001907348633,
+           "token": "2"
+          }
+         ]
+        },
+        {
+         "logprob": -7.391003236989491e-06,
+         "token": " "
+        },
+        {
+         "logprob": -3.337865791763761e-06,
+         "token": " **"
+        },
+        {
+         "logprob": -0.0015556388534605503,
+         "token": "Final"
+        },
+        {
+         "logprob": -0.03925781324505806,
+         "token": " Verification"
+        },
+        {
+         "logprob": -2.7418175250204513e-06,
+         "token": ":**"
+        },
+        {
+         "logprob": -0.005036259535700083,
+         "token": " Does"
+        },
+        {
+         "logprob": -1.2268568277359009,
+         "token": " this"
+        },
+        {
+         "logprob": -0.33826014399528503,
+         "token": " meet"
+        },
+        {
+         "logprob": -0.014792535454034805,
+         "token": " the"
+        },
+        {
+         "logprob": -0.15368951857089996,
+         "token": " \"",
+         "top_logprobs": [
+          {
+           "logprob": -0.15368951857089996,
+           "token": " \""
+          },
+          {
+           "logprob": -2.9036896228790283,
+           "token": " criteria"
+          },
+          {
+           "logprob": -2.9036896228790283,
+           "token": " user"
+          },
+          {
+           "logprob": -4.528689384460449,
+           "token": " constraint"
+          },
+          {
+           "logprob": -4.903689384460449,
+           "token": " requirement"
+          }
+         ]
+        },
+        {
+         "logprob": -0.06687259674072266,
+         "token": "single"
+        },
+        {
+         "logprob": -1.4782061043661088e-05,
+         "token": " letter"
+        },
+        {
+         "logprob": -0.0004909051349386573,
+         "token": " A",
+         "top_logprobs": [
+          {
+           "logprob": -0.0004909051349386573,
+           "token": " A"
+          },
+          {
+           "logprob": -7.750491142272949,
+           "token": "\""
+          },
+          {
+           "logprob": -9.87549114227295,
+           "token": " and"
+          },
+          {
+           "logprob": -12.25049114227295,
+           "token": " '"
+          },
+          {
+           "logprob": -13.12549114227295,
+           "token": "..."
+          }
+         ]
+        },
+        {
+         "logprob": -0.014172977767884731,
+         "token": " and"
+        },
+        {
+         "logprob": -3.4570753086882178e-06,
+         "token": " nothing"
+        },
+        {
+         "logprob": -5.960466182841628e-07,
+         "token": " else"
+        },
+        {
+         "logprob": -2.8133788873674348e-05,
+         "token": "\"",
+         "top_logprobs": [
+          {
+           "logprob": -2.8133788873674348e-05,
+           "token": "\""
+          },
+          {
+           "logprob": -10.625028610229492,
+           "token": "\"?"
+          },
+          {
+           "logprob": -13.625028610229492,
+           "token": "\u201d"
+          },
+          {
+           "logprob": -14.125028610229492,
+           "token": "'"
+          },
+          {
+           "logprob": -14.437528610229492,
+           "token": " criteria"
+          }
+         ]
+        },
+        {
+         "logprob": -1.100337028503418,
+         "token": " constraint"
+        },
+        {
+         "logprob": -9.298368240706623e-06,
+         "token": "?",
+         "top_logprobs": [
+          {
+           "logprob": -9.298368240706623e-06,
+           "token": "?"
+          },
+          {
+           "logprob": -12.750009536743164,
+           "token": " yes"
+          },
+          {
+           "logprob": -13.250009536743164,
+           "token": "?*"
+          },
+          {
+           "logprob": -14.000009536743164,
+           "token": "?**"
+          },
+          {
+           "logprob": -14.312509536743164,
+           "token": "\uff1f"
+          }
+         ]
+        },
+        {
+         "logprob": -5.245222382654902e-06,
+         "token": " Yes"
+        },
+        {
+         "logprob": -1.0628540515899658,
+         "token": ".",
+         "top_logprobs": [
+          {
+           "logprob": -0.4378540813922882,
+           "token": ".c"
+          },
+          {
+           "logprob": -1.0628540515899658,
+           "token": "."
+          },
+          {
+           "logprob": -6.687854290008545,
+           "token": ".ct"
+          },
+          {
+           "logprob": -7.125354290008545,
+           "token": ".cs"
+          },
+          {
+           "logprob": -7.500354290008545,
+           "token": ".m"
+          }
+         ]
+        },
+        {
+         "logprob": -0.3911701738834381,
+         "token": "\n\n"
+        },
+        {
+         "logprob": -0.9713127613067627,
+         "token": "*",
+         "top_logprobs": [
+          {
+           "logprob": -0.9713127613067627,
+           "token": "*"
+          },
+          {
+           "logprob": -1.4713127613067627,
+           "token": "Output"
+          },
+          {
+           "logprob": -1.5963126420974731,
+           "token": "Wait"
+          },
+          {
+           "logprob": -2.7213127613067627,
+           "token": "Action"
+          },
+          {
+           "logprob": -2.7213127613067627,
+           "token": "**"
+          }
+         ]
+        },
+        {
+         "logprob": -0.01463931892067194,
+         "token": "Self"
+        },
+        {
+         "logprob": -0.010092291049659252,
+         "token": "-C"
+        },
+        {
+         "logprob": -1.3113030945532955e-06,
+         "token": "or"
+        },
+        {
+         "logprob": -2.7418175250204513e-06,
+         "token": "rection"
+        },
+        {
+         "logprob": -0.07606261968612671,
+         "token": "/",
+         "top_logprobs": [
+          {
+           "logprob": -0.07606261968612671,
+           "token": "/"
+          },
+          {
+           "logprob": -3.2010626792907715,
+           "token": "/S"
+          },
+          {
+           "logprob": -3.4510626792907715,
+           "token": " during"
+          },
+          {
+           "logprob": -8.826062202453613,
+           "token": ":*"
+          },
+          {
+           "logprob": -8.826062202453613,
+           "token": "/N"
+          }
+         ]
+        },
+        {
+         "logprob": -0.1313236951828003,
+         "token": "Ref"
+        },
+        {
+         "logprob": -1.4782061043661088e-05,
+         "token": "inement"
+        },
+        {
+         "logprob": -0.00029884272953495383,
+         "token": ":*"
+        },
+        {
+         "logprob": -2.388833999633789,
+         "token": " Sometimes"
+        },
+        {
+         "logprob": -0.45102909207344055,
+         "token": " users"
+        },
+        {
+         "logprob": -0.45976728200912476,
+         "token": " ask"
+        },
+        {
+         "logprob": -0.43931844830513,
+         "token": " for"
+        },
+        {
+         "logprob": -1.211205005645752,
+         "token": " this"
+        },
+        {
+         "logprob": -0.2713295519351959,
+         "token": " to"
+        },
+        {
+         "logprob": -0.017239926382899284,
+         "token": " test"
+        },
+        {
+         "logprob": -1.7672747373580933,
+         "token": " if"
+        },
+        {
+         "logprob": -0.029007598757743835,
+         "token": " the"
+        },
+        {
+         "logprob": -0.7594425678253174,
+         "token": " model"
+        },
+        {
+         "logprob": -0.39001402258872986,
+         "token": " follows"
+        },
+        {
+         "logprob": -0.5242869853973389,
+         "token": " instructions"
+        },
+        {
+         "logprob": -3.3896753787994385,
+         "token": " literally"
+        },
+        {
+         "logprob": -0.03034200333058834,
+         "token": ".",
+         "top_logprobs": [
+          {
+           "logprob": -0.03034200333058834,
+           "token": "."
+          },
+          {
+           "logprob": -4.030342102050781,
+           "token": " or"
+          },
+          {
+           "logprob": -5.280342102050781,
+           "token": ","
+          },
+          {
+           "logprob": -5.780342102050781,
+           "token": " vs"
+          },
+          {
+           "logprob": -6.280342102050781,
+           "token": " versus"
+          }
+         ]
+        },
+        {
+         "logprob": -0.08821208029985428,
+         "token": " I",
+         "top_logprobs": [
+          {
+           "logprob": -0.08821208029985428,
+           "token": " I"
+          },
+          {
+           "logprob": -2.588212013244629,
+           "token": " The"
+          },
+          {
+           "logprob": -5.338212013244629,
+           "token": " There"
+          },
+          {
+           "logprob": -7.088212013244629,
+           "token": " Ad"
+          },
+          {
+           "logprob": -7.213212013244629,
+           "token": "\n"
+          }
+         ]
+        },
+        {
+         "logprob": -2.5794270038604736,
+         "token": " need"
+        },
+        {
+         "logprob": -4.5300555939320475e-05,
+         "token": " to"
+        },
+        {
+         "logprob": -0.10578819364309311,
+         "token": " ensure"
+        },
+        {
+         "logprob": -0.3177828788757324,
+         "token": " no"
+        },
+        {
+         "logprob": -0.15181280672550201,
+         "token": " markdown"
+        },
+        {
+         "logprob": -2.4563727378845215,
+         "token": " code"
+        },
+        {
+         "logprob": -0.0005931228515692055,
+         "token": " blocks"
+        },
+        {
+         "logprob": -0.8533111214637756,
+         "token": " or"
+        },
+        {
+         "logprob": -0.27940529584884644,
+         "token": " extra"
+        },
+        {
+         "logprob": -2.3262786865234375,
+         "token": " new"
+        },
+        {
+         "logprob": -6.795160152250901e-05,
+         "token": "lines"
+        },
+        {
+         "logprob": -0.5145504474639893,
+         "token": " are"
+        },
+        {
+         "logprob": -0.2963964641094208,
+         "token": " added"
+        },
+        {
+         "logprob": -1.6740221977233887,
+         "token": " if"
+        },
+        {
+         "logprob": -0.2882692217826843,
+         "token": " possible"
+        },
+        {
+         "logprob": -0.01564621366560459,
+         "token": ",",
+         "top_logprobs": [
+          {
+           "logprob": -0.01564621366560459,
+           "token": ","
+          },
+          {
+           "logprob": -4.515645980834961,
+           "token": "."
+          },
+          {
+           "logprob": -5.390645980834961,
+           "token": " ("
+          },
+          {
+           "logprob": -10.515645980834961,
+           "token": " to"
+          },
+          {
+           "logprob": -14.703145980834961,
+           "token": " though"
+          }
+         ]
+        },
+        {
+         "logprob": -0.2461678683757782,
+         "token": " though"
+        },
+        {
+         "logprob": -1.7562392950057983,
+         "token": " typically"
+        },
+        {
+         "logprob": -0.6269383430480957,
+         "token": " a",
+         "top_logprobs": [
+          {
+           "logprob": -0.6269383430480957,
+           "token": " a"
+          },
+          {
+           "logprob": -1.1269383430480957,
+           "token": " just"
+          },
+          {
+           "logprob": -3.0019383430480957,
+           "token": " plain"
+          },
+          {
+           "logprob": -3.2519383430480957,
+           "token": " text"
+          },
+          {
+           "logprob": -3.3769383430480957,
+           "token": " the"
+          }
+         ]
+        },
+        {
+         "logprob": -0.875931441783905,
+         "token": " single"
+        },
+        {
+         "logprob": -0.057072363793849945,
+         "token": " character"
+        },
+        {
+         "logprob": -0.7595043182373047,
+         "token": " is"
+        },
+        {
+         "logprob": -0.7581964731216431,
+         "token": " fine"
+        },
+        {
+         "logprob": -0.0914456769824028,
+         "token": ".",
+         "top_logprobs": [
+          {
+           "logprob": -0.0914456769824028,
+           "token": "."
+          },
+          {
+           "logprob": -3.3414456844329834,
+           "token": " on"
+          },
+          {
+           "logprob": -3.4664456844329834,
+           "token": " as"
+          },
+          {
+           "logprob": -4.466445446014404,
+           "token": " within"
+          },
+          {
+           "logprob": -5.341445446014404,
+           "token": " in"
+          }
+         ]
+        },
+        {
+         "logprob": -0.9685574173927307,
+         "token": " The"
+        },
+        {
+         "logprob": -0.3301878571510315,
+         "token": " instruction"
+        },
+        {
+         "logprob": -0.161428302526474,
+         "token": " says"
+        },
+        {
+         "logprob": -1.5735749911982566e-05,
+         "token": " \"",
+         "top_logprobs": [
+          {
+           "logprob": -1.5735749911982566e-05,
+           "token": " \""
+          },
+          {
+           "logprob": -11.875016212463379,
+           "token": " nothing"
+          },
+          {
+           "logprob": -11.875016212463379,
+           "token": " '"
+          },
+          {
+           "logprob": -14.375016212463379,
+           "token": " Reply"
+          },
+          {
+           "logprob": -15.437516212463379,
+           "token": " \"\""
+          }
+         ]
+        },
+        {
+         "logprob": -0.24634034931659698,
+         "token": "nothing"
+        },
+        {
+         "logprob": -2.2649790025752736e-06,
+         "token": " else"
+        },
+        {
+         "logprob": -0.9752297401428223,
+         "token": "\"."
+        },
+        {
+         "logprob": -0.13148397207260132,
+         "token": "\n\n"
+        },
+        {
+         "logprob": -2.973456382751465,
+         "token": "Response"
+        }
+       ]
+      },
+      "matched_stop": null,
+      "message": {
+       "content": "",
+       "reasoning_content": "Thinking Process:\n1.  **Analyze the Request:** The user wants a reply consisting of exactly the single letter 'A' and nothing else.\n2.  **Determine the Output:** The output must be just 'A'.\n3.  **Check Constraints:** No punctuation, no exp\u2026",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "metadata": {
+     "weight_version": "default",
+     "weight_versions": [
+      {
+       "end": 160,
+       "start": 0,
+       "version": "default"
+      }
+     ]
+    },
+    "model": "qwen3.5-9b",
+    "usage": {
+     "completion_tokens": 160,
+     "prompt_tokens": 20,
+     "prompt_tokens_details": null,
+     "reasoning_tokens": 160,
+     "total_tokens": 180
+    }
+   },
+   "method": "POST",
+   "name": "chat-logprobs-long",
+   "path": "/v1/chat/completions",
+   "request": {
+    "logprobs": true,
+    "max_tokens": 160,
+    "messages": [
+     {
+      "content": "Reply with the single letter A and nothing else.",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3.5-9b",
+    "top_logprobs": 5
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "choices": [
+     {
+      "finish_reason": "length",
+      "index": 0,
+      "logprobs": {
+       "content": [
+        {
+         "logprob": -0.0013915441231802106,
+         "token": "Thinking"
+        },
+        {
+         "logprob": -0.00025961193023249507,
+         "token": " Process"
+        },
+        {
+         "logprob": -1.4662849935120903e-05,
+         "token": ":",
+         "top_logprobs": []
+        },
+        {
+         "logprob": -0.020724181085824966,
+         "token": "\n"
+        }
+       ]
+      },
+      "matched_stop": null,
+      "message": {
+       "content": "",
+       "reasoning_content": "Thinking Process:\n",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "metadata": {
+     "weight_version": "default",
+     "weight_versions": [
+      {
+       "end": 4,
+       "start": 0,
+       "version": "default"
+      }
+     ]
+    },
+    "model": "qwen3.5-9b",
+    "usage": {
+     "completion_tokens": 4,
+     "prompt_tokens": 20,
+     "prompt_tokens_details": null,
+     "reasoning_tokens": 4,
+     "total_tokens": 24
+    }
+   },
+   "method": "POST",
+   "name": "chat-logprobs-no-tops",
+   "path": "/v1/chat/completions",
+   "request": {
+    "logprobs": true,
+    "max_tokens": 4,
+    "messages": [
+     {
+      "content": "Reply with the single letter A and nothing else.",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3.5-9b"
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "code": 400,
+    "message": "1 validation error:\n  {'type': 'missing', 'loc': ('body', 'messages'), 'msg': 'Field required', 'input': {'model': 'qwen3.5-9b', 'max_tokens': 4, 'tool_choice': 'none'}}\n\n  File \"/home/zhu/sglang-env/lib/python3.12/site-packages/sglang/srt/entrypoints/http_server.py\", line 1747, in openai_v1_chat_completions\n    POST /v1/chat/completions [{'type': 'missing', 'loc': ('body', 'messages'), 'msg': 'Field required', 'input': {'model': 'qwen3.5-9b', 'max_tokens': 4, 'tool_choice': 'none'}}]",
+    "param": null,
+    "type": "Bad Request"
+   },
+   "method": "POST",
+   "name": "chat-missing-messages",
+   "path": "/v1/chat/completions",
+   "request": {
+    "max_tokens": 4,
+    "model": "qwen3.5-9b"
+   },
+   "status": 400
+  },
+  {
+   "body": {
+    "choices": [
+     {
+      "finish_reason": "length",
+      "index": 0,
+      "logprobs": null,
+      "matched_stop": null,
+      "message": {
+       "content": "",
+       "reasoning_content": "Thinking Process:\n",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     },
+     {
+      "finish_reason": "length",
+      "index": 1,
+      "logprobs": null,
+      "matched_stop": null,
+      "message": {
+       "content": "",
+       "reasoning_content": "Thinking Process:\n",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "metadata": {
+     "weight_version": "default",
+     "weight_versions": [
+      {
+       "end": 4,
+       "start": 0,
+       "version": "default"
+      }
+     ]
+    },
+    "model": "qwen3.5-9b",
+    "usage": {
+     "completion_tokens": 8,
+     "prompt_tokens": 20,
+     "prompt_tokens_details": null,
+     "reasoning_tokens": 8,
+     "total_tokens": 28
+    }
+   },
+   "method": "POST",
+   "name": "chat-n-two",
+   "path": "/v1/chat/completions",
+   "request": {
+    "max_tokens": 4,
+    "messages": [
+     {
+      "content": "Reply with the single letter A and nothing else.",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3.5-9b",
+    "n": 2
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": {
+       "content": [
+        {
+         "logprob": -0.0008595106191933155,
+         "token": "A",
+         "top_logprobs": [
+          {
+           "logprob": -0.0008595106191933155,
+           "token": "A"
+          },
+          {
+           "logprob": -7.875859260559082,
+           "token": "a"
+          },
+          {
+           "logprob": -8.563359260559082,
+           "token": "B"
+          },
+          {
+           "logprob": -10.250859260559082,
+           "token": "C"
+          },
+          {
+           "logprob": -10.375859260559082,
+           "token": "I"
+          }
+         ]
+        },
+        {
+         "logprob": -0.00010037925676442683,
+         "token": "<|im_end|>"
+        }
+       ]
+      },
+      "matched_stop": 248046,
+      "message": {
+       "content": "A",
+       "reasoning_content": null,
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "metadata": {
+     "weight_version": "default",
+     "weight_versions": [
+      {
+       "end": 2,
+       "start": 0,
+       "version": "default"
+      }
+     ]
+    },
+    "model": "qwen3.5-9b",
+    "usage": {
+     "completion_tokens": 2,
+     "prompt_tokens": 22,
+     "prompt_tokens_details": null,
+     "reasoning_tokens": 0,
+     "total_tokens": 24
+    }
+   },
+   "method": "POST",
+   "name": "chat-thinking-off-logprobs",
+   "path": "/v1/chat/completions",
+   "request": {
+    "chat_template_kwargs": {
+     "enable_thinking": false
+    },
+    "logprobs": true,
+    "max_tokens": 4,
+    "messages": [
+     {
+      "content": "Reply with the single letter A and nothing else.",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3.5-9b",
+    "top_logprobs": 5
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "choices": [
+     {
+      "finish_reason": "length",
+      "index": 0,
+      "logprobs": {
+       "content": [
+        {
+         "logprob": -0.0013915441231802106,
+         "token": "Thinking"
+        },
+        {
+         "logprob": -0.00025961193023249507,
+         "token": " Process"
+        },
+        {
+         "logprob": -1.4662849935120903e-05,
+         "token": ":",
+         "top_logprobs": [
+          {
+           "logprob": -1.4662849935120903e-05,
+           "token": ":"
+          },
+          {
+           "logprob": -11.250014305114746,
+           "token": " for"
+          },
+          {
+           "logprob": -14.562514305114746,
+           "token": "\uff1a"
+          },
+          {
+           "logprob": -15.187514305114746,
+           "token": " that"
+          },
+          {
+           "logprob": -16.062515258789062,
+           "token": " with"
+          }
+         ]
+        },
+        {
+         "logprob": -0.020724181085824966,
+         "token": "\n"
+        },
+        {
+         "logprob": -5.161895387573168e-05,
+         "token": "1",
+         "top_logprobs": [
+          {
+           "logprob": -5.161895387573168e-05,
+           "token": "1"
+          },
+          {
+           "logprob": -11.000051498413086,
+           "token": "The"
+          },
+          {
+           "logprob": -11.562551498413086,
+           "token": "-"
+          },
+          {
+           "logprob": -12.437551498413086,
+           "token": "0"
+          },
+          {
+           "logprob": -12.750051498413086,
+           "token": "*"
+          }
+         ]
+        },
+        {
+         "logprob": -3.361758354003541e-05,
+         "token": ".",
+         "top_logprobs": [
+          {
+           "logprob": -3.361758354003541e-05,
+           "token": "."
+          },
+          {
+           "logprob": -10.375033378601074,
+           "token": ":"
+          },
+          {
+           "logprob": -14.500033378601074,
+           "token": " "
+          },
+          {
+           "logprob": -14.562533378601074,
+           "token": ","
+          },
+          {
+           "logprob": -14.625033378601074,
+           "token": "/"
+          }
+         ]
+        },
+        {
+         "logprob": -0.004364823456853628,
+         "token": " "
+        },
+        {
+         "logprob": -0.0025511712301522493,
+         "token": " **"
+        }
+       ]
+      },
+      "matched_stop": null,
+      "message": {
+       "content": "",
+       "reasoning_content": "Thinking Process:\n1.  **",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "metadata": {
+     "weight_version": "default",
+     "weight_versions": [
+      {
+       "end": 8,
+       "start": 0,
+       "version": "default"
+      }
+     ]
+    },
+    "model": "qwen3.5-9b",
+    "usage": {
+     "completion_tokens": 8,
+     "prompt_tokens": 20,
+     "prompt_tokens_details": null,
+     "reasoning_tokens": 8,
+     "total_tokens": 28
+    }
+   },
+   "method": "POST",
+   "name": "chat-thinking-on-logprobs",
+   "path": "/v1/chat/completions",
+   "request": {
+    "logprobs": true,
+    "max_tokens": 8,
+    "messages": [
+     {
+      "content": "Reply with the single letter A and nothing else.",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3.5-9b",
+    "top_logprobs": 5
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "choices": [
+     {
+      "finish_reason": "length",
+      "index": 0,
+      "logprobs": null,
+      "matched_stop": null,
+      "message": {
+       "content": "",
+       "reasoning_content": "Thinking Process:\n",
+       "role": "assistant",
+       "tool_calls": null
+      }
+     }
+    ],
+    "metadata": {
+     "weight_version": "default",
+     "weight_versions": [
+      {
+       "end": 4,
+       "start": 0,
+       "version": "default"
+      }
+     ]
+    },
+    "model": "qwen3.5-9b",
+    "usage": {
+     "completion_tokens": 4,
+     "prompt_tokens": 20,
+     "prompt_tokens_details": null,
+     "reasoning_tokens": 4,
+     "total_tokens": 24
+    }
+   },
+   "method": "POST",
+   "name": "chat-tops-without-logprobs",
+   "path": "/v1/chat/completions",
+   "request": {
+    "max_tokens": 4,
+    "messages": [
+     {
+      "content": "Reply with the single letter A and nothing else.",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3.5-9b",
+    "top_logprobs": 5
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "error": {
+     "code": 404,
+     "message": "The model 'definitely-not-a-model' does not exist",
+     "param": "model",
+     "type": "invalid_request_error"
+    }
+   },
+   "method": "POST",
+   "name": "responses-bad-model",
+   "path": "/v1/responses",
+   "request": {
+    "input": [
+     {
+      "content": "Reply with the single letter A.",
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 8,
+    "model": "definitely-not-a-model"
+   },
+   "status": 404
+  },
+  {
+   "body": {
+    "error": null,
+    "incomplete_details": {
+     "reason": "max_output_tokens"
+    },
+    "instructions": null,
+    "max_output_tokens": 16,
+    "metadata": {},
+    "model": "qwen3.5-9b",
+    "output": [
+     {
+      "content": [
+       {
+        "type": "reasoning_text"
+       }
+      ],
+      "status": null,
+      "summary": [],
+      "type": "reasoning"
+     }
+    ],
+    "reasoning": {
+     "effort": null,
+     "summary": null
+    },
+    "status": "incomplete",
+    "tools": [],
+    "usage": {
+     "input_tokens": 17,
+     "input_tokens_details": {
+      "cache_write_tokens": 0,
+      "cached_tokens": 0
+     },
+     "output_tokens": 14,
+     "output_tokens_details": {
+      "reasoning_tokens": 14
+     },
+     "total_tokens": 31
+    }
+   },
+   "method": "POST",
+   "name": "responses-logprobs",
+   "path": "/v1/responses",
+   "request": {
+    "include": [
+     "message.output_text.logprobs"
+    ],
+    "input": [
+     {
+      "content": "Reply with the single letter A.",
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16,
+    "model": "qwen3.5-9b",
+    "top_logprobs": 5
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "error": null,
+    "incomplete_details": null,
+    "instructions": null,
+    "max_output_tokens": 16,
+    "metadata": {},
+    "model": "qwen3.5-9b",
+    "output": [
+     {
+      "content": [
+       {
+        "logprobs": [
+         {
+          "logprob": -1.4543638826580718e-05,
+          "token": "A",
+          "top_logprobs": [
+           {
+            "logprob": -1.4543638826580718e-05,
+            "token": "A"
+           },
+           {
+            "logprob": -11.78572940826416,
+            "token": "B"
+           },
+           {
+            "logprob": -12.41072940826416,
+            "token": "a"
+           },
+           {
+            "logprob": -14.01787281036377,
+            "token": " A"
+           },
+           {
+            "logprob": -14.55358600616455,
+            "token": "C"
+           }
+          ]
+         },
+         {
+          "logprob": -1.3113030945532955e-06,
+          "token": "<|im_end|>",
+          "top_logprobs": [
+           {
+            "logprob": -1.3113030945532955e-06,
+            "token": "<|im_end|>"
+           },
+           {
+            "logprob": -13.928571701049805,
+            "token": "."
+           },
+           {
+            "logprob": -14.732142448425293,
+            "token": "\n"
+           },
+           {
+            "logprob": -16.517858505249023,
+            "token": ":"
+           },
+           {
+            "logprob": -17.142858505249023,
+            "token": "\n\n"
+           }
+          ]
+         }
+        ],
+        "type": "output_text"
+       }
+      ],
+      "phase": "final_answer",
+      "role": "assistant",
+      "status": "completed",
+      "type": "message"
+     }
+    ],
+    "reasoning": {
+     "effort": null,
+     "summary": null
+    },
+    "status": "completed",
+    "tools": [],
+    "usage": {
+     "input_tokens": 19,
+     "input_tokens_details": {
+      "cache_write_tokens": 0,
+      "cached_tokens": 0
+     },
+     "output_tokens": 2,
+     "output_tokens_details": {
+      "reasoning_tokens": 0
+     },
+     "total_tokens": 21
+    }
+   },
+   "method": "POST",
+   "name": "responses-thinking-off-logprobs",
+   "path": "/v1/responses",
+   "request": {
+    "chat_template_kwargs": {
+     "enable_thinking": false
+    },
+    "include": [
+     "message.output_text.logprobs"
+    ],
+    "input": [
+     {
+      "content": "Reply with the single letter A.",
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16,
+    "model": "qwen3.5-9b",
+    "top_logprobs": 5
+   },
+   "status": 200
+  }
+ ]
+}

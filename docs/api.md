@@ -29,7 +29,7 @@ caller (`close()` only shuts down jevper's own thread pool).
 | `api` | `"auto"` | `"auto"`, `"chat_completions"` or `"responses"`; `"auto"` prefers `responses` and falls back to `chat_completions` when the server answers 404 for that route — see [methods.md](methods.md#auto) |
 | `reasoning` | `None` | A `ReasoningConfig`; `None` disables reasoning entirely |
 | `examples` | `()` | Default few-shot examples: a sequence for all questions, or a mapping keyed by question id |
-| `structured_outputs` | `True` | Send a strict `json_schema` response format; `False` falls back to `{"type": "json_object"}` with the schema left in the prompt |
+| `structured_outputs` | `True` | Send a strict `json_schema` response format; `False` falls back to `{"type": "json_object"}` with the schema left in the prompt. A server that refuses the strict schema gets the same fallback automatically |
 | `normalize_probabilities` | `True` | Rescale `structured` distributions that are off by more than `1e-6`; `False` returns the model's numbers verbatim |
 | `top_logprobs` | `20` | Requested alternatives for `logprobs`/`grammar`; must be in `[0, 20]`, and at least 2 when the method is pinned to `logprobs`/`grammar` — the sampled token alone is not a distribution |
 | `max_concurrency` | `8` | Questions in flight at once (thread pool, or asyncio semaphore) |
@@ -185,6 +185,7 @@ wall-clock seconds for the whole `system_one` call.
 | `retry_reasons` | Corrective-retry messages, in order |
 | `probability_errors` | `{question_id: abs(sum − 1)}` for `structured` distributions outside `1e-6` |
 | `original_probabilities` | The model's raw distribution, only for questions that were rescaled |
+| `server_limits` | Only when the server refused a capability field: `structured` (`"schema"`/`"object"`/`"none"`), `reasoning` and `include` as it last accepted them |
 | `labels_missing` | Labels the provider did not report a logprob for, per question |
 
 Every key is always present — except `methods`, which only `method="auto"` adds — and the last three are empty

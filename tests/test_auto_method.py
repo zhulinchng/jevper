@@ -530,6 +530,66 @@ def test_auto_does_not_remember_a_value_rejection(stub_server):
     assert bodies[2]["top_logprobs"] == 20  # the second call tried logprobs again
 
 
+STRUCTURAL_REJECTION = {
+    "error": {
+        "message": "top_logprobs requires logprobs to be set to true",
+        "type": "invalid_request_error",
+        "code": 400,
+    }
+}
+
+CONDITIONAL_VALUE_REJECTION = {
+    "error": {
+        "message": "top_logprobs requires a value between 0 and 20",
+        "type": "invalid_request_error",
+    }
+}
+
+
+def structural_hostile(body):
+    """llama.cpp's shape: the field is refused outright, in the words its Responses shim uses."""
+    if body.get("logprobs"):
+        return 400, STRUCTURAL_REJECTION
+    return 200, chat_body(content=STRUCTURED)
+
+
+def conditionally_hostile(body):
+    """A server that states its cap as a requirement: the field is fine, the value is not."""
+    if body.get("logprobs"):
+        return 400, CONDITIONAL_VALUE_REJECTION
+    return 200, chat_body(content=STRUCTURED)
+
+
+def test_auto_remembers_a_refusal_that_states_a_condition(stub_server):
+    stub = stub_server(chat=structural_hostile)
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions", retry=NO_RETRY)
+
+    first = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    second = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert first.answers["q"].choice == "billing"
+    assert second.debug["methods"] == {"q": "structured"}
+
+    bodies = stub.bodies("/chat/completions")
+    assert len(bodies) == 3
+    assert "logprobs" not in bodies[2]  # the verdict was remembered
+
+
+def test_a_value_bound_stated_as_a_requirement_is_not_remembered(stub_server):
+    stub = stub_server(chat=conditionally_hostile)
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions", retry=NO_RETRY)
+
+    first = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert first.answers["q"].choice == "billing"
+    assert "not remembered" in first.debug["retry_reasons"][0]
+
+    bodies = stub.bodies("/chat/completions")
+    assert len(bodies) == 4
+    assert bodies[2]["top_logprobs"] == 20  # a bounded value is not a missing capability
+
+
 def test_auto_remembers_a_rejection_that_names_the_field_only_in_param():
     stub = AttrRejectingClient()
     client = SystemOneClient(stub, model="stub", api="chat_completions", retry=NO_RETRY)

@@ -120,6 +120,10 @@ rather than a self-report — and answers in JSON where they do not, remembering
 surface. See [docs/methods.md](https://github.com/zhulinchng/jevper/blob/main/docs/methods.md#auto) for the
 provider table, the exact request bodies, the readout rules and the failure modes.
 
+The same holds for the request fields jevper adds: a server that refuses structured output, the reasoning
+parameters or the Responses `include` list gets that field dropped and the call re-asked, so a partially
+implemented server answers instead of failing. `debug["server_limits"]` reports what it refused.
+
 ## Reasoning
 
 Pass `reasoning=ReasoningConfig(...)` to make the model think before it classifies:

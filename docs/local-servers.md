@@ -55,17 +55,19 @@ off for classification work — it costs a whole reasoning pass to choose one le
 | Server | Request field that turns it off | Also available |
 | --- | --- | --- |
 | ollama | `reasoning_effort: "none"` | `OLLAMA_CONTEXT_LENGTH`, per-model `think` on the native API |
-| llama.cpp | `chat_template_kwargs: {"enable_thinking": false}` | `reasoning_budget: 0`; `--reasoning-format deepseek` splits the trace into `reasoning_content` |
-| vLLM | `chat_template_kwargs: {"enable_thinking": false}` | `reasoning_effort` |
-| SGLang | `chat_template_kwargs: {"enable_thinking": false}` | `reasoning_effort` |
+| llama.cpp | `chat_template_kwargs: {"enable_thinking": false}` | `reasoning_effort: "none"` works too, since `--jinja` runs the model's own template; `reasoning_budget: 0`; `--reasoning-format deepseek` splits the trace into `reasoning_content` |
+| vLLM | `chat_template_kwargs: {"enable_thinking": false}` | `reasoning_effort` — but only with the values its parser accepts |
+| SGLang | `chat_template_kwargs: {"enable_thinking": false}` | `reasoning_effort` — but only with the values its parser accepts |
 
 If you keep thinking on, `structured` and `discrete` are unaffected — they read the answer text, and the
 trace lands in `response.reasoning` (`message.reasoning` on ollama, `reasoning_content` on the others;
 jevper reads all three). A label readout also survives it when the server separates the trace *and* the token
 stream ends exactly with the answer text: jevper anchors on that tail and reads the answer's own first token.
-That anchor is deliberately strict — anything else is reported rather than guessed.
+That anchor is deliberately strict — anything else is reported rather than guessed — with one allowance:
+vLLM and SGLang append their own end-of-turn token (`<|im_end|>`) to the logprob stream after the answer, so
+up to two trailing tokens that cannot be part of the answer are dropped before the tail is tested.
 
-## What each server ignores
+## What each server ignores, and what it rejects
 
 Unknown fields are accepted and dropped by all four, so a field that does not apply is not an error:
 
@@ -73,7 +75,46 @@ Unknown fields are accepted and dropped by all four, so a field that does not ap
   the model answers unconstrained and the label readout reports a non-label first token instead of a grammar
   failure. Use `logprobs` or `structured` there.
 - `strict: true` inside `json_schema` is ignored by ollama and honoured by vLLM and SGLang.
-- `reasoning_effort` is a no-op on llama.cpp (it has no such field) and is accepted by the others.
+- `reasoning_effort` reaches the chat template on llama.cpp, ollama and SGLang; vLLM validates it against its
+  own enum and answers `400` for a value outside it (`xhigh` and `max` are the usual casualties).
+- `max_completion_tokens` is ignored by ollama, which only knows `max_tokens` — bound output with
+  `max_tokens`.
+- `n` is rejected outright by llama.cpp (`1 <= value <= 1`); the others accept it, and vLLM and SGLang then
+  return two choices where jevper reads the first.
+- A `developer` message is a `400` (`Unexpected message role.`) on SGLang, so keep `state` to
+  `system`/`user`/`assistant` roles. jevper's own turns never use another role.
+
+## What each server actually answers
+
+Recorded with raw HTTP against each server — 45 requests each, and the responses jevper has to read are kept
+in `tests/fixtures/providers/`. The shapes matter more than the verdicts: they are what a client has to
+tolerate, and the fixture tests replay them on every change.
+
+| | ollama 0.34.3 | llama.cpp b11139 | vLLM 0.30.1 | SGLang 0.5.20 |
+| --- | --- | --- | --- | --- |
+| `/v1/responses` route | yes | yes | yes | yes |
+| logprobs on Chat Completions | yes | yes | yes | yes |
+| logprobs on Responses | **empty list** | **`400`** | yes, with `include` | yes, with `top_logprobs` |
+| `top_logprobs` above 20 | `400` (`must be between 0 and 20`) | accepted | `400` | accepted |
+| unknown model id | `404` naming it | ignored, `200` | `404` naming it | Chat ignored, Responses `404` |
+| `n: 2` | accepted, one choice back | `400` | accepted, two choices | accepted, two choices |
+| `developer` role | accepted | accepted | accepted | **`400`** |
+| unknown request field | ignored | ignored | ignored | ignored |
+| route 404 body | `404 page not found` (text) | `{"error": {...}}` | `{"detail": "Not Found"}` | `{"detail": "Not Found"}` |
+| some `400` bodies | JSON object | JSON object | JSON object | **a bare JSON string** |
+| reasoning field | `reasoning` | `reasoning_content` | `reasoning` | `reasoning_content` |
+
+Three of these decide behaviour jevper implements rather than documents:
+
+- **A 404 that names the model is about the model.** ollama and vLLM answer a bad model id with a 404 that
+  quotes it; switching surfaces would only produce the same 404 again, so jevper reports it as it stands.
+- **A 404 that does not name the model is a missing route.** `{"detail": "Not Found"}` and
+  `404 page not found` say nothing about the model, so `api="auto"` re-asks on the other surface and
+  remembers which one exists.
+- **A surface that answers without a distribution is left behind.** ollama's Responses route returns the
+  message with `logprobs: []` and llama.cpp's refuses the fields outright, while Chat Completions on both
+  carries the full distribution; `api="auto"` moves the label readout there, marks the surface, and later
+  calls start where the distribution is.
 
 ## Sizing a 12 GB card
 
@@ -90,5 +131,7 @@ worked here, one server at a time (they cannot share the card):
 Neither builder sends `max_tokens`, so a chatty model can generate far more than the answer needs. Bound it
 per call with `extra_body={"max_tokens": 512}` — the one field worth setting on a small card. With thinking
 left on, that cap is spent on the reasoning first: ollama answered a 512-token cap with an empty `content` and
-`finish_reason: "length"`, which reaches the caller as a malformed answer. Disable thinking *and* bound the
+`finish_reason: "length"`, which reaches the caller as a malformed answer whose message names the budget
+(`finish_reason: "length"` on Chat Completions, `status: "incomplete"` with
+`incomplete_details.reason: "max_output_tokens"` on the Responses surface). Disable thinking *and* bound the
 output.

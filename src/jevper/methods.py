@@ -192,14 +192,27 @@ def _answer_tokens(result: CallResult) -> tuple[TokenLogprob, ...]:
     anchor: when it is exactly the tail of the token stream, the token covering its first character
     is the answer's first token. The check is strict on purpose — no separated trace, or no exact
     tail, means nothing is skipped and the stream is read as it arrives.
+
+    Two servers append their own end-of-turn token to the stream (vLLM and SGLang report
+    ``<|im_end|>`` after the answer), which would hide the tail. A trailing token that cannot be part
+    of the answer — one whose text does not occur in it — is therefore dropped before the tail is
+    tested, at most two of them, so the anchor stays exact about everything it keeps.
     """
     tokens = result.token_logprobs
     content = result.text
     if not result.reasoning or not content.strip():
         return tokens
-    stream = "".join(token.token for token in tokens)
+    kept = list(tokens)
+    for _ in range(2):
+        if "".join(token.token for token in kept).endswith(content):
+            break
+        if len(kept) == 1 or (kept[-1].token and kept[-1].token in content):
+            return tokens
+        kept.pop()
+    stream = "".join(token.token for token in kept)
     if len(content) >= len(stream) or not stream.endswith(content):
         return tokens
+    tokens = tuple(kept)
     start = len(stream) - len(content)
     offset = 0
     for index, token in enumerate(tokens):
@@ -209,13 +222,31 @@ def _answer_tokens(result: CallResult) -> tuple[TokenLogprob, ...]:
     return tokens
 
 
+def _stop_note(result: CallResult) -> str:
+    """Why the provider stopped, when it stopped before writing an answer.
+
+    A reasoning model can spend the entire output budget thinking: vLLM and SGLang answer with
+    ``status: "incomplete"`` and an empty message, llama.cpp and ollama with ``finish_reason:
+    "length"`` and nothing but reasoning tokens. "No non-whitespace token in the response" is true
+    and useless; the budget is the actionable fact.
+    """
+    if result.stop is None:
+        return ""
+    if result.stop in ("length", "max_output_tokens"):
+        return (
+            f" — the provider ran out of output tokens before the answer was complete "
+            f"({result.stop!r}); raise the limit, for example extra_body={{'max_tokens': 2048}}"
+        )
+    return f" — the provider reported {result.stop!r}"
+
+
 def first_answer_token(result: CallResult, labels: Sequence[str], *, method: Method) -> TokenLogprob:
     """The first non-whitespace token of the answer, which must be one of the labels."""
     if not result.token_logprobs:
         raise _LogprobsUnavailable(
             f"no logprobs returned for the answer token (method={method!r}); this provider does not "
             f"report them — use method='structured' for the model's own probabilities, or "
-            f"method='discrete' for one label, neither of which needs logprobs",
+            f"method='discrete' for one label, neither of which needs logprobs{_stop_note(result)}",
             evidence="readout",
         )
     for token in _answer_tokens(result):
@@ -225,8 +256,11 @@ def first_answer_token(result: CallResult, labels: Sequence[str], *, method: Met
             return token
         raise LabelReadoutError(
             f"first non-whitespace token {token.token!r} is not one of the labels {list(labels)!r}"
+            f"{_stop_note(result)}"
         )
-    raise LabelReadoutError(f"no non-whitespace token in the response (method={method!r})")
+    raise LabelReadoutError(
+        f"no non-whitespace token in the response (method={method!r}){_stop_note(result)}"
+    )
 
 
 def _logprob_readout(
@@ -286,13 +320,15 @@ def readout_grammar(result: CallResult, question: Question, labels: Sequence[str
     return _logprob_readout(result, question, labels, "grammar", "grammar")
 
 
-def parse_json_object(text: str) -> dict[str, Any]:
+def parse_json_object(text: str, note: str = "") -> dict[str, Any]:
     try:
         value = json.loads(text)
     except json.JSONDecodeError as first_error:
         start = text.find("{")
         if start < 0:
-            raise MalformedAnswerError(f"no JSON object in the answer ({first_error})") from first_error
+            raise MalformedAnswerError(
+                f"no JSON object in the answer ({first_error}){note}"
+            ) from first_error
         try:
             value, _ = json.JSONDecoder().raw_decode(text[start:])
         except ValueError as exc:
@@ -313,7 +349,7 @@ def _number(value: Any, *, where: str, upper: float | None = None) -> float:
 
 
 def readout_structured(result: CallResult, question: Question) -> Readout:
-    payload = parse_json_object(result.text)
+    payload = parse_json_object(result.text, _stop_note(result))
     if question.type == "choice":
         keys = list(question.criteria)
         raw = payload.get("probabilities")
@@ -375,7 +411,7 @@ def _boolean(value: Any) -> bool | None:
 
 
 def readout_discrete(result: CallResult, question: Question, labels: Sequence[str]) -> Readout:
-    payload = parse_json_object(result.text)
+    payload = parse_json_object(result.text, _stop_note(result))
     if question.type == "choice":
         keys = list(question.criteria)
         raw = payload.get("choice")

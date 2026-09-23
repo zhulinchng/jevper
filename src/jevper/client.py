@@ -12,7 +12,7 @@ import math
 import threading
 import time
 from collections.abc import Generator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from pydantic import BaseModel
@@ -59,6 +59,7 @@ from .transport import (
     SURFACES,
     CallResult,
     CallSpec,
+    Limits,
     Surface,
     Transport,
     _has_attribute,
@@ -86,6 +87,10 @@ TRANSIENT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504, 529})
 _SERVER_ERROR_STATUS_CODES = TRANSIENT_STATUS_CODES - {408, 429}
 _LOGPROB_REJECTION_STATUS_CODES = frozenset({400, 403, 422})
 # Text that says the provider refuses the *field itself*: the capability evidence ``auto`` remembers.
+# "requires" and "must be set" are how a server states a structural condition rather than a bad value:
+# llama.cpp's Responses shim answers ``top_logprobs requires logprobs to be set to true`` and vLLM
+# ``when using `top_logprobs`, `logprobs` must be set to true`` — on a surface where there is no field
+# to set, that is a statement about what the route can do, not about the number that was sent.
 _UNSUPPORTED_MARKERS = (
     "not supported",
     "unsupported",
@@ -95,9 +100,24 @@ _UNSUPPORTED_MARKERS = (
     "unrecognized",
     "not recognized",
     "not allowed",
+    "must be set",
+    "requires",
 )
 # Text that says only the *value* was wrong: the field exists, so this is not a capability verdict.
-_VALUE_MARKERS = ("must be between", "out of range", "maximum", "max_logprobs", "exceeds")
+# Any "between" phrasing bounds a value — ollama answers ``top_logprobs must be between 0 and 20``.
+_VALUE_MARKERS = ("between", "out of range", "maximum", "max_logprobs", "exceeds")
+# Text that names a *field jevper added for capability* rather than a bad value: the server does not
+# implement structured outputs, the reasoning parameters, or the Responses ``include`` list. None of the
+# three is needed to answer a question — the prompt already asks for one JSON object — so the field is
+# dropped and the call is re-asked, and the server's limit is remembered.
+_SCHEMA_MARKERS = (
+    "response_format",
+    "json_schema",
+    "text.format",
+    "structured output",
+    "structured_output",
+)
+_REASONING_MARKERS = ("reasoning_effort", "reasoning")
 # The Responses surface carries logprobs in ``include``, so a provider that does not offer that
 # includable refuses the *field* without ever naming logprobs: OpenRouter answers ``Invalid option:
 # expected one of "file_search_call.results"|...`` for ``path: ["include", 0]``. This vocabulary is
@@ -429,6 +449,8 @@ class _BaseClient:
         self._auto_misses: dict[tuple[str, Surface], int] = {}
         # Surfaces this server has answered 404 for, learned by trying them once each.
         self._missing_surfaces: set[Surface] = set()
+        # Request fields this server has refused, per surface: structured output, reasoning, include.
+        self._limits: dict[Surface, Limits] = {}
         self._auto_lock = threading.Lock()
 
     # -- shared helpers ----------------------------------------------------------------
@@ -493,6 +515,45 @@ class _BaseClient:
         with self._auto_lock:
             return self._auto_methods.get((model, surface), AUTO_METHOD) == FALLBACK_METHOD
 
+    def _limits_for(self, surface: Surface) -> Limits:
+        """What this server has been observed to accept on this surface."""
+        with self._auto_lock:
+            return self._limits.get(surface, Limits())
+
+    def _remember_limits(self, surface: Surface, limits: Limits) -> None:
+        """Remember a server's limit for the rest of this client's life, like any other verdict."""
+        with self._auto_lock:
+            self._limits[surface] = limits
+
+    def _downgrade(self, exc: Exception, spec: CallSpec, context: _CallContext) -> Limits | None:
+        """The next request shape to try when a server refuses a field jevper added for capability.
+
+        A server that does not implement structured outputs, the reasoning parameters or the Responses
+        ``include`` list answers 400 naming the field it refuses. None of the three is required to
+        answer the question, so the field is dropped and the same call is re-asked — one step down the
+        ladder at a time, remembered afterwards, so the discovery is paid once. The ladder is bounded,
+        so a server that refuses everything still ends in a ``ProviderError``. A rejection that names
+        the logprob fields belongs to the label-readout fallback, not here.
+        """
+        if _status_code(exc) not in _LOGPROB_REJECTION_STATUS_CODES or _logprobs_rejected(exc):
+            return None
+        evidence = _error_evidence(exc)
+        limits = context.transport.limits
+        if spec.json_schema is not None and any(marker in evidence for marker in _SCHEMA_MARKERS):
+            if limits.structured == "schema":
+                return replace(limits, structured="object")
+            if limits.structured == "object":
+                return replace(limits, structured="none")
+        if (
+            spec.reasoning is not None
+            and limits.reasoning
+            and any(marker in evidence for marker in _REASONING_MARKERS)
+        ):
+            return replace(limits, reasoning=False)
+        if spec.reasoning is not None and limits.include and "include" in evidence:
+            return replace(limits, include=False)
+        return None
+
     def _logprob_surface_alternative(
         self, surface: Surface, reasoning: ReasoningConfig | None
     ) -> Surface | None:
@@ -521,11 +582,6 @@ class _BaseClient:
         ):
             self._remember_logprobs_unavailable(model, surface)
 
-    def _remember_responses_missing(self) -> None:
-        """Remember that this server has no Responses route, for the rest of this client's life."""
-        with self._auto_lock:
-            self._responses_missing = True
-
     def _switch_surface(self, context: _CallContext, surface: Surface) -> None:
         """Rebuild the transport and the reasoning plan for another surface, in place.
 
@@ -538,6 +594,7 @@ class _BaseClient:
             structured_outputs=self.structured_outputs,
             extra_body=self.extra_body,
             extra_headers=self.extra_headers,
+            limits=self._limits_for(surface),
         )
         if context.auto:
             # The method verdict is keyed by surface, so the surface that just changed has its own:
@@ -653,6 +710,7 @@ class _BaseClient:
                 structured_outputs=self.structured_outputs,
                 extra_body=self.extra_body,
                 extra_headers=self.extra_headers,
+                limits=self._limits_for(surface),
             ),
             model=effective_model,
             method=effective_method,
@@ -936,6 +994,14 @@ class _BaseClient:
             debug["methods"] = {
                 question_id: outcome.method for question_id, outcome in outcomes.items()
             }
+        limits = self._limits_for(context.transport.surface)
+        if limits != Limits():
+            # The server refused a request field jevper added, and the answer came without it.
+            debug["server_limits"] = {
+                "structured": limits.structured,
+                "reasoning": limits.reasoning,
+                "include": limits.include,
+            }
         return SystemOneResponse(
             model=context.model,
             answers=answers,
@@ -1000,6 +1066,12 @@ class SystemOneClient(_BaseClient):
                             f"the server has no {context.transport.surface!r} route: {exc}",
                             surface=context.transport.surface,
                         ) from exc
+                    downgraded = self._downgrade(exc, spec, context)
+                    if downgraded is not None:
+                        # The field is optional; the question is not. Remember the limit and re-ask.
+                        self._remember_limits(context.transport.surface, downgraded)
+                        self._switch_surface(context, context.transport.surface)
+                        continue
                     failure = self._call_failure(exc, spec, context, log)
                     # An embedded provider error is the caught exception itself; raising it `from`
                     # itself would print as its own cause.
@@ -1117,6 +1189,12 @@ class AsyncSystemOneClient(_BaseClient):
                             f"the server has no {context.transport.surface!r} route: {exc}",
                             surface=context.transport.surface,
                         ) from exc
+                    downgraded = self._downgrade(exc, spec, context)
+                    if downgraded is not None:
+                        # The field is optional; the question is not. Remember the limit and re-ask.
+                        self._remember_limits(context.transport.surface, downgraded)
+                        self._switch_surface(context, context.transport.surface)
+                        continue
                     failure = self._call_failure(exc, spec, context, log)
                     # An embedded provider error is the caught exception itself; raising it `from`
                     # itself would print as its own cause.

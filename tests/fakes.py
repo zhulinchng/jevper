@@ -162,9 +162,21 @@ class StubServer:
                     status, payload = 404, {"error": {"message": f"no stub script for {self.path}"}}
                 else:
                     status, payload = script(body)
-                data = json.dumps(payload).encode()
+                if isinstance(payload, str):
+                    # A string payload is sent verbatim: real servers answer with plain text
+                    # (ollama's ``404 page not found``) or with a bare JSON string (SGLang's
+                    # validation errors), and both must reach the client byte for byte.
+                    data = payload.encode()
+                    try:
+                        json.loads(payload)
+                        content_type = "application/json"
+                    except ValueError:
+                        content_type = "text/plain"
+                else:
+                    data = json.dumps(payload).encode()
+                    content_type = "application/json"
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)

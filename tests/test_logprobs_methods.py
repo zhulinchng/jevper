@@ -153,6 +153,74 @@ def test_a_separated_reasoning_trace_does_not_hide_the_answer_token(stub_server)
     assert response.debug["retry_reasons"] == []
 
 
+def test_a_trailing_end_of_turn_token_does_not_hide_the_answer(stub_server):
+    """vLLM and SGLang append their own ``<|im_end|>`` to the stream after the answer text.
+
+    Without dropping it the tail test fails, and a thinking-on label readout reports the first token of
+    the *thinking* as the answer — which is exactly what both servers did.
+    """
+    stream = [
+        ("The", -0.1),
+        (" user", -0.2),
+        (" was", -0.3),
+        (" charged", -0.4),
+        (" twice", -0.5),
+        (".", -0.6),
+        ("A", -0.12),
+        ("<|im_end|>", -0.01),
+    ]
+    body = chat_body(
+        content="A",
+        logprobs=stream,
+        alternatives=[("A", -0.12), ("B", -2.47), ("C", -3.48)],
+        reasoning="The user was charged twice, so this is about money.",
+    )
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", method="logprobs"
+    )
+
+    response = client.system_one(
+        state="s", questions={"q": Choice(criteria={"billing": None, "technical": None, "sales": None})}
+    )
+
+    assert response.answers["q"].choice == "billing"
+    assert response.usage.n_calls == 1
+    assert response.debug["retry_reasons"] == []
+
+
+def test_the_trailing_token_tolerance_is_bounded(stub_server):
+    """Three trailing tokens are not an end-of-turn marker, they are the answer: the anchor refuses."""
+    stream = [
+        ("The", -0.1),
+        (" user", -0.2),
+        (" was", -0.3),
+        (" charged", -0.4),
+        ("A", -0.12),
+        ("x", -1.0),
+        ("y", -1.0),
+        ("z", -1.0),
+    ]
+    body = chat_body(
+        content="A",
+        logprobs=stream,
+        alternatives=[("A", -0.12), ("B", -2.47), ("C", -3.48)],
+        reasoning="The user was charged twice, so this is about money.",
+    )
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", method="logprobs", n_retry_malformed=0
+    )
+
+    with pytest.raises(LabelReadoutError) as error:
+        client.system_one(
+            state="s",
+            questions={"q": Choice(criteria={"billing": None, "technical": None, "sales": None})},
+        )
+
+    assert "'The'" in str(error.value)
+
+
 def test_the_answer_is_the_tail_of_the_stream_not_its_first_mention(stub_server):
     """The trace weighs the options by name; only the last occurrence of the answer text is the answer."""
     body = chat_body(
@@ -187,14 +255,16 @@ def test_the_answer_is_the_tail_of_the_stream_not_its_first_mention(stub_server)
     assert answer.probabilities["technical"] == pytest.approx(0.933188894, abs=1e-9)
 
 
-def test_a_stream_that_does_not_end_with_the_answer_is_read_as_it_arrives(stub_server):
-    """The anchor is exact on purpose: a trailing token after the answer means nothing is skipped.
+def test_a_trailing_token_the_answer_contains_is_not_dropped(stub_server):
+    """The end-of-turn tolerance is only for tokens that cannot be part of the answer.
 
-    Some servers append an end-of-turn token to the logprobs; guessing where the answer ends there
-    would be a guess, so the stream is read as it arrives and the first token is reported as it is.
+    A token whose text occurs in the answer could be part of it, so nothing is skipped and the stream is
+    read as it arrives — reporting the first token as it is, rather than guessing where the answer
+    starts. A server's own ``<|im_end|>`` cannot be part of the answer and is dropped instead; that is
+    the difference between removing what the provider excluded from ``content`` and guessing.
     """
     body = chat_body(
-        content="A",
+        content="AB",
         logprobs=[
             ("The", -0.2),
             (" user", -0.3),
@@ -202,7 +272,7 @@ def test_a_stream_that_does_not_end_with_the_answer_is_read_as_it_arrives(stub_s
             (" twice", -0.5),
             (".", -0.6),
             ("A", -0.12),
-            ("<|im_end|>", -0.01),
+            ("A", -0.9),
         ],
         alternatives=[("A", -0.12), ("B", -2.47), ("C", -3.48)],
         reasoning="The user paid twice.",
