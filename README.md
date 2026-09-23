@@ -37,10 +37,18 @@ answer.confidence    # 0.83
 ## Install
 
 ```sh
-pip install -e '.[test]'   # or: uv pip install --python .venv/bin/python -e '.[test]'
+pip install jevper
 ```
 
 Python 3.10+. The only runtime dependency is `pydantic>=2.7`.
+
+For development:
+
+```sh
+git clone https://github.com/zhulinchng/jevper && cd jevper
+uv venv && uv pip install -e '.[test]'
+pytest -q
+```
 
 ## What one call does
 
@@ -198,3 +206,7 @@ LLM_MODEL=gpt-5.6-terra OPENAI_API_KEY=... pytest -q tests/test_live.py
 - [docs/reasoning.md](docs/reasoning.md) — native vs two-step reasoning, traces, encrypted content
 - [docs/few-shot.md](docs/few-shot.md) — example levels, precedence, rendering, structured examples
 - [docs/internals.md](docs/internals.md) — module map, call flow, concurrency, retries, testing
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).

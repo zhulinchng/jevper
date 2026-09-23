@@ -1,0 +1,43 @@
+# Release: tag `vX.Y.Z` -> run the suite, build, publish to PyPI.
+#
+# Publishing uses PyPI trusted publishing (OIDC), so no API token is stored in
+# this repository. One-time setup on PyPI:
+#
+#   pypi.org -> Account -> Publishing -> "Add a pending publisher"
+#     PyPI project name: jevper
+#     Owner:             zhulinchng
+#     Repository name:   jevper
+#     Workflow name:     release.yml
+#     Environment name:  pypi
+#
+# Then: bump `version` in pyproject.toml, commit, and `git push origin vX.Y.Z`.
+# If the project is instead published with an API token, replace the publish
+# step's `password` with `${{ secrets.PYPI_API_TOKEN }}` and drop `id-token`.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv venv --python 3.12
+      - run: uv pip install --python .venv/bin/python -e '.[test]'
+      - run: .venv/bin/python -m pytest -q
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1

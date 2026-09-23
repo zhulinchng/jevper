@@ -8,10 +8,31 @@ version = "0.1.0"
 description = "Jev-shaped (TypeSafe System One) classification wrapper over OpenAI-like clients"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Zhu Lin", email = "zhulin@czl.my" }]
+keywords = ["classification", "confidence", "jev", "llm", "logprobs", "openai", "structured-output", "system-one"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Typing :: Typed",
+]
 dependencies = ["pydantic>=2.7"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "openai>=1.40"]
+
+[project.urls]
+Homepage = "https://github.com/zhulinchng/jevper"
+Repository = "https://github.com/zhulinchng/jevper"
+Issues = "https://github.com/zhulinchng/jevper/issues"
+Changelog = "https://github.com/zhulinchng/jevper/releases"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/jevper"]
