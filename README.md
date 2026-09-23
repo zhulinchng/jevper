@@ -102,7 +102,7 @@ label→option mapping, so switching methods does not change your types.
 | `discrete` | strict JSON schema, model returns one option | one-hot distribution | JSON-schema structured output |
 
 `logprobs` is the default because it needs no provider-specific field beyond `logprobs`, and it reads the
-model's real distribution rather than a sampled answer. See [docs/methods.md](docs/methods.md) for the exact
+model's real distribution rather than a sampled answer. See [docs/methods.md](https://github.com/zhulinchng/jevper/blob/main/docs/methods.md) for the exact
 request bodies, readout rules and failure modes.
 
 ## Reasoning
@@ -121,7 +121,7 @@ reasoning_text(response.reasoning)   # the trace, as text
 `mode="auto"` (the default) uses native provider reasoning on the Responses surface and a two-step
 think-then-classify path on Chat Completions, where the analysis text is replayed as an assistant turn before
 the answer. The trace always lands on `response.reasoning`, and the two-step analysis call's usage is counted
-in `response.usage`. See [docs/reasoning.md](docs/reasoning.md).
+in `response.usage`. See [docs/reasoning.md](https://github.com/zhulinchng/jevper/blob/main/docs/reasoning.md).
 
 ## Few-shot examples
 
@@ -145,7 +145,7 @@ client.system_one(state=..., questions={"intent": question},
 
 Precedence is question → per call → constructor, and the first non-empty level wins. `examples` is excluded
 from `model_dump()`, so question dumps keep exactly the Jev wire keys. See
-[docs/few-shot.md](docs/few-shot.md).
+[docs/few-shot.md](https://github.com/zhulinchng/jevper/blob/main/docs/few-shot.md).
 
 ## Response
 
@@ -161,7 +161,7 @@ response.debug                 # per-attempt requests/responses, retry reasons, 
 `response.model_dump_json()` serializes to the Jev answer shape — the answer field names and JSON keys match
 `POST /v1/systemone`. Token counts are `None` when any constituent call omitted them; `n_calls` counts every
 provider call including analysis passes and corrective retries, while `n_retries` counts transient-failure
-retries only. See [docs/api.md](docs/api.md) for the full reference.
+retries only. See [docs/api.md](https://github.com/zhulinchng/jevper/blob/main/docs/api.md) for the full reference.
 
 ## Failures
 
@@ -191,7 +191,7 @@ ruff check src tests           # clean except three PYI034 hints (see docs/inter
 ```
 
 The suite drives a real `openai` SDK client at a stdlib `ThreadingHTTPServer` stub, so the SDK's own
-serialization path is exercised; see [docs/internals.md](docs/internals.md#testing).
+serialization path is exercised; see [docs/internals.md](https://github.com/zhulinchng/jevper/blob/main/docs/internals.md#testing).
 
 Optional live check, skipped unless both variables are set:
 
@@ -201,12 +201,12 @@ LLM_MODEL=gpt-5.6-terra OPENAI_API_KEY=... pytest -q tests/test_live.py
 
 ## Docs
 
-- [docs/api.md](docs/api.md) — constructor and `system_one` parameters, answer/usage/debug shapes, errors
-- [docs/methods.md](docs/methods.md) — the four methods, request bodies, readout rules, surface selection
-- [docs/reasoning.md](docs/reasoning.md) — native vs two-step reasoning, traces, encrypted content
-- [docs/few-shot.md](docs/few-shot.md) — example levels, precedence, rendering, structured examples
-- [docs/internals.md](docs/internals.md) — module map, call flow, concurrency, retries, testing
+- [docs/api.md](https://github.com/zhulinchng/jevper/blob/main/docs/api.md) — constructor and `system_one` parameters, answer/usage/debug shapes, errors
+- [docs/methods.md](https://github.com/zhulinchng/jevper/blob/main/docs/methods.md) — the four methods, request bodies, readout rules, surface selection
+- [docs/reasoning.md](https://github.com/zhulinchng/jevper/blob/main/docs/reasoning.md) — native vs two-step reasoning, traces, encrypted content
+- [docs/few-shot.md](https://github.com/zhulinchng/jevper/blob/main/docs/few-shot.md) — example levels, precedence, rendering, structured examples
+- [docs/internals.md](https://github.com/zhulinchng/jevper/blob/main/docs/internals.md) — module map, call flow, concurrency, retries, testing
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](https://github.com/zhulinchng/jevper/blob/main/LICENSE).
