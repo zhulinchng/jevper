@@ -127,9 +127,11 @@ not the Python.
 | Corrective | `LabelReadoutError` or `MalformedAnswerError` on the answer call | `usage.n_calls` (each is a provider call) and `debug["retry_reasons"]` |
 
 Transient retries wrap the failing call; a non-transient error, or a transient one with the retries exhausted,
-becomes a `ProviderError` with the attempt history attached. Corrective retries append a correction turn to the
-answer conversation — after the `ANSWER_CUE` turn in two-step mode — and use the JSON wording for
-`structured`/`discrete`, the label wording otherwise.
+becomes a `ProviderError` with the attempt history attached. A `200` whose body carries the provider's own
+`error` object — OpenRouter reports an overloaded upstream that way, with no `choices` at all — is read as that
+failure rather than as an unreadable surface, and the status inside the body decides whether it is retried.
+Corrective retries append a correction turn to the answer conversation — after the `ANSWER_CUE` turn in
+two-step mode — and use the JSON wording for `structured`/`discrete`, the label wording otherwise.
 
 ## Accounting
 

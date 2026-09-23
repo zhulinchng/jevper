@@ -51,8 +51,20 @@ class MalformedAnswerError(JevperError):
 
 
 class ProviderError(JevperError):
-    """A provider call failed after transient retries were exhausted."""
+    """A provider call failed after transient retries were exhausted.
 
-    def __init__(self, message: str, *, attempts: list[dict[str, Any]] | None = None) -> None:
+    ``status_code`` is the HTTP status the provider reported, when it reported one — including a
+    status carried inside the body of a ``200``, which is how OpenRouter reports an upstream failure.
+    ``attempts`` holds one record per call attempt, the same records as ``debug["llm_attempts"]``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: list[dict[str, Any]] | None = None,
+        status_code: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.attempts: list[dict[str, Any]] = attempts or []
+        self.status_code = status_code

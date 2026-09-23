@@ -31,6 +31,16 @@ REJECTION = {
     }
 }
 NO_RETRY = RetryPolicy(n_retries=1, base_delay=0.0)
+# OpenRouter's Responses API, verbatim: the refusal names the `include` path and its allowed values,
+# and never the word "logprob".
+INCLUDE_REJECTION = {
+    "error": {"code": "invalid_prompt", "message": "Invalid Responses API request"},
+    "metadata": {
+        "raw": '[{"code": "invalid_value", "values": ["file_search_call.results", '
+        '"reasoning.encrypted_content"], "path": ["include", 0], "message": "Invalid option: expected '
+        'one of \\"file_search_call.results\\"|\\"reasoning.encrypted_content\\""}]'
+    },
+}
 
 
 def hostile(body):
@@ -232,6 +242,46 @@ def test_auto_falls_back_on_the_responses_surface(stub_server):
     assert len(sent) == 2
     assert sent[0]["include"] == ["message.output_text.logprobs"]
     assert "include" not in sent[1] and "top_logprobs" not in sent[1]
+
+
+def test_auto_falls_back_when_a_provider_refuses_the_include_path(stub_server):
+    """OpenRouter's Responses API refuses the logprob includable without ever saying "logprob"."""
+
+    def script(body):
+        if body.get("include") or body.get("top_logprobs"):
+            return 400, INCLUDE_REJECTION
+        return 200, responses_body(text=STRUCTURED)
+
+    stub = stub_server(responses=script)
+    client = SystemOneClient(openai_client(stub), model="stub")  # api="auto" prefers responses
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.debug["api"] == "responses"
+    assert response.debug["methods"] == {"q": "structured"}
+    assert response.answers["q"].choice == "billing"
+
+    # Refusing the carrier is a fact about the surface, so the next call does not pay for it again.
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    assert stub.bodies("/responses")[2].get("include") is None
+
+
+def test_serial_questions_share_the_discovery(stub_server):
+    """A question that has not started yet takes the verdict: one probe, not one per question."""
+
+    stub = stub_server(chat=hostile)
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", max_concurrency=1
+    )
+
+    response = client.system_one(
+        state="s", questions={name: Choice(criteria=CRITERIA) for name in ("a", "b", "c")}
+    )
+
+    assert response.debug["methods"] == {"a": "structured", "b": "structured", "c": "structured"}
+    bodies = stub.bodies("/chat/completions")
+    assert sum(1 for body in bodies if body.get("logprobs")) == 1
+    assert len(bodies) == 4
 
 
 def test_async_client_auto_falls_back(stub_server):

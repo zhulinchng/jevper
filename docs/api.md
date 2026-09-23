@@ -174,7 +174,7 @@ wall-clock seconds for the whole `system_one` call.
 
 | Key | Content |
 | --- | --- |
-| `method` | Effective method: what `method="auto"` resolved to, or the method you pinned |
+| `method` | The call-level method: what `method="auto"` resolved to for this call, or the method you pinned. A question that skips the probe — a `Choice` past 26 options is answered in JSON without ever asking for logprobs — reports its own method in `methods`, so read that when they can differ |
 | `methods` | `{question_id: method}` — only for `method="auto"`, since the method is then chosen per question |
 | `api` | Surface actually used (`"chat_completions"` or `"responses"`) |
 | `reasoning_mode` | `"off"`, `"native"` or `"two_step"` |
@@ -206,8 +206,9 @@ class in its MRO — contains `Connection` or
 is what covers `httpx.ConnectError`, `ReadError` and `RemoteProtocolError`, whose names carry neither marker;
 a client-side `LocalProtocolError` is not retried. The delay before retry
 `n` is `min(base_delay · 3ⁿ, max_delay)` (so 0.5s, 1.5s, … by default). Anything else — and a transient
-failure with the retries exhausted — is raised as `ProviderError` carrying `.attempts`. A `RetryPolicy` with a
-negative field, or a `retry` that is not a `RetryPolicy`, raises `JevperError` at construction.
+failure with the retries exhausted — is raised as `ProviderError` carrying `.attempts` and `.status_code`. A
+`RetryPolicy` with a negative field, or a `retry` that is not a `RetryPolicy`, raises `JevperError` at
+construction.
 
 ## `ReasoningConfig`
 
@@ -230,10 +231,10 @@ All inherit from `JevperError`.
 | --- | --- |
 | `InvalidQuestionError` | question or example is locally invalid; also raised when `logprobs`/`grammar` get a `Choice` with more than 26 options |
 | `UnsupportedMethodError` | `method="grammar"` and the selected surface is not Chat Completions |
-| `ClientCapabilityError` | the client lacks the attribute a surface needs, or a chat response carried no choices |
+| `ClientCapabilityError` | the client lacks the attribute a surface needs, or a response carried no choices and no explanation of why |
 | `LabelReadoutError` | no logprobs at all, no alternatives for the answer token, no non-whitespace token, a first token that is not a label, no logprob for the answer token, a non-finite logprob, or no probability mass on any label. The first two are the provider's doing, so they are not corrective-retried and `method="auto"` answers with `structured` instead |
 | `MalformedAnswerError` | JSON answer missing/extra keys, a non-finite or out-of-range number, an unknown label, a score that is not a level index |
-| `ProviderError` | provider failure after transient retries; `.attempts` holds the attempt records |
+| `ProviderError` | provider failure after transient retries; `.attempts` holds the attempt records and `.status_code` the status the provider reported, including one carried inside a `200` body |
 | `JevperError` | base class, and the type used for constructor misuse, bad `state` messages, and content that is not JSON-serializable or contains a non-finite number |
 
 The provider-side logprob failures — a rejected logprob request, no logprobs at all, no alternatives for the

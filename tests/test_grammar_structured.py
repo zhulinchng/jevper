@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 import pytest
 from fakes import chat_body, openai_client, responses_body
@@ -105,6 +106,33 @@ def test_structured_rescales_off_distribution_and_keeps_the_original(stub_server
         "technical": 0.1,
         "sales": 0.1,
     }
+
+
+def test_structured_rescales_a_distribution_that_overflows_a_float(stub_server):
+    """Three values near the float limit: the sum overflows, and a bare OverflowError is not a jevper error."""
+    payload = {"probabilities": {"billing": 1e308, "technical": 1e308, "sales": 1e308}}
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps(payload))))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions"
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    answer = response.answers["q"]
+    assert answer.probabilities == {
+        "billing": pytest.approx(1 / 3),
+        "technical": pytest.approx(1 / 3),
+        "sales": pytest.approx(1 / 3),
+    }
+    assert answer.confidence == pytest.approx(0.0, abs=1e-12)
+    assert response.debug["probability_errors"]["q"] == math.inf
+    assert response.debug["original_probabilities"]["q"] == {
+        "billing": 1e308,
+        "technical": 1e308,
+        "sales": 1e308,
+    }
+    # The infinite error still has to serialize: pydantic writes a non-finite float as null.
+    assert json.loads(response.model_dump_json())["debug"]["probability_errors"]["q"] is None
 
 
 def test_structured_normalization_can_be_disabled(stub_server):

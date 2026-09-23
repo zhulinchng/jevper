@@ -94,6 +94,11 @@ _UNSUPPORTED_MARKERS = (
 )
 # Text that says only the *value* was wrong: the field exists, so this is not a capability verdict.
 _VALUE_MARKERS = ("must be between", "out of range", "maximum", "max_logprobs", "exceeds")
+# The Responses surface carries logprobs in ``include``, so a provider that does not offer that
+# includable refuses the *field* without ever naming logprobs: OpenRouter answers ``Invalid option:
+# expected one of "file_search_call.results"|...`` for ``path: ["include", 0]``. This vocabulary is
+# only read next to ``include``, where it is the refusal of the field rather than of a value.
+_INCLUDE_REJECTION_MARKERS = ("invalid option", "invalid_value", "expected one of")
 _TRANSIENT_NAME_MARKERS = ("Connection", "Timeout")
 _TRANSIENT_TRANSPORT_CLASSES = frozenset({"TransportError", "TimeoutException"})
 METHODS: tuple[Method, ...] = ("logprobs", "grammar", "structured", "discrete")
@@ -156,14 +161,31 @@ def _logprob_evidence(exc: BaseException) -> str:
     return " ".join(parts).lower()
 
 
+def _include_refused(evidence: str) -> bool:
+    """The provider refused the Responses surface's logprob carrier, the ``include`` entry.
+
+    ``include`` is the only place a Responses request can ask for logprobs, and a provider that does
+    not offer that includable rejects the path rather than the word: OpenRouter answers ``Invalid
+    option: expected one of "file_search_call.results"|...`` for ``path: ["include", 0]``.
+    """
+    return "include" in evidence and any(
+        marker in evidence for marker in _INCLUDE_REJECTION_MARKERS
+    )
+
+
 def _logprobs_rejected(exc: BaseException) -> bool:
     """The provider refused the request because of the logprob fields it carried.
 
     Both shapes seen in the wild name the field: Gemini's OpenAI-compatibility layer answers
     ``Unknown name "logprobs": Cannot find field.`` and a reasoning model behind an OpenAI-shaped
-    gateway answers ``logprobs are not supported with reasoning models.``
+    gateway answers ``logprobs are not supported with reasoning models.`` A Responses request asks
+    for logprobs through ``include`` instead, so the field it can be refused for is that one — see
+    ``_include_refused``.
     """
-    return _status_code(exc) in _LOGPROB_REJECTION_STATUS_CODES and "logprob" in _logprob_evidence(exc)
+    if _status_code(exc) not in _LOGPROB_REJECTION_STATUS_CODES:
+        return False
+    evidence = _logprob_evidence(exc)
+    return "logprob" in evidence or _include_refused(evidence)
 
 
 def _logprobs_unsupported(exc: BaseException) -> bool:
@@ -179,6 +201,8 @@ def _logprobs_unsupported(exc: BaseException) -> bool:
     evidence = _logprob_evidence(exc)
     if any(marker in evidence for marker in _VALUE_MARKERS):
         return False
+    if _include_refused(evidence):
+        return True
     return any(marker in evidence for marker in _UNSUPPORTED_MARKERS)
 
 
@@ -388,7 +412,16 @@ class _BaseClient:
                     f"the provider failed every attempt at the logprob request ({failure})",
                     capability=False,
                 )
-        return ProviderError(f"{type(exc).__name__}: {exc}", attempts=log.attempts)
+        if isinstance(exc, ProviderError):
+            # The transport already built the right error — an embedded provider failure — so keep
+            # its message and status and hand it the attempt history instead of wrapping it again.
+            exc.attempts = log.attempts
+            return exc
+        return ProviderError(
+            f"{type(exc).__name__}: {exc}",
+            attempts=log.attempts,
+            status_code=_status_code(exc),
+        )
 
     def _question_method(self, question: Question, context: _CallContext) -> Method:
         """The method one question is answered with."""
@@ -738,7 +771,10 @@ class SystemOneClient(_BaseClient):
                 ):
                     if isinstance(exc, ClientCapabilityError):
                         raise  # the client cannot read this surface; another attempt cannot help
-                    raise self._call_failure(exc, spec, context, log) from exc
+                    failure = self._call_failure(exc, spec, context, log)
+                    # An embedded provider error is the caught exception itself; raising it `from`
+                    # itself would print as its own cause.
+                    raise failure from (None if failure is exc else exc)
                 log.n_retries += 1
                 time.sleep(_retry_delay(self.retry, attempt))
                 attempt += 1
@@ -843,7 +879,10 @@ class AsyncSystemOneClient(_BaseClient):
                 ):
                     if isinstance(exc, ClientCapabilityError):
                         raise  # the client cannot read this surface; another attempt cannot help
-                    raise self._call_failure(exc, spec, context, log) from exc
+                    failure = self._call_failure(exc, spec, context, log)
+                    # An embedded provider error is the caught exception itself; raising it `from`
+                    # itself would print as its own cause.
+                    raise failure from (None if failure is exc else exc)
                 log.n_retries += 1
                 await asyncio.sleep(_retry_delay(self.retry, attempt))
                 attempt += 1

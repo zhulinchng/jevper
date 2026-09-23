@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .errors import ClientCapabilityError
+from .errors import ClientCapabilityError, ProviderError
 from .reasoning import ReasoningConfig, ReasoningContentPart, ReasoningTextPart
 from .types import Method
 
@@ -222,10 +222,28 @@ def _chat_reasoning(message: Any) -> tuple[ReasoningContentPart, ...]:
     return ()
 
 
+def _embedded_error(response: Any) -> ProviderError | None:
+    """The provider's own failure, carried in the body of a ``200``.
+
+    OpenRouter answers an overloaded upstream that way — ``{"id": ..., "error": {"message":
+    "Upstream error from Nvidia: Service temporarily overloaded", "code": 503}}``, with no
+    ``choices`` at all — so without this the call reads as a surface the client cannot parse. The
+    status travels with the error, which keeps a transient upstream failure retryable.
+    """
+    error = _get(response, "error")
+    if error is None:
+        return None
+    message = _get(error, "message")
+    code = _get(error, "code")
+    detail = message if isinstance(message, str) and message else "no message"
+    status = code if isinstance(code, int) and not isinstance(code, bool) else None
+    return ProviderError(f"provider reported an error: {detail}", status_code=status)
+
+
 def _chat_result(response: Any, request: dict[str, Any]) -> CallResult:
     choices = _get(response, "choices") or []
     if not choices:
-        raise ClientCapabilityError("provider returned no choices")
+        raise _embedded_error(response) or ClientCapabilityError("provider returned no choices")
     choice = choices[0]
     message = _get(choice, "message")
     usage = _get(response, "usage")
@@ -279,6 +297,10 @@ def _responses_reasoning(response: Any) -> tuple[ReasoningContentPart, ...]:
 
 
 def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
+    if not (_get(response, "output") or []):
+        failure = _embedded_error(response)
+        if failure is not None:
+            raise failure
     usage = _get(response, "usage")
     details = _get(usage, "output_tokens_details")
     return CallResult(

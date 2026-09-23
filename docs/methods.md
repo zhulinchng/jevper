@@ -26,7 +26,8 @@ Pick `logprobs` when the provider returns chat logprobs: it is one short call, a
 real distribution rather than a self-report. Pick `structured` when logprobs are unavailable or the provider
 supports strict JSON schema, and `discrete` when you only need the decision and want to skip probabilities.
 `grammar` exists for self-hosted Chat Completions servers that accept a `grammar` field. Leaving `method` at
-`auto` makes that choice for you and costs at most one extra call per model.
+`auto` makes that choice for you, at the cost of one extra provider call per question that runs before the
+verdict is known (see [`auto`](#auto) below).
 
 ## `auto`
 
@@ -40,6 +41,7 @@ Three things count as *this provider cannot do logprobs*:
 | Evidence | Response |
 | --- | --- |
 | The provider rejects the logprob fields with a 4xx that names them — Gemini's OpenAI-compatibility layer answers `Unknown name "logprobs": Cannot find field.`, a reasoning model behind an OpenAI-shaped gateway answers `logprobs are not supported with reasoning models.` | Re-ask the question with `structured`, and remember the verdict |
+| The provider refuses the `include` entry a Responses request carries them in — OpenRouter answers `400 Invalid option: expected one of …` for `path: ["include", 0]`, without ever writing the word "logprob" | same |
 | The answer carries no logprobs at all (`logprobs: null`, or a compatibility layer that drops the field) | same |
 | The answer token's logprobs carry no alternatives — `top_logprobs` empty, or nothing but the sampled token — so there is no distribution to read | same |
 
@@ -49,9 +51,11 @@ one bad minute does not downgrade a working provider.
 
 Cost and consequences:
 
-- The first question of the first call pays for the discovery: at most one extra provider call, or two under
-  `reasoning`, where the analysis pass is re-run for the new method. Later questions and later calls go
-  straight to the resolved method.
+- The discovery is paid once per (model, surface) per client — and by every question that is already in
+  flight when the first verdict lands. A four-question call at the default `max_concurrency=8` makes four
+  logprob attempts, not one; `max_concurrency=1` makes exactly one, because a question that has not started
+  yet takes the verdict for free. Every later call goes straight to the resolved method. Under `reasoning`
+  each question that probes pays twice, because the analysis pass is re-run for the new method.
 - The fallback asks for the model's own probabilities, which are a different quantity from a token
   distribution. `debug["methods"]` says which method each question used, and
   `debug["llm_attempts"][*]["readout"]["source"]` says which one produced a given attempt.
@@ -78,6 +82,7 @@ Provider support, as of this release — check your provider's docs, since this 
 | Together | yes | send `top_logprobs` for alternatives; `logprobs: 1` alone returns the sampled token |
 | llama.cpp, vLLM | yes | vLLM caps `top_logprobs` at its own `--max-logprobs` |
 | Ollama | partial | local builds since Nov 2025 return logprobs; Ollama Cloud and older builds do not, and the compatibility page still lists Logprobs as unsupported |
+| OpenRouter | per model | it routes by price and, by default, sends your request to an endpoint that may ignore `logprobs` — the answer comes back with none, which `auto` reads as "no logprobs" and falls back on. Add `extra_body={"provider": {"require_parameters": True}}` to route only to endpoints that support every field you send. Its Responses API rejects the logprob includable outright (`400 Invalid option: expected one of …` at `path: ["include", 0]`), so `api="auto"` there always resolves to `structured` |
 | everything else | unknown | reasoning models and thin compatibility layers are the ones that say no |
 
 With `auto` you do not have to know this table.
@@ -219,7 +224,9 @@ Readout:
 3. Normalization (not part of the readout): when `abs(sum − 1) > 1e-6` and `normalize_probabilities=True` (the
    default), the distribution is rescaled to sum 1 and both the error and the model's original numbers are
    recorded in `debug["probability_errors"]` and `debug["original_probabilities"]`. A zero total becomes
-   uniform. With `normalize_probabilities=False` the model's numbers are returned verbatim and only the error
+   uniform. Values whose sum leaves the float range — a model that answers `1e308` three times — are scaled by
+   their largest value first, so normalization cannot raise `OverflowError`. With
+   `normalize_probabilities=False` the model's numbers are returned verbatim and only the error
    is recorded — never raised, matching the reference adapter.
 4. `choice` is the argmax of the final distribution, and `confidence` is computed from it.
 

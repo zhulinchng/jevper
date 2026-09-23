@@ -187,10 +187,10 @@ unusable `state`, or `grammar` on a surface that cannot carry a grammar.
 | --- | --- |
 | `InvalidQuestionError` | question or few-shot example is locally invalid |
 | `UnsupportedMethodError` | `method="grammar"` on the Responses surface |
-| `ClientCapabilityError` | the client lacks the attribute the chosen surface needs, or returned no choices |
+| `ClientCapabilityError` | the client lacks the attribute the chosen surface needs, or the response carried no choices and no explanation of why |
 | `LabelReadoutError` | the first answer token is not a label, or the provider returned no logprobs (or no alternatives, or no logprob for that token). The provider-side cases are not corrective-retried, and `method="auto"` answers them with `structured` |
 | `MalformedAnswerError` | the JSON answer had an unusable shape after corrective retries |
-| `ProviderError` | a provider call failed; `.attempts` carries the attempt history |
+| `ProviderError` | a provider call failed; `.attempts` carries the attempt history and `.status_code` the status the provider reported — including one carried inside a `200` body, which is how OpenRouter reports an upstream failure |
 | `JevperError` | constructor misuse, a bad `state` message, or content that is not JSON-serializable |
 
 Transient failures (HTTP 408/429/500/502/503/504/529, connection and timeout errors — including the `httpx`

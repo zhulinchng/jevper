@@ -14,14 +14,36 @@ K = TypeVar("K")
 
 def _normalize(probabilities: Sequence[float]) -> list[float]:
     """Normalize confidence inputs, using uniform probabilities for zero totals."""
-    total = math.fsum(probabilities)
+    try:
+        total = math.fsum(probabilities)
+    except OverflowError:
+        return _normalize_scaled(probabilities)
     if total == 0:
         return [1.0 / len(probabilities)] * len(probabilities)
     return [probability / total for probability in probabilities]
 
 
+def _normalize_scaled(probabilities: Sequence[float]) -> list[float]:
+    """Normalize by the largest value first, for inputs whose sum leaves the float range.
+
+    A model that answers with values near ``1e308`` overflows ``math.fsum``, which raises
+    ``OverflowError`` — a bare Python error escaping a readout. Dividing by the largest magnitude
+    first keeps every ratio exact and the running total inside the float range.
+    """
+    largest = max(probabilities, default=0.0)
+    if largest <= 0:
+        return [1.0 / len(probabilities)] * len(probabilities)
+    scaled = [probability / largest for probability in probabilities]
+    total = math.fsum(scaled)
+    return [probability / total for probability in scaled]
+
+
 def rescale(probabilities: Mapping[K, float]) -> dict[K, float]:
-    total = math.fsum(probabilities.values())
+    try:
+        total = math.fsum(probabilities.values())
+    except OverflowError:
+        scaled = _normalize_scaled(list(probabilities.values()))
+        return {key: value for key, value in zip(probabilities, scaled)}
     if total == 0:
         return {key: 1.0 / len(probabilities) for key in probabilities}
     return {key: value / total for key, value in probabilities.items()}
@@ -53,5 +75,11 @@ def score_confidence(probabilities: Sequence[float]) -> float:
 
 
 def probability_error(probabilities: Mapping[K, float]) -> float:
-    """``abs(sum - 1)`` for a structured-mode distribution."""
-    return abs(math.fsum(probabilities.values()) - 1.0)
+    """``abs(sum - 1)`` for a structured-mode distribution, without raising on huge values."""
+    try:
+        total = math.fsum(probabilities.values())
+    except OverflowError:
+        # The values themselves are near the float limit; the caller rescales them, which
+        # `_normalize_scaled` can do. Reporting an infinite error is what triggers that.
+        return math.inf
+    return abs(total - 1.0)

@@ -579,6 +579,72 @@ def test_empty_choices_is_a_client_capability_error(stub_server):
     assert "provider returned no choices" in str(error.value)
 
 
+UPSTREAM_OVERLOAD = {
+    "id": "gen-stub",
+    "error": {
+        "message": "Upstream error from Nvidia: Service temporarily overloaded",
+        "code": 503,
+        "metadata": {"error_type": "provider_overloaded"},
+    },
+}
+
+
+def test_a_provider_error_in_a_200_body_is_a_provider_error(stub_server):
+    """OpenRouter reports an overloaded upstream as a 200 whose body carries the error, not a 503."""
+    stub = stub_server(chat=lambda _: (200, UPSTREAM_OVERLOAD))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        method="structured",
+        retry=RetryPolicy(n_retries=1, base_delay=0.0),
+    )
+
+    with pytest.raises(ProviderError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "Service temporarily overloaded" in str(error.value)
+    assert error.value.status_code == 503
+    # The status travelled with the error, so the retry policy saw a transient failure.
+    assert len(stub.bodies("/chat/completions")) == 2
+
+
+def test_a_permanent_provider_error_in_a_200_body_is_not_retried(stub_server):
+    body = {"id": "gen-stub", "error": {"message": "upstream rejected the request", "code": 400}}
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        method="structured",
+        retry=RetryPolicy(n_retries=2, base_delay=0.0),
+    )
+
+    with pytest.raises(ProviderError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert error.value.status_code == 400
+    assert len(stub.bodies("/chat/completions")) == 1
+
+
+def test_a_provider_error_in_a_200_response_body_is_a_provider_error(stub_server):
+    """The Responses surface carries it the same way: no output, an error, HTTP 200."""
+    stub = stub_server(responses=lambda _: (200, UPSTREAM_OVERLOAD))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="responses",
+        method="structured",
+        retry=RetryPolicy(n_retries=1, base_delay=0.0),
+    )
+
+    with pytest.raises(ProviderError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert error.value.status_code == 503
+    assert len(stub.bodies("/responses")) == 2
+
+
 def test_non_string_question_id_fails_before_any_request(stub_server):
     stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
     client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
