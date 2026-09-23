@@ -56,6 +56,20 @@ class MalformedAnswerError(JevperError):
     """The model's answer had an unusable shape after corrective retries."""
 
 
+class _SurfaceUnavailable(JevperError):
+    """The server does not implement the surface ``api="auto"`` picked.
+
+    An ``openai`` client object always exposes ``chat.completions.create`` *and* ``responses.create``, so
+    client-side detection cannot tell a server that implements the Responses API from one that answers 404
+    for the route. The verdict travels to the fallback the way ``_LogprobsUnavailable`` does, and is
+    remembered for the rest of the client's life.
+    """
+
+    def __init__(self, message: str, *, surface: str) -> None:
+        super().__init__(message)
+        self.surface = surface
+
+
 class ProviderError(JevperError):
     """A provider call failed after transient retries were exhausted.
 

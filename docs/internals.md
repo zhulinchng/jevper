@@ -174,6 +174,17 @@ Worth keeping when editing:
   decides whether to retry. A number the provider did not report stays missing (`TokenLogprob.logprob` is
   `float | None`) rather than defaulting to `0.0`, which would read as certainty, and a non-finite logprob
   raises instead of propagating a `nan` distribution into `confidence` and `score`.
+- The first token a label readout reads is the answer's, not the completion's. When the provider separates its
+  reasoning from the answer *and* the answer text is exactly the tail of the token stream, the answer's own
+  tokens start at that offset (`methods._answer_tokens`); anything else — no trace, no exact tail — is read as
+  it arrives, so a stream that cannot be anchored is reported rather than guessed at.
+- `method="auto"` remembers two kinds of verdict per client, and neither changes a pinned method or a pinned
+  surface: which method works per `(model, surface)`, and which surfaces answer 404. A surface that cannot
+  deliver a distribution — it withheld logprobs, or refused the fields outright — is worth one request on the
+  other surface, and is then marked so later calls start there; the mark is per model, survives the call, and
+  is cleared by a distribution arriving on that surface. The move happens only while the reasoning plan
+  survives it (`native` reasoning exists only on Responses) and never for a provider failure that outlived its
+  retries, which says nothing about the surface.
 - An empty assistant turn is never sent. Two-step analysis output that is blank falls back to the call's
   reasoning text, and if there is none the answer call goes from the question block straight to the cue.
 - Content is rendered with `allow_nan=False`: `NaN`/`Infinity` are not valid JSON, so they raise `JevperError`

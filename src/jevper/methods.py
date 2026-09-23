@@ -183,8 +183,34 @@ def softmax_over_labels(values: Mapping[str, float]) -> dict[str, float]:
     return {key: weights.get(key, 0.0) / total for key in values}
 
 
+def _answer_tokens(result: CallResult) -> tuple[TokenLogprob, ...]:
+    """The tokens of the answer itself, when the provider separated its reasoning from the answer.
+
+    A reasoning server reports logprobs for every generated token — vLLM, SGLang and ollama include
+    the thinking span, while ``message.content`` holds only the answer — so the first token of the
+    stream is the first token of the *thinking*, which is never a label. The answer text is the
+    anchor: when it is exactly the tail of the token stream, the token covering its first character
+    is the answer's first token. The check is strict on purpose — no separated trace, or no exact
+    tail, means nothing is skipped and the stream is read as it arrives.
+    """
+    tokens = result.token_logprobs
+    content = result.text
+    if not result.reasoning or not content.strip():
+        return tokens
+    stream = "".join(token.token for token in tokens)
+    if len(content) >= len(stream) or not stream.endswith(content):
+        return tokens
+    start = len(stream) - len(content)
+    offset = 0
+    for index, token in enumerate(tokens):
+        offset += len(token.token)
+        if offset > start:
+            return tokens[index:]
+    return tokens
+
+
 def first_answer_token(result: CallResult, labels: Sequence[str], *, method: Method) -> TokenLogprob:
-    """The first non-whitespace token, which must be one of the labels."""
+    """The first non-whitespace token of the answer, which must be one of the labels."""
     if not result.token_logprobs:
         raise _LogprobsUnavailable(
             f"no logprobs returned for the answer token (method={method!r}); this provider does not "
@@ -192,7 +218,7 @@ def first_answer_token(result: CallResult, labels: Sequence[str], *, method: Met
             f"method='discrete' for one label, neither of which needs logprobs",
             evidence="readout",
         )
-    for token in result.token_logprobs:
+    for token in _answer_tokens(result):
         if not token.token.strip():
             continue
         if token.token.strip().upper() in labels:

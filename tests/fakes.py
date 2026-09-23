@@ -21,18 +21,21 @@ def chat_body(
     *,
     content: str,
     logprobs: Sequence[tuple[str, float]] | None = None,
+    alternatives: Sequence[tuple[str, float]] | None = None,
     reasoning: str | None = None,
     input_tokens: int | None = 10,
     output_tokens: int | None = 3,
     reasoning_tokens: int | None = 0,
 ) -> dict[str, Any]:
     """A ``chat.completion`` body. ``logprobs`` is the generated token stream for the answer, first
-    entry first; the answer token's ``top_logprobs`` is the whole sequence."""
+    entry first; the answer token's ``top_logprobs`` is the whole sequence unless ``alternatives``
+    says otherwise — a stream that carries reasoning tokens needs the distribution spelled out."""
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if reasoning is not None:
         message["reasoning_content"] = reasoning
     choice: dict[str, Any] = {"index": 0, "finish_reason": "stop", "message": message}
     if logprobs is not None:
+        distribution = logprobs if alternatives is None else alternatives
         choice["logprobs"] = {
             "content": [
                 {
@@ -41,7 +44,7 @@ def chat_body(
                     "bytes": list(token.encode()),
                     "top_logprobs": [
                         {"token": name, "logprob": value, "bytes": list(name.encode())}
-                        for name, value in logprobs
+                        for name, value in distribution
                     ],
                 }
                 for token, logprob in logprobs

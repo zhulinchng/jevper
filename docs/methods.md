@@ -86,8 +86,10 @@ Provider support, as of this release — check your provider's docs, since this 
 | Gemini native API | yes | not reachable through an OpenAI-compatible client |
 | DeepSeek | yes | `top_logprobs` up to 20 |
 | Together | yes | send `top_logprobs` for alternatives; `logprobs: 1` alone returns the sampled token |
-| llama.cpp, vLLM | yes | vLLM caps `top_logprobs` at its own `--max-logprobs` |
-| Ollama | partial | local builds since Nov 2025 return logprobs; Ollama Cloud and older builds do not, and the compatibility page still lists Logprobs as unsupported |
+| llama.cpp | yes | Chat Completions only: its `/v1/responses` shim rejects the logprob fields (`400 top_logprobs requires logprobs to be set to true`), so `auto` re-asks on Chat Completions |
+| vLLM | yes | caps `top_logprobs` at its own `--max-logprobs` (20 by default); `/v1/responses` carries them through `include` |
+| SGLang | yes | its `/v1/responses` needs `top_logprobs` sent explicitly (it defaults to 0) — jevper always sends it |
+| Ollama | partial | local builds since Nov 2025 return logprobs on Chat Completions; its `/v1/responses` returns an empty logprob list, so `auto` re-asks on Chat Completions. Ollama Cloud and older builds report none at all |
 | OpenRouter | per model | it routes by price and, by default, sends your request to an endpoint that may ignore `logprobs` — the answer comes back with none, which `auto` reads as "no logprobs" and falls back on. Add `extra_body={"provider": {"require_parameters": True}}` to route only to endpoints that support every field you send. Its Responses API rejects the logprob includable outright (`400 Invalid option: expected one of …` at `path: ["include", 0]`), so `api="auto"` there always resolves to `structured` |
 | everything else | unknown | reasoning models and thin compatibility layers are the ones that say no |
 
@@ -105,11 +107,32 @@ flowchart TD
     E -->|"no"| F{"client has responses.create"}
     F -->|"yes"| C
     F -->|"no"| D
+    C -->|"404 that does not name the model"| D
 ```
 
 `api="auto"` (the default) prefers the Responses surface because it carries native reasoning and encrypted
 content, except for `grammar`, which only Chat Completions can carry. A missing attribute raises
 `ClientCapabilityError` naming the surface to pass explicitly.
+
+A client object cannot tell you whether the *server* implements the route: `openai.OpenAI` exposes
+`responses.create` either way, so a server that does not implement it answers 404 for that call. Under `auto`
+that 404 is read as "no Responses surface here" — unless the error names the model, which would fail the same
+way on either surface — and the call is re-issued on `chat_completions` and remembered for the rest of the
+client's life. An explicit `api="responses"` is a decision, not a preference: its 404 reaches you unchanged.
+
+The preference has one exception, and it is about the readout rather than the surface. A server can implement
+the Responses route and still not carry logprobs through it: ollama answers it with an empty logprob list,
+llama.cpp refuses the logprob fields there outright (`400 top_logprobs requires logprobs to be set to true`),
+and OpenAI's Responses logprobs hold the sampled token with no alternatives. When the label readout cannot
+produce a distribution on the chosen surface — for any reason other than a provider failure that survived its
+retries — `auto` re-asks on the other surface, marks the one that failed so later calls start where the
+distribution is, and keeps that mark for the model. Two things stop the move: `reasoning="native"`, because
+native reasoning is the reason to prefer Responses and switching would silently turn it into a two-step pass,
+and a server whose other route is missing or already known to be missing. A distribution arriving later on a
+marked surface clears the mark: the verdict moves the readout, it does not condemn the surface.
+
+For the four servers this was checked against — what to pass, how to turn thinking off, and what fits a 12 GB
+card — see [local-servers.md](local-servers.md).
 
 Request fields per surface:
 
@@ -133,7 +156,13 @@ allowed). On the Responses surface the logprobs arrive through `include=["messag
 
 Readout:
 
-1. The first non-whitespace token of the answer must be a label (compared case-insensitively).
+1. The first non-whitespace token of the answer must be a label (compared case-insensitively). A reasoning
+   server reports logprobs for every generated token — vLLM, SGLang and ollama include the thinking span while
+   `message.content` holds only the answer — so the answer's own tokens are located first, by matching the
+   answer text against the tail of the token stream. The match is strict: without a separated trace, or without
+   an exact tail, nothing is skipped and the stream is read as it arrives, so a mismatch is an error rather
+   than a guess. Disabling thinking is still the better deployment — a one-token answer does not need a
+   reasoning pass.
 2. Its logprob is taken from the token itself, and the rest of the distribution from the token's
    `top_logprobs` entries. A label the provider did not report gets probability exactly `0.0` and is listed in
    `debug["labels_missing"]`. A provider that reports `logprob: null` — some OpenAI-compatible servers do — is

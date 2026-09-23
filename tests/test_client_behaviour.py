@@ -6,6 +6,7 @@ import asyncio
 import json
 import threading
 import time
+import warnings
 
 import pytest
 from fakes import (
@@ -795,3 +796,26 @@ def test_a_per_call_method_cannot_ask_for_one_alternative(stub_server):
 
     assert "at least 2" in str(error.value)
     assert stub.requests == []
+
+
+def test_a_provider_field_the_sdk_types_differently_is_dumped_without_noise(stub_server):
+    """SGLang returns a list for ``metadata`` where the SDK declares a string.
+
+    jevper dumps the provider object for ``debug``, so without asking pydantic to keep quiet every
+    call against such a server prints a ``PydanticSerializationUnexpectedValue`` warning the caller
+    never asked for. The value survives the dump either way: only the noise is removed.
+    """
+    body = chat_body(content="A", logprobs=CHOICE_LOGS)
+    body["metadata"] = [{"version": "default", "start": 0, "end": 4}]
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert [item for item in caught if "PydanticSerializationUnexpectedValue" in str(item.message)] == []
+    assert response.debug["llm_attempts"][-1]["response"]["metadata"] == [
+        {"version": "default", "start": 0, "end": 4}
+    ]
+    assert response.answers["q"].choice == "billing"

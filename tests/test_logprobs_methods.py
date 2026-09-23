@@ -119,6 +119,103 @@ def test_non_label_answer_is_retried_then_raises(stub_server):
     assert "A, B" in requests[1]["messages"][-1]["content"]
 
 
+def test_a_separated_reasoning_trace_does_not_hide_the_answer_token(stub_server):
+    """A reasoning server reports logprobs for every generated token, the thinking span included.
+
+    vLLM, SGLang and ollama all do this while separating the trace into ``reasoning_content``, so the
+    first token of the stream is the first token of the *thinking*. The answer text is the anchor: the
+    token that starts its exact tail is the answer's first token, and the distribution is read there.
+    """
+    stream = [
+        ("The", -0.1),
+        (" user", -0.2),
+        (" was", -0.3),
+        (" charged", -0.4),
+        (" twice", -0.5),
+        (".", -0.6),
+        ("A", -0.12),
+    ]
+    body = chat_body(
+        content="A",
+        logprobs=stream,
+        alternatives=[("A", -0.12), ("B", -2.47), ("C", -3.48)],
+        reasoning="The user was charged twice, so this is about money.",
+    )
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions", method="logprobs")
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria={"billing": None, "technical": None, "sales": None})})
+
+    answer = response.answers["q"]
+    assert answer.choice == "billing"
+    assert answer.probabilities["billing"] == pytest.approx(0.884873983, abs=1e-9)
+    assert response.usage.n_calls == 1  # the readout needed no corrective retry
+    assert response.debug["retry_reasons"] == []
+
+
+def test_the_answer_is_the_tail_of_the_stream_not_its_first_mention(stub_server):
+    """The trace weighs the options by name; only the last occurrence of the answer text is the answer."""
+    body = chat_body(
+        content="B",
+        logprobs=[
+            ("The", -0.2),
+            (" user", -0.3),
+            (" paid", -0.4),
+            (" twice", -0.5),
+            (",", -0.6),
+            (" so", -0.7),
+            ("A", -0.8),
+            (" is", -0.9),
+            (" wrong", -1.0),
+            (" and", -1.1),
+            (" B", -1.2),
+            (" fits", -1.3),
+            (".", -1.4),
+            ("B", -0.05),
+        ],
+        alternatives=[("B", -0.05), ("A", -3.0), ("C", -4.0)],
+        reasoning="The user paid twice, so A is wrong and B fits.",
+    )
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions", method="logprobs")
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria={"billing": None, "technical": None, "sales": None})})
+
+    answer = response.answers["q"]
+    assert answer.choice == "technical"  # B, not the A the trace rules out
+    # The distribution is the final token's: the trace's mention of B carries logprob -1.2 there.
+    assert answer.probabilities["technical"] == pytest.approx(0.933188894, abs=1e-9)
+
+
+def test_a_stream_that_does_not_end_with_the_answer_is_read_as_it_arrives(stub_server):
+    """The anchor is exact on purpose: a trailing token after the answer means nothing is skipped.
+
+    Some servers append an end-of-turn token to the logprobs; guessing where the answer ends there
+    would be a guess, so the stream is read as it arrives and the first token is reported as it is.
+    """
+    body = chat_body(
+        content="A",
+        logprobs=[
+            ("The", -0.2),
+            (" user", -0.3),
+            (" paid", -0.4),
+            (" twice", -0.5),
+            (".", -0.6),
+            ("A", -0.12),
+            ("<|im_end|>", -0.01),
+        ],
+        alternatives=[("A", -0.12), ("B", -2.47), ("C", -3.48)],
+        reasoning="The user paid twice.",
+    )
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions", method="logprobs")
+
+    with pytest.raises(LabelReadoutError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria={"billing": None, "technical": None, "sales": None})})
+
+    assert "first non-whitespace token 'The'" in str(error.value)
+
+
 def test_corrective_retry_succeeds_and_records_reason(stub_server):
     good = chat_body(content="B", logprobs=[("B", -0.05), ("A", -3.0)])
     bad = chat_body(content="maybe", logprobs=[("maybe", -0.1), ("A", -2.0), ("B", -2.5)])

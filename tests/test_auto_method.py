@@ -266,6 +266,111 @@ def test_auto_falls_back_when_a_provider_refuses_the_include_path(stub_server):
     assert stub.bodies("/responses")[2].get("include") is None
 
 
+def test_a_rejection_moves_the_readout_to_the_other_surface(stub_server):
+    """llama.cpp's Responses shim refuses the logprob fields; Chat Completions carries them.
+
+    A refusal is about the surface that made it — the same question on the other surface is worth one
+    request, because that is where the distribution is. llama.cpp answers
+    ``400 top_logprobs requires logprobs to be set to true`` on ``/v1/responses`` and a full
+    distribution on ``/v1/chat/completions``.
+    """
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)),
+        responses=lambda body: (400, INCLUDE_REJECTION)
+        if body.get("include")
+        else (200, responses_body(text=STRUCTURED)),
+    )
+    client = SystemOneClient(openai_client(stub), model="stub")  # api="auto" prefers responses
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.debug["api"] == "chat_completions"
+    assert response.debug["methods"] == {"q": "logprobs"}
+    assert stub.paths == ["/v1/responses", "/v1/chat/completions"]
+    assert response.answers["q"].probabilities["billing"] == pytest.approx(0.884873983, abs=1e-9)
+
+
+def test_a_surface_that_delivers_again_is_not_written_off(stub_server):
+    """The verdict moves the readout away; it does not condemn the surface. A distribution clears it."""
+    calls = {"probes": 0}
+
+    def responses_script(body):
+        if body.get("include") or body.get("top_logprobs"):
+            calls["probes"] += 1
+            if calls["probes"] == 1:
+                return 200, responses_body(text="A")  # answered, carrying no logprobs
+            return 200, responses_body(text="A", logprobs=CHOICE_LOGS)  # this time it does
+        return 200, responses_body(text=STRUCTURED)
+
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)),
+        responses=responses_script,
+    )
+    client = SystemOneClient(openai_client(stub), model="stub")
+    question = {"q": Choice(criteria=CRITERIA)}
+
+    client.system_one(state="s", questions=question)  # responses withholds: the readout moves to chat
+    assert stub.paths == ["/v1/responses", "/v1/chat/completions"]
+
+    # A pinned call proves the surface can carry a distribution after all, which clears the verdict.
+    client.system_one(state="s", questions=question, api="responses", method="logprobs")
+    assert stub.paths[-1] == "/v1/responses"
+
+    # So the next auto call opens there again, rather than staying away for the client's life — and
+    # it needs only that one request, because the surface now carries the distribution.
+    client.system_one(state="s", questions=question)
+    assert stub.paths[-1] == "/v1/responses"
+    assert stub.paths.count("/v1/responses") == 3
+    assert stub.paths.count("/v1/chat/completions") == 1
+
+
+def test_a_refusal_is_remembered_even_when_the_surface_cannot_move(stub_server):
+    """Native reasoning keeps the surface, so the only verdict left is the provider's own."""
+
+    def script(body):
+        # Native reasoning also sends an `include` (for encrypted content); only the logprob
+        # includable is refused here, which is what the real rejection names.
+        if "message.output_text.logprobs" in (body.get("include") or []):
+            return 400, INCLUDE_REJECTION
+        return 200, responses_body(text=STRUCTURED)
+
+    stub = stub_server(responses=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        reasoning=ReasoningConfig(mode="native", effort="low"),
+    )
+    question = {"q": Choice(criteria=CRITERIA)}
+
+    client.system_one(state="s", questions=question)
+    client.system_one(state="s", questions=question)
+
+    # The refusal names the surface's carrier, so it is a capability verdict: no second probe.
+    assert "message.output_text.logprobs" not in (
+        stub.bodies("/responses")[2].get("include") or []
+    )
+    assert stub.paths.count("/v1/responses") == 3  # probe, structured, structured
+
+
+def test_coming_back_to_a_marked_surface_does_not_ask_for_logprobs_again(stub_server):
+    """The method verdict is keyed by surface: returning to one that withheld logprobs stays in JSON."""
+
+    def responses_script(body):
+        if body.get("include") or body.get("top_logprobs"):
+            return 200, responses_body(text="A")  # answered, carrying no logprobs
+        return 200, responses_body(text=STRUCTURED)
+
+    stub = stub_server(responses=responses_script)  # no chat route: the move cannot land
+    client = SystemOneClient(openai_client(stub), model="stub")
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    # responses withholds → chat is tried and 404s → back on responses, answered in JSON, not probed.
+    assert stub.paths == ["/v1/responses", "/v1/chat/completions", "/v1/responses"]
+    assert response.debug["api"] == "responses"
+    assert response.answers["q"].choice == "billing"
+
+
 def test_serial_questions_share_the_discovery(stub_server):
     """A question that has not started yet takes the verdict: one probe, not one per question."""
 
@@ -498,3 +603,144 @@ def test_a_readable_distribution_retires_earlier_absences(stub_server):
 
     # Two absences separated by a readable distribution are still only one absence in a row.
     assert stub.bodies("/chat/completions")[5]["logprobs"] is True
+
+
+def test_auto_switches_to_chat_when_the_server_has_no_responses_route(stub_server):
+    """A server with no ``/v1/responses`` route: the SDK object exposes ``responses.create`` regardless.
+
+    The stub answers 404 for a path it has no script for, exactly as such a server does, so the default
+    ``api="auto"`` must notice and answer on the surface the server actually implements.
+    """
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub")  # api="auto" prefers responses
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert stub.paths == ["/v1/responses", "/v1/chat/completions"]
+    assert response.debug["api"] == "chat_completions"
+    assert response.answers["q"].choice == "billing"
+    assert response.usage.n_retries == 0  # a surface switch is not a transient retry
+
+
+def test_the_missing_responses_surface_is_remembered(stub_server):
+    """One 404 is enough: later calls on the same client go straight to the surface that works."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub")
+
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert stub.paths.count("/v1/responses") == 1
+    assert stub.paths.count("/v1/chat/completions") == 2
+
+
+def test_a_404_that_names_the_model_does_not_switch_surface(stub_server):
+    """The model is missing on either surface, so the provider's own error must reach the caller."""
+
+    def script(_):
+        return 404, {"error": {"message": "The model 'stub' does not exist", "code": "model_not_found"}}
+
+    stub = stub_server(responses=script)
+    client = SystemOneClient(openai_client(stub), model="stub")
+
+    with pytest.raises(ProviderError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "does not exist" in str(error.value)
+    assert stub.paths == ["/v1/responses"]
+
+
+def test_an_explicit_responses_surface_reports_the_404(stub_server):
+    """``api="responses"`` is a decision, not a preference: it is never silently overridden."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="responses")
+
+    with pytest.raises(ProviderError):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert stub.paths == ["/v1/responses"]
+
+
+def test_switching_surface_re_derives_the_reasoning_mode(stub_server):
+    """``mode="auto"`` is native on Responses and two-step on Chat: the switch must follow the surface."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        reasoning=ReasoningConfig(effort="medium", mode="auto"),
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert stub.paths[0] == "/v1/responses"  # the 404 that teaches the verdict
+    assert response.debug["api"] == "chat_completions"
+    assert response.debug["reasoning_mode"] == "two_step"
+    sent = stub.bodies("/chat/completions")
+    assert len(sent) == 2  # analysis pass, then the answer pass
+    assert all("reasoning_effort" not in body for body in sent)  # two-step asks for no native reasoning
+    assert response.answers["q"].choice == "billing"
+
+
+def test_auto_answers_from_chat_when_the_responses_surface_carries_no_logprobs(stub_server):
+    """ollama and llama.cpp implement ``/v1/responses`` with an empty logprob list; chat has them.
+
+    The surface preference exists for native reasoning, but a label readout with nothing to read is
+    worth one request on the other surface — which on the same server carries a full distribution.
+    """
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)),
+        responses=lambda _: (200, responses_body(text="A")),
+    )
+    client = SystemOneClient(openai_client(stub), model="stub")
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.debug["api"] == "chat_completions"
+    assert response.debug["methods"] == {"q": "logprobs"}
+    assert response.answers["q"].probabilities["billing"] == pytest.approx(0.884873983, abs=1e-9)
+    assert stub.paths == ["/v1/responses", "/v1/chat/completions"]
+
+
+def test_native_reasoning_keeps_the_responses_surface(stub_server):
+    """Switching surfaces would silently turn native reasoning into a two-step pass: it stays put."""
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)),
+        responses=lambda _: (200, responses_body(text=STRUCTURED)),
+    )
+    client = SystemOneClient(
+        openai_client(stub), model="stub", reasoning=ReasoningConfig(mode="native", effort="low")
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.debug["api"] == "responses"
+    assert response.debug["reasoning_mode"] == "native"
+    assert response.debug["methods"] == {"q": "structured"}
+    assert stub.paths == ["/v1/responses", "/v1/responses"]
+    assert response.answers["q"].choice == "billing"
+
+
+def test_the_surface_verdict_is_remembered_from_the_first_call(stub_server):
+    """One surface without logprobs is enough to stop opening there: the next call starts elsewhere."""
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)),
+        responses=lambda _: (200, responses_body(text="A")),
+    )
+    client = SystemOneClient(openai_client(stub), model="stub")
+
+    for _ in range(3):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert stub.paths.count("/v1/responses") == 1  # the discovery, paid once
+    assert stub.paths.count("/v1/chat/completions") == 3
+
+
+def test_async_auto_switches_surface_too(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = AsyncSystemOneClient(async_openai_client(stub), model="stub")
+
+    response = asyncio.run(client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}))
+
+    assert stub.paths == ["/v1/responses", "/v1/chat/completions"]
+    assert response.debug["api"] == "chat_completions"
+    assert response.answers["q"].choice == "billing"

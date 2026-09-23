@@ -220,6 +220,7 @@ LLM_MODEL=gpt-5.6-terra OPENAI_API_KEY=... pytest -q tests/test_live.py
 
 - [docs/api.md](https://github.com/zhulinchng/jevper/blob/main/docs/api.md) — constructor and `system_one` parameters, answer/usage/debug shapes, errors
 - [docs/methods.md](https://github.com/zhulinchng/jevper/blob/main/docs/methods.md) — the four methods, request bodies, readout rules, surface selection
+- [docs/local-servers.md](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md) — ollama, llama.cpp, vLLM and SGLang: what to pass, turning thinking off, what fits a small GPU
 - [docs/reasoning.md](https://github.com/zhulinchng/jevper/blob/main/docs/reasoning.md) — native vs two-step reasoning, traces, encrypted content
 - [docs/few-shot.md](https://github.com/zhulinchng/jevper/blob/main/docs/few-shot.md) — example levels, precedence, rendering, structured examples
 - [docs/internals.md](https://github.com/zhulinchng/jevper/blob/main/docs/internals.md) — module map, call flow, concurrency, retries, testing

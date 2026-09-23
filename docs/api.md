@@ -26,7 +26,7 @@ caller (`close()` only shuts down jevper's own thread pool).
 | --- | --- | --- |
 | `model` | required | Model id sent with every call; overridable per `system_one` call |
 | `method` | `"auto"` | `"auto"`, `"logprobs"`, `"grammar"`, `"structured"` or `"discrete"`; `"auto"` resolves per model and surface — see [methods.md](methods.md#auto) |
-| `api` | `"auto"` | `"auto"`, `"chat_completions"` or `"responses"` |
+| `api` | `"auto"` | `"auto"`, `"chat_completions"` or `"responses"`; `"auto"` prefers `responses` and falls back to `chat_completions` when the server answers 404 for that route — see [methods.md](methods.md#auto) |
 | `reasoning` | `None` | A `ReasoningConfig`; `None` disables reasoning entirely |
 | `examples` | `()` | Default few-shot examples: a sequence for all questions, or a mapping keyed by question id |
 | `structured_outputs` | `True` | Send a strict `json_schema` response format; `False` falls back to `{"type": "json_object"}` with the schema left in the prompt |
@@ -249,6 +249,17 @@ is evidence about the provider (`True`, which `auto` remembers) or a bad minute 
 Catch the public `LabelReadoutError`. `capability=True` from a rejection is remembered at once; the same verdict
 read out of an answer that carried no usable logprobs needs a second one, because a single anomalous response is
 not evidence about the provider — [`internals.md`](internals.md#invariants) has the rule.
+
+The surface has its own private verdict. An `openai` client object exposes `responses.create` whether or not the
+server behind it implements the route — every local server (ollama, llama.cpp, SGLang, vLLM without the route)
+does not — so under `api="auto"` a 404 that does not name the model is read as *this server has no Responses
+route*: the call is re-issued on `chat_completions` and the verdict is remembered for the rest of the client's
+life. A 404 that names the model is the model, and `api="responses"` asked for explicitly is never overridden.
+
+A surface that cannot deliver a distribution — it answered without logprobs, or refused the logprob fields —
+is the same kind of verdict: under `api="auto"` the readout moves to the other surface once, and the surface
+that failed is marked so later calls for that model start where the distribution is. `reasoning="native"` keeps
+the surface it implies, and a provider failure that survived its retries moves nothing.
 
 ## Constants
 

@@ -26,6 +26,7 @@ from .errors import (
     MalformedAnswerError,
     ProviderError,
     _LogprobsUnavailable,
+    _SurfaceUnavailable,
 )
 from .labels import MAX_LABEL_OPTIONS, labels_for
 from .normalize import (
@@ -55,10 +56,12 @@ from .reasoning import (
     resolve_reasoning_mode,
 )
 from .transport import (
+    SURFACES,
     CallResult,
     CallSpec,
     Surface,
     Transport,
+    _has_attribute,
     make_transport,
     select_surface,
 )
@@ -100,6 +103,11 @@ _VALUE_MARKERS = ("must be between", "out of range", "maximum", "max_logprobs", 
 # expected one of "file_search_call.results"|...`` for ``path: ["include", 0]``. This vocabulary is
 # only read next to ``include``, where it is the refusal of the field rather than of a value.
 _INCLUDE_REJECTION_MARKERS = ("invalid option", "invalid_value", "expected one of")
+# A 404 that names the model *and* talks about a model is about the model: the other surface would
+# answer the same way, so switching would only hide the real problem. Both halves are required —
+# an unrelated message can easily contain a short model name, and a server that does not implement
+# the Responses route answers 404 there with a message about the route.
+_MODEL_404_MARKERS = ("model", "no such", "not exist")
 _TRANSIENT_NAME_MARKERS = ("Connection", "Timeout")
 _TRANSIENT_TRANSPORT_CLASSES = frozenset({"TransportError", "TimeoutException"})
 METHODS: tuple[Method, ...] = ("logprobs", "grammar", "structured", "discrete")
@@ -175,7 +183,7 @@ def _require_top_logprobs(method: Method, top_logprobs: int) -> None:
         )
 
 
-def _logprob_evidence(exc: BaseException) -> str:
+def _error_evidence(exc: BaseException) -> str:
     """Everything the provider said about the failure: its message, and the param/code it named."""
     parts = [str(exc)]
     for attr in ("param", "code"):
@@ -183,6 +191,20 @@ def _logprob_evidence(exc: BaseException) -> str:
         if isinstance(value, str) and value:
             parts.append(value)
     return " ".join(parts).lower()
+
+
+def _route_missing(exc: BaseException, *, surface: Surface, model: str) -> bool:
+    """The server has no route for this surface, rather than a problem with what was sent.
+
+    An OpenAI-compatible server that does not implement a surface's route answers 404 for it, and the
+    ``openai`` client object exposes ``responses.create`` either way. A 404 that names the model is
+    about the model — the same error would come back from the other surface — so it is left alone.
+    """
+    if _status_code(exc) != 404:
+        return False
+    evidence = _error_evidence(exc)
+    names_the_model = model.lower() in evidence
+    return not (names_the_model and any(marker in evidence for marker in _MODEL_404_MARKERS))
 
 
 def _include_refused(evidence: str) -> bool:
@@ -208,7 +230,7 @@ def _logprobs_rejected(exc: BaseException) -> bool:
     """
     if _status_code(exc) not in _LOGPROB_REJECTION_STATUS_CODES:
         return False
-    evidence = _logprob_evidence(exc)
+    evidence = _error_evidence(exc)
     return "logprob" in evidence or _include_refused(evidence)
 
 
@@ -222,7 +244,7 @@ def _logprobs_unsupported(exc: BaseException) -> bool:
     """
     if not _logprobs_rejected(exc):
         return False
-    evidence = _logprob_evidence(exc)
+    evidence = _error_evidence(exc)
     if any(marker in evidence for marker in _VALUE_MARKERS):
         return False
     if _include_refused(evidence):
@@ -231,12 +253,23 @@ def _logprobs_unsupported(exc: BaseException) -> bool:
 
 
 def _dump_model(obj: Any) -> Any:
+    """The provider object as plain data for ``debug``, without the provider's typing noise.
+
+    A server can put a value the SDK's model does not expect in a field it still has to serialize —
+    SGLang returns a list for ``metadata``, which the SDK types as a string — and pydantic answers
+    every ``model_dump`` with a ``PydanticSerializationUnexpectedValue`` warning. The value survives
+    the dump either way, and the dump exists for ``debug``, so the warning is noise the caller never
+    asked for; ``warnings=False`` keeps it out of their logs without touching global warning state.
+    """
     dump = getattr(obj, "model_dump", None)
     if callable(dump):
         try:
-            return dump(mode="json")
-        except TypeError:  # pragma: no cover - non-pydantic objects with a model_dump()
-            return dump()
+            return dump(mode="json", warnings=False)
+        except TypeError:  # pragma: no cover - a model_dump() without those keywords
+            try:
+                return dump(mode="json")
+            except TypeError:
+                return dump()
     return obj
 
 
@@ -254,6 +287,8 @@ class _CallContext:
     model: str
     method: Method
     mode: str
+    reasoning: ReasoningConfig | None
+    """The effective config, kept so a surface switch can re-derive ``mode`` for the new surface."""
     temperature: float | None
     examples: Examples
     state_messages: tuple[dict[str, str], ...]
@@ -262,6 +297,9 @@ class _CallContext:
     auto: bool = False
     """``method="auto"``: choose per question, and fall back when logprobs are unavailable. ``method``
     then holds the resolved default rather than what the caller asked for."""
+    api_auto: bool = False
+    """``api="auto"``: the surface was chosen here, so this call may re-choose it. An explicit
+    ``api="responses"`` is a decision: its 404 belongs to the caller, not to a fallback."""
 
 
 @dataclass
@@ -389,6 +427,8 @@ class _BaseClient:
         # What method="auto" has learned about this provider, per (model, surface).
         self._auto_methods: dict[tuple[str, Surface], Method] = {}
         self._auto_misses: dict[tuple[str, Surface], int] = {}
+        # Surfaces this server has answered 404 for, learned by trying them once each.
+        self._missing_surfaces: set[Surface] = set()
         self._auto_lock = threading.Lock()
 
     # -- shared helpers ----------------------------------------------------------------
@@ -430,9 +470,84 @@ class _BaseClient:
             return misses
 
     def _note_logprobs_present(self, model: str, surface: Surface) -> None:
-        """A readable distribution retires the absences counted so far."""
+        """A readable distribution retires the absences counted so far, and any verdict against it."""
         with self._auto_lock:
             self._auto_misses.pop((model, surface), None)
+            # A distribution that arrived here proves this surface can carry one, so a verdict that
+            # moved the readout away from it is stale.
+            if self._auto_methods.get((model, surface)) == FALLBACK_METHOD:
+                self._auto_methods.pop((model, surface), None)
+
+    def _surface_missing(self, surface: Surface) -> bool:
+        """Whether this server has already answered 404 for a surface's route."""
+        with self._auto_lock:
+            return surface in self._missing_surfaces
+
+    def _remember_surface_missing(self, surface: Surface) -> None:
+        """Remember that this server has no route for a surface, for the rest of this client's life."""
+        with self._auto_lock:
+            self._missing_surfaces.add(surface)
+
+    def _logprobs_absent_here(self, model: str, surface: Surface) -> bool:
+        """Whether the label readout is already known to have no future on this surface."""
+        with self._auto_lock:
+            return self._auto_methods.get((model, surface), AUTO_METHOD) == FALLBACK_METHOD
+
+    def _logprob_surface_alternative(
+        self, surface: Surface, reasoning: ReasoningConfig | None
+    ) -> Surface | None:
+        """The other surface to try for a label readout, when the move is free of side effects.
+
+        ``native`` reasoning exists only on the Responses surface, so a caller who asked for it — or
+        whose ``mode="auto"`` resolved to it — keeps the surface that choice implies. Otherwise the
+        move costs nothing but a request, and it is worth one: a server can implement a surface
+        without carrying logprobs through it — ollama answers the Responses route with an empty
+        logprob list, llama.cpp rejects the logprob fields there outright, and OpenAI's Responses
+        logprobs hold the sampled token and no alternatives — while Chat Completions on the same
+        server carries a full distribution.
+        """
+        other: Surface = "chat_completions" if surface == "responses" else "responses"
+        if self._surface_missing(other) or resolve_reasoning_mode(reasoning, surface) == "native":
+            return None
+        return other if _has_attribute(self.client, f"{SURFACES[other][2]}.create") else None
+
+    def _note_surface_absence(
+        self, model: str, surface: Surface, exc: _LogprobsUnavailable
+    ) -> None:
+        """Count one absence for this surface, remembering the verdict once it is a pattern."""
+        if exc.capability and (
+            exc.evidence == "provider"
+            or self._note_absent_logprobs(model, surface) >= AUTO_ABSENCES_BEFORE_REMEMBERING
+        ):
+            self._remember_logprobs_unavailable(model, surface)
+
+    def _remember_responses_missing(self) -> None:
+        """Remember that this server has no Responses route, for the rest of this client's life."""
+        with self._auto_lock:
+            self._responses_missing = True
+
+    def _switch_surface(self, context: _CallContext, surface: Surface) -> None:
+        """Rebuild the transport and the reasoning plan for another surface, in place.
+
+        ``_assemble`` reports the surface from the context it was handed, and the driver reads the
+        transport per call, so the switch has to be visible on the object they already hold.
+        """
+        context.transport = make_transport(
+            self.client,
+            surface,
+            structured_outputs=self.structured_outputs,
+            extra_body=self.extra_body,
+            extra_headers=self.extra_headers,
+        )
+        if context.auto:
+            # The method verdict is keyed by surface, so the surface that just changed has its own:
+            # coming back to one that is known to withhold logprobs must not ask for them again.
+            context.method = self._auto_method(context.model, surface)
+        context.mode = resolve_reasoning_mode(context.reasoning, surface)
+        context.answer_reasoning = context.reasoning if context.mode == "native" else None
+        context.analysis_reasoning = (
+            context.reasoning if context.mode == "two_step" and surface == "responses" else None
+        )
 
     def _call_failure(
         self, exc: Exception, spec: CallSpec, context: _CallContext, log: _CallLog
@@ -459,6 +574,9 @@ class _BaseClient:
                 return _LogprobsUnavailable(
                     f"the provider failed every attempt at the logprob request ({failure})",
                     capability=False,
+                    # Not evidence about the surface: another surface would have failed too, so this
+                    # must not move the label readout anywhere.
+                    evidence="transient",
                 )
         if isinstance(exc, ProviderError):
             # The transport already built the right error — an embedded provider failure — so keep
@@ -503,18 +621,30 @@ class _BaseClient:
         if requested not in METHOD_SELECTIONS:
             raise JevperError(f"method must be one of {METHOD_SELECTIONS!r}, got {requested!r}")
         auto = requested == "auto"
+        api_auto = (api or self.api) == "auto"
+        effective_model = model or self.model
+        effective_reasoning = reasoning if reasoning is not None else self.reasoning
         # The surface is picked for the method auto tries first; the fallback runs on either surface.
         surface = select_surface(self.client, api or self.api, AUTO_METHOD if auto else requested)
+        if api_auto and self._surface_missing(surface):
+            # This server answered 404 for the route before: do not pay for the discovery again.
+            surface = "chat_completions" if surface == "responses" else "responses"
+        elif api_auto and auto and self._logprobs_absent_here(effective_model, surface):
+            alternative = self._logprob_surface_alternative(surface, effective_reasoning)
+            if alternative is not None and not self._logprobs_absent_here(
+                effective_model, alternative
+            ):
+                # The label readout has no future on this surface and the other one is unmarked:
+                # start there instead of paying for the same discovery on every call.
+                surface = alternative
         if requested == "grammar":
             methods.require_grammar_surface(surface)
-        effective_model = model or self.model
         effective_method = self._auto_method(effective_model, surface) if auto else requested
         if not auto:
             # auto never reaches the label-readout cap: a wide Choice is answered in JSON.
             for question_id, question in parsed.items():
                 methods.require_label_readout(effective_method, question, question_id)
             _require_top_logprobs(effective_method, self.top_logprobs)
-        effective_reasoning = reasoning if reasoning is not None else self.reasoning
         mode = resolve_reasoning_mode(effective_reasoning, surface)
         context = _CallContext(
             transport=make_transport(
@@ -527,6 +657,7 @@ class _BaseClient:
             model=effective_model,
             method=effective_method,
             mode=mode,
+            reasoning=effective_reasoning,
             temperature=temperature if temperature is not None else self.temperature,
             examples=examples,
             state_messages=state_messages,
@@ -535,6 +666,7 @@ class _BaseClient:
                 effective_reasoning if mode == "two_step" and surface == "responses" else None
             ),
             auto=auto,
+            api_auto=api_auto,
         )
         return context, parsed
 
@@ -580,16 +712,40 @@ class _BaseClient:
             except _LogprobsUnavailable as exc:
                 if not context.auto or fell_back:
                     raise
+                if exc.evidence != "transient" and context.api_auto:
+                    alternative = self._logprob_surface_alternative(
+                        context.transport.surface, context.reasoning
+                    )
+                    if alternative is not None and not self._logprobs_absent_here(
+                        context.model, alternative
+                    ):
+                        # The verdict is about this surface — it answered without logprobs, or refused
+                        # the fields outright, as llama.cpp's Responses shim does. Mark it, so later
+                        # calls start where the distribution is, and answer this question there.
+                        self._remember_logprobs_unavailable(context.model, context.transport.surface)
+                        retry_reasons.append(
+                            f"{exc} — retrying the label readout on api={alternative!r}"
+                        )
+                        self._switch_surface(context, alternative)
+                        continue
                 fell_back = True
                 retry_reasons.append(f"{exc} — answering with method={FALLBACK_METHOD!r}")
-                if exc.capability and (
-                    exc.evidence == "provider"
-                    or self._note_absent_logprobs(context.model, context.transport.surface)
-                    >= AUTO_ABSENCES_BEFORE_REMEMBERING
-                ):
-                    self._remember_logprobs_unavailable(context.model, context.transport.surface)
+                self._note_surface_absence(context.model, context.transport.surface, exc)
                 # Questions that have not started yet take the fallback without paying for it.
                 context.method = FALLBACK_METHOD
+            except _SurfaceUnavailable as exc:
+                if not context.api_auto:
+                    raise
+                self._remember_surface_missing(context.transport.surface)
+                other: Surface = (
+                    "chat_completions" if context.transport.surface == "responses" else "responses"
+                )
+                if self._surface_missing(other) or not _has_attribute(
+                    self.client, f"{SURFACES[other][2]}.create"
+                ):
+                    raise  # nowhere left to go: this 404 is the answer
+                retry_reasons.append(f"{exc} — answering on api={other!r}")
+                self._switch_surface(context, other)
 
     def _answer_steps(
         self,
@@ -814,7 +970,7 @@ class SystemOneClient(_BaseClient):
             while True:
                 try:
                     result = self._call(log, question_id, spec, context)
-                except _LogprobsUnavailable as exc:
+                except (_LogprobsUnavailable, _SurfaceUnavailable) as exc:
                     # Hand the verdict back to the generator: it owns the fallback decision.
                     spec = steps.throw(exc)
                 else:
@@ -835,6 +991,15 @@ class SystemOneClient(_BaseClient):
                 ):
                     if isinstance(exc, ClientCapabilityError):
                         raise  # the client cannot read this surface; another attempt cannot help
+                    if context.api_auto and _route_missing(
+                        exc, surface=context.transport.surface, model=context.model
+                    ):
+                        # A server with no such route: hand the verdict to the generator, which owns
+                        # the fallback decision, exactly as with an unavailable logprob readout.
+                        raise _SurfaceUnavailable(
+                            f"the server has no {context.transport.surface!r} route: {exc}",
+                            surface=context.transport.surface,
+                        ) from exc
                     failure = self._call_failure(exc, spec, context, log)
                     # An embedded provider error is the caught exception itself; raising it `from`
                     # itself would print as its own cause.
@@ -922,7 +1087,7 @@ class AsyncSystemOneClient(_BaseClient):
             while True:
                 try:
                     result = await self._call(log, question_id, spec, context)
-                except _LogprobsUnavailable as exc:
+                except (_LogprobsUnavailable, _SurfaceUnavailable) as exc:
                     # Hand the verdict back to the generator: it owns the fallback decision.
                     spec = steps.throw(exc)
                 else:
@@ -943,6 +1108,15 @@ class AsyncSystemOneClient(_BaseClient):
                 ):
                     if isinstance(exc, ClientCapabilityError):
                         raise  # the client cannot read this surface; another attempt cannot help
+                    if context.api_auto and _route_missing(
+                        exc, surface=context.transport.surface, model=context.model
+                    ):
+                        # A server with no such route: hand the verdict to the generator, which owns
+                        # the fallback decision, exactly as with an unavailable logprob readout.
+                        raise _SurfaceUnavailable(
+                            f"the server has no {context.transport.surface!r} route: {exc}",
+                            surface=context.transport.surface,
+                        ) from exc
                     failure = self._call_failure(exc, spec, context, log)
                     # An embedded provider error is the caught exception itself; raising it `from`
                     # itself would print as its own cause.
