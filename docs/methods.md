@@ -54,11 +54,10 @@ Request fields per surface:
 | schema fallback (`structured_outputs=False`) | `response_format={"type": "json_object"}` | `text={"format": {"type": "json_object"}}` |
 | grammar | `extra_body={"grammar": "..."}` | not available |
 | reasoning | `reasoning_effort` (only when `effort` is set) | `reasoning={effort, summary, context}` |
-| stop sequences | `stop` | never sent — the surface has no equivalent field |
 
 Neither builder ever sends `max_tokens`, `max_completion_tokens` or `max_output_tokens`: reasoning tokens count
 against those caps, and a small cap silently truncates a reasoning model. Cost is bounded by reading only the
-first answer token.
+first answer token. Any other provider field goes through `extra_body`.
 
 ## `logprobs`
 

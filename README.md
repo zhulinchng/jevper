@@ -60,7 +60,7 @@ pytest -q
 
 ```mermaid
 flowchart LR
-    A["state + questions"] --> B["build_messages: system prompt, state turns, few-shot turns, question block"]
+    A["state + questions"] --> B["build_parts + assemble: system prompt, state turns, few-shot turns, question block"]
     B --> C{"method"}
     C -->|logprobs| D["logprobs=true, top_logprobs=20"]
     C -->|grammar| E["+ GBNF grammar in extra_body"]

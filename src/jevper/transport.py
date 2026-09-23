@@ -6,7 +6,7 @@ gets, and the normalizers turn either provider response object into one ``CallRe
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -29,7 +29,6 @@ class CallSpec:
     grammar: str | None = None
     reasoning: ReasoningConfig | None = None
     temperature: float | None = None
-    stop: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -76,8 +75,6 @@ def build_chat_kwargs(
         kwargs["reasoning_effort"] = spec.reasoning.effort
     if spec.temperature is not None:
         kwargs["temperature"] = spec.temperature
-    if spec.stop is not None:
-        kwargs["stop"] = spec.stop
     body = dict(extra_body or {})
     if spec.grammar is not None:
         body["grammar"] = spec.grammar
@@ -132,7 +129,6 @@ def build_responses_kwargs(
             kwargs["text"] = {"format": {"type": "json_object"}}
     if spec.temperature is not None:
         kwargs["temperature"] = spec.temperature
-    # `stop` is never sent here: the Responses surface has no equivalent field.
     if extra_body:
         kwargs["extra_body"] = dict(extra_body)
     if extra_headers:
@@ -293,34 +289,41 @@ def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
     )
 
 
+SurfaceBuilder = Callable[..., dict[str, Any]]
+SurfaceNormalizer = Callable[[Any, dict[str, Any]], CallResult]
+
+# surface -> (request builder, response normalizer, dotted path to the create method on the client)
+SURFACES: dict[Surface, tuple[SurfaceBuilder, SurfaceNormalizer, str]] = {
+    "chat_completions": (build_chat_kwargs, _chat_result, "chat.completions"),
+    "responses": (build_responses_kwargs, _responses_result, "responses"),
+}
+
+
 class Transport:
-    surface: Surface
+    """One surface: the request builder, the response normalizer and where the call goes.
+
+    The client is validated by ``select_surface`` before a transport is built, so the attribute walk
+    in ``_endpoint`` cannot fail for a client that passed selection.
+    """
 
     def __init__(
         self,
         client: Any,
+        surface: Surface,
         *,
         structured_outputs: bool = True,
         extra_body: Mapping[str, Any] | None = None,
         extra_headers: Mapping[str, str] | None = None,
     ) -> None:
         self.client = client
+        self.surface = surface
+        self.build_kwargs, self.normalize, self.endpoint_path = SURFACES[surface]
         self.structured_outputs = structured_outputs
         self.extra_body = extra_body
         self.extra_headers = extra_headers
 
-    def call(self, spec: CallSpec, model: str) -> CallResult:  # pragma: no cover - overridden
-        raise NotImplementedError
-
-    async def acall(self, spec: CallSpec, model: str) -> CallResult:  # pragma: no cover - overridden
-        raise NotImplementedError
-
-
-class ChatCompletionsTransport(Transport):
-    surface: Surface = "chat_completions"
-
     def kwargs(self, spec: CallSpec, model: str) -> dict[str, Any]:
-        return build_chat_kwargs(
+        return self.build_kwargs(
             spec,
             model=model,
             structured_outputs=self.structured_outputs,
@@ -328,36 +331,19 @@ class ChatCompletionsTransport(Transport):
             extra_headers=self.extra_headers,
         )
 
-    def call(self, spec: CallSpec, model: str) -> CallResult:
-        kwargs = self.kwargs(spec, model)
-        return _chat_result(self.client.chat.completions.create(**kwargs), kwargs)
-
-    async def acall(self, spec: CallSpec, model: str) -> CallResult:
-        kwargs = self.kwargs(spec, model)
-        response = await self.client.chat.completions.create(**kwargs)
-        return _chat_result(response, kwargs)
-
-
-class ResponsesTransport(Transport):
-    surface: Surface = "responses"
-
-    def kwargs(self, spec: CallSpec, model: str) -> dict[str, Any]:
-        return build_responses_kwargs(
-            spec,
-            model=model,
-            structured_outputs=self.structured_outputs,
-            extra_body=self.extra_body,
-            extra_headers=self.extra_headers,
-        )
+    def _endpoint(self) -> Any:
+        endpoint = self.client
+        for name in self.endpoint_path.split("."):
+            endpoint = getattr(endpoint, name)
+        return endpoint
 
     def call(self, spec: CallSpec, model: str) -> CallResult:
         kwargs = self.kwargs(spec, model)
-        return _responses_result(self.client.responses.create(**kwargs), kwargs)
+        return self.normalize(self._endpoint().create(**kwargs), kwargs)
 
     async def acall(self, spec: CallSpec, model: str) -> CallResult:
         kwargs = self.kwargs(spec, model)
-        response = await self.client.responses.create(**kwargs)
-        return _responses_result(response, kwargs)
+        return self.normalize(await self._endpoint().create(**kwargs), kwargs)
 
 
 def _has_attribute(client: Any, path: str) -> bool:
@@ -402,7 +388,10 @@ def make_transport(
     extra_body: Mapping[str, Any] | None = None,
     extra_headers: Mapping[str, str] | None = None,
 ) -> Transport:
-    factory = ChatCompletionsTransport if surface == "chat_completions" else ResponsesTransport
-    return factory(
-        client, structured_outputs=structured_outputs, extra_body=extra_body, extra_headers=extra_headers
+    return Transport(
+        client,
+        surface,
+        structured_outputs=structured_outputs,
+        extra_body=extra_body,
+        extra_headers=extra_headers,
     )

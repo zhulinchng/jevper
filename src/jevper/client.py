@@ -34,13 +34,15 @@ from .normalize import (
     score_confidence,
 )
 from .prompts import (
+    ANALYSIS_SYSTEM_PROMPT,
     ANSWER_CUE,
-    build_analysis_messages,
-    build_messages,
+    assemble,
+    build_parts,
     correction_message,
     example_answer_label,
     render_state_messages,
     structured_correction_message,
+    system_prompt,
 )
 from .reasoning import (
     ReasoningConfig,
@@ -105,6 +107,11 @@ def _is_transient(exc: BaseException) -> bool:
     return any(marker in name for name in names for marker in _TRANSIENT_NAME_MARKERS)
 
 
+def _retry_delay(policy: RetryPolicy, attempt: int) -> float:
+    """Exponential backoff for transient retries, capped by the policy."""
+    return min(policy.base_delay * 3**attempt, policy.max_delay)
+
+
 def _dump_model(obj: Any) -> Any:
     dump = getattr(obj, "model_dump", None)
     if callable(dump):
@@ -131,6 +138,7 @@ class _CallContext:
     mode: str
     temperature: float | None
     examples: Examples
+    state_messages: tuple[dict[str, str], ...]
     answer_reasoning: ReasoningConfig | None
     analysis_reasoning: ReasoningConfig | None
 
@@ -248,6 +256,23 @@ class _BaseClient:
 
     # -- shared helpers ----------------------------------------------------------------
 
+    def _record_failure(
+        self,
+        log: _CallLog,
+        question_id: str,
+        spec: CallSpec,
+        context: _CallContext,
+        exc: Exception,
+    ) -> bool:
+        """Record a failed attempt and report whether it may be retried."""
+        log.add_attempt(
+            question_id,
+            surface=context.transport.surface,
+            request=context.transport.kwargs(spec, context.model),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return _is_transient(exc)
+
     def _prepare(
         self,
         state: Any,
@@ -261,7 +286,8 @@ class _BaseClient:
     ) -> tuple[_CallContext, dict[str, Question]]:
         if not questions:
             raise InvalidQuestionError("at least one question is required")
-        render_state_messages(state)  # fail fast, before any provider call
+        # Fail fast, before any provider call, and reuse the rendered turns for every question.
+        state_messages = tuple(render_state_messages(state))
         parsed = {question_id: parse_question(question_id, raw) for question_id, raw in questions.items()}
         effective_method = method or self.method
         if effective_method not in METHODS:
@@ -286,6 +312,7 @@ class _BaseClient:
             mode=mode,
             temperature=temperature if temperature is not None else self.temperature,
             examples=examples,
+            state_messages=state_messages,
             answer_reasoning=effective_reasoning if mode == "native" else None,
             analysis_reasoning=(
                 effective_reasoning if mode == "two_step" and surface == "responses" else None
@@ -317,18 +344,18 @@ class _BaseClient:
         self,
         question_id: str,
         question: Question,
-        state: Any,
         context: _CallContext,
         log: _CallLog,
     ) -> Generator[CallSpec, CallResult, _QuestionOutcome]:
         labels = labels_for(2 if question.type == "noul" else len(question.criteria))
         examples = self._resolve_examples(question, labels, question_id, context.examples)
-        messages = build_messages(state, question, labels, examples=examples, method=context.method)
+        parts = build_parts(context.state_messages, question, labels, examples, method=context.method)
+        messages = assemble(parts, system=system_prompt(context.method))
         native_reasoning: tuple[ReasoningContentPart, ...] = ()
         trace: str | None = None
         retry_reasons: list[str] = []
         if context.mode == "two_step":
-            analysis = build_analysis_messages(state, question, labels, examples, method=context.method)
+            analysis = assemble(parts, system=ANALYSIS_SYSTEM_PROMPT)
             result = yield CallSpec(messages=analysis, reasoning=context.analysis_reasoning)
             native_reasoning = result.reasoning
             # A model that reasons without writing output leaves `text` empty; its reasoning items are
@@ -512,10 +539,10 @@ class SystemOneClient(_BaseClient):
     """
 
     def _run(
-        self, question_id: str, question: Question, state: Any, context: _CallContext
+        self, question_id: str, question: Question, context: _CallContext
     ) -> _QuestionOutcome:
         log = _CallLog()
-        steps = self._question_steps(question_id, question, state, context, log)
+        steps = self._question_steps(question_id, question, context, log)
         try:
             spec = next(steps)
             while True:
@@ -531,16 +558,12 @@ class SystemOneClient(_BaseClient):
             try:
                 result = context.transport.call(spec, context.model)
             except Exception as exc:
-                log.add_attempt(
-                    question_id,
-                    surface=context.transport.surface,
-                    request=context.transport.kwargs(spec, context.model),
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-                if not _is_transient(exc) or attempt >= self.retry.n_retries:
+                if not self._record_failure(log, question_id, spec, context, exc) or (
+                    attempt >= self.retry.n_retries
+                ):
                     raise ProviderError(f"{type(exc).__name__}: {exc}", attempts=log.attempts) from exc
                 log.n_retries += 1
-                time.sleep(min(self.retry.base_delay * 3**attempt, self.retry.max_delay))
+                time.sleep(_retry_delay(self.retry, attempt))
                 attempt += 1
                 continue
             log.add_result(result)
@@ -571,7 +594,7 @@ class SystemOneClient(_BaseClient):
         if len(parsed) == 1:
             question_id, question = next(iter(parsed.items()))
             try:
-                outcomes[question_id] = self._run(question_id, question, state, context)
+                outcomes[question_id] = self._run(question_id, question, context)
             except BaseException as exc:  # noqa: BLE001 - re-raised below, in question order
                 failure = exc
         else:
@@ -582,7 +605,7 @@ class SystemOneClient(_BaseClient):
                     )
                 executor = self._executor
             futures = {
-                question_id: executor.submit(self._run, question_id, question, state, context)
+                question_id: executor.submit(self._run, question_id, question, context)
                 for question_id, question in parsed.items()
             }
             for question_id, future in futures.items():
@@ -613,10 +636,10 @@ class AsyncSystemOneClient(_BaseClient):
     """Asynchronous twin of ``SystemOneClient``; identical constructor and semantics."""
 
     async def _run(
-        self, question_id: str, question: Question, state: Any, context: _CallContext
+        self, question_id: str, question: Question, context: _CallContext
     ) -> _QuestionOutcome:
         log = _CallLog()
-        steps = self._question_steps(question_id, question, state, context, log)
+        steps = self._question_steps(question_id, question, context, log)
         try:
             spec = next(steps)
             while True:
@@ -632,16 +655,12 @@ class AsyncSystemOneClient(_BaseClient):
             try:
                 result = await context.transport.acall(spec, context.model)
             except Exception as exc:
-                log.add_attempt(
-                    question_id,
-                    surface=context.transport.surface,
-                    request=context.transport.kwargs(spec, context.model),
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-                if not _is_transient(exc) or attempt >= self.retry.n_retries:
+                if not self._record_failure(log, question_id, spec, context, exc) or (
+                    attempt >= self.retry.n_retries
+                ):
                     raise ProviderError(f"{type(exc).__name__}: {exc}", attempts=log.attempts) from exc
                 log.n_retries += 1
-                await asyncio.sleep(min(self.retry.base_delay * 3**attempt, self.retry.max_delay))
+                await asyncio.sleep(_retry_delay(self.retry, attempt))
                 attempt += 1
                 continue
             log.add_result(result)
@@ -671,7 +690,7 @@ class AsyncSystemOneClient(_BaseClient):
 
         async def run(question_id: str, question: Question) -> _QuestionOutcome:
             async with semaphore:
-                return await self._run(question_id, question, state, context)
+                return await self._run(question_id, question, context)
 
         results = await asyncio.gather(
             *(run(question_id, question) for question_id, question in parsed.items()),

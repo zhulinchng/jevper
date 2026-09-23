@@ -333,10 +333,11 @@ def readout_discrete(result: CallResult, question: Question, labels: Sequence[st
         raw = payload.get("choice")
         label = None
         if isinstance(raw, str):
-            if raw.strip().upper() in labels:
-                label = raw.strip().upper()
-            elif raw.strip() in keys:
-                label = labels[keys.index(raw.strip())]
+            candidate = raw.strip()
+            if candidate.upper() in labels:
+                label = candidate.upper()
+            elif candidate in keys:
+                label = labels[keys.index(candidate)]
         if label is None:
             raise MalformedAnswerError(
                 f"'choice' must be one of the labels {list(labels)!r} or the option keys {keys!r}, got {raw!r}"

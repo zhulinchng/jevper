@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from .errors import InvalidQuestionError, JevperError
@@ -151,9 +152,11 @@ def _example_probabilities(
     return {name: given[name] for name in expected}
 
 
-def _structured_example_answer(question: Question, labels: Sequence[str], example: Example, index: int) -> str:
+def _structured_example_answer(
+    question: Question, labels: Sequence[str], example: Example, index: int, keys: Mapping[str, Any]
+) -> str:
     label = example_answer_label(question, labels, example.answer, index)
-    key = label_to_key(question, labels)[label]
+    key = keys[label]
     probabilities = example.probabilities
     if question.type == "noul":
         if probabilities is None:
@@ -200,6 +203,7 @@ def render_examples(
 ) -> list[dict[str, str]]:
     """One user turn (example state + question block) and one assistant turn (expected answer) per example."""
     turns: list[dict[str, str]] = []
+    keys = label_to_key(question, labels) if method == "structured" else {}
     for index, example in enumerate(examples):
         try:
             turn = render_question_turn(example.state, question, labels)
@@ -207,50 +211,59 @@ def render_examples(
             raise JevperError(f"example {index}: {exc}") from exc
         turns.append({"role": "user", "content": turn})
         if method == "structured":
-            content = _structured_example_answer(question, labels, example, index)
+            content = _structured_example_answer(question, labels, example, index, keys)
         else:
             content = example_answer_label(question, labels, example.answer, index)
         turns.append({"role": "assistant", "content": content})
     return turns
 
 
-def build_messages(
-    state: Any,
+@dataclass(frozen=True)
+class PromptParts:
+    """One question's prompt, rendered once and assembled per pass.
+
+    ``state_messages`` are the call's state turns: identical for every question, so they are rendered
+    once per ``system_one`` call and shared.
+    """
+
+    state_messages: Sequence[dict[str, str]]
+    example_turns: Sequence[dict[str, str]]
+    question_block: str
+
+
+def system_prompt(method: Method) -> str:
+    """The answer-pass system prompt for a method."""
+    return STRUCTURED_SYSTEM_PROMPT if method == "structured" else SYSTEM_PROMPT
+
+
+def build_parts(
+    state_messages: Sequence[dict[str, str]],
     question: Question,
     labels: Sequence[str],
-    *,
     examples: Iterable[Example] = (),
+    *,
     method: Method = "logprobs",
-) -> list[dict[str, str]]:
-    """The single message builder for every method and both reasoning passes.
+) -> PromptParts:
+    """Render everything a question's prompt needs, once, for both reasoning passes."""
+    return PromptParts(
+        state_messages=state_messages,
+        example_turns=render_examples(examples, question, labels, method=method),
+        question_block=render_question_block(question, labels),
+    )
+
+
+def assemble(parts: PromptParts, *, system: str) -> list[dict[str, str]]:
+    """The message list for one pass: system prompt, state turns, few-shot turns, question block.
 
     The caller's state turns are preserved as-is and the question block is the final user turn, so the
-    state is never repeated.
+    state is never repeated. Each pass gets its own message dicts; the rendered strings are shared.
     """
-    system = STRUCTURED_SYSTEM_PROMPT if method == "structured" else SYSTEM_PROMPT
-    return (
-        [{"role": "system", "content": system}]
-        + render_state_messages(state)
-        + render_examples(examples, question, labels, method=method)
-        + [{"role": "user", "content": render_question_block(question, labels)}]
-    )
-
-
-def build_analysis_messages(
-    state: Any,
-    question: Question,
-    labels: Sequence[str],
-    examples: Iterable[Example] = (),
-    *,
-    method: Method = "logprobs",
-) -> list[dict[str, str]]:
-    """The two-step analysis pass: same turns as ``build_messages`` with the analysis system prompt."""
-    return (
-        [{"role": "system", "content": ANALYSIS_SYSTEM_PROMPT}]
-        + render_state_messages(state)
-        + render_examples(examples, question, labels, method=method)
-        + [{"role": "user", "content": render_question_block(question, labels)}]
-    )
+    return [
+        {"role": "system", "content": system},
+        *(dict(message) for message in parts.state_messages),
+        *(dict(message) for message in parts.example_turns),
+        {"role": "user", "content": parts.question_block},
+    ]
 
 
 def correction_message(reason: str, labels: Sequence[str]) -> str:

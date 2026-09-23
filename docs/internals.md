@@ -25,11 +25,11 @@ imports `types.py` at runtime (it is duck-typed on `question.type`) so the graph
 
 ```mermaid
 flowchart TD
-    A["system_one(state, questions, ...)"] --> B["_prepare: validate questions, resolve method/api/reasoning/examples"]
+    A["system_one(state, questions, ...)"] --> B["_prepare: validate questions, render the state turns, resolve method/api/reasoning/examples"]
     B --> C["select_surface + make_transport"]
     C --> D["per question, concurrently"]
-    D --> E["labels_for + _resolve_examples"]
-    E --> F["_question_steps generator"]
+    D --> E["labels_for + _resolve_examples + build_parts"]
+    E --> F["_question_steps: assemble each pass from the parts"]
     F --> G["analysis CallSpec (two_step only)"]
     F --> H["answer CallSpec via methods.build_spec"]
     H --> I["transport.call / acall -> CallResult"]
@@ -40,10 +40,10 @@ flowchart TD
     L --> M["_assemble -> SystemOneResponse"]
 ```
 
-`_prepare` validates the questions, renders the state once for validation (discarding the result), resolves
-method, surface, reasoning mode and examples, and builds the transport. It runs before any provider call, so a
-bad question, an empty `questions` mapping, an unusable `state` or `grammar` on the Responses surface produces
-zero HTTP requests.
+`_prepare` validates the questions, renders the state turns once into `_CallContext.state_messages` (every
+question reuses them), resolves method, surface, reasoning mode and examples, and builds the transport. It runs
+before any provider call, so a bad question, an empty `questions` mapping, an unusable `state` or `grammar` on
+the Responses surface produces zero HTTP requests.
 
 ## The per-question generator
 
@@ -60,6 +60,11 @@ while True:
 `StopIteration.value` is the finished `_QuestionOutcome`. The sync and async clients differ only in their
 driver (`_call` uses the sync or async transport), which keeps the two implementations from drifting.
 
+`_question_steps` renders a question's prompt once, as `prompts.PromptParts` (`build_parts`), and every pass is
+assembled from those parts (`assemble`). The two-step analysis and answer calls therefore share the rendered
+state turns, example turns and question block instead of re-rendering them; the state itself is rendered once
+per `system_one` call, in `_prepare`.
+
 ## Concurrency
 
 - One provider call sequence per question; questions are independent.
@@ -71,6 +76,24 @@ driver (`_call` uses the sync or async transport), which keeps the two implement
   insertion order.
 - Failures are collected and the first one in question insertion order is re-raised after every task has
   settled — one bad question cannot leave dangling threads, and `answers` is never partially returned.
+
+## Performance
+
+The library is I/O-bound: one provider call costs hundreds of milliseconds, while the local work around it —
+rendering, request building, readout, normalization — is well under a millisecond per question.
+
+Measured on an 8-question `choice` call with a 45 KiB JSON state (CPython 3.14, M-series, best of 7):
+
+| Method | Renders of the state | Local CPU |
+| --- | --- | --- |
+| `logprobs` | 1 (was 9) | 0.5 ms (was 1.5 ms) |
+| `logprobs` + `two_step` | 1 (was 17) | 0.7 ms (was 2.4 ms) |
+| `discrete` | 1 (was 9) | 0.5 ms (was 1.3 ms) |
+
+So the whole local path is under 0.2 % of the wall time of a single provider call. That is why there is no
+native extension (PyO3, `orjson`, `msgspec`): it would trade the universal `py3-none-any` wheel, a build
+toolchain and maturin CI for a fraction of a fraction of a percent. Optimize the prompt and the request count,
+not the Python.
 
 ## Retries
 
@@ -105,6 +128,8 @@ Worth keeping when editing:
 
 - No request ever carries `max_tokens`, `max_completion_tokens` or `max_output_tokens`. Reasoning tokens count
   against those caps, and a small cap truncates a reasoning model.
+- The builders emit only the fields the surface understands; anything else the provider accepts goes through
+  `extra_body` (`grammar` is merged into it), never into `CallSpec`.
 - Labels are single letters up to 26 options, two letters above that. Only `structured` and `discrete` may use
   the two-letter range: multi-letter labels break first-token logprob readout, so `logprobs`/`grammar` raise
   `InvalidQuestionError` past 26 options (`methods.require_label_readout`), and `Choice` itself stops at the Jev
@@ -131,8 +156,8 @@ Worth keeping when editing:
 - **A new method**: add the `Literal` member in `types.Method`, a `build_spec` branch and a `readout_*`
   function in `methods.py`, and route it in `methods.readout`. The client needs no change — it already passes
   the method through.
-- **A new surface**: add a builder and a normalizer in `transport.py`, a `Transport` subclass, and a branch in
-  `select_surface`/`make_transport`. Everything above the transport is surface-agnostic.
+- **A new surface**: add a builder and a normalizer in `transport.py`, one entry in the `SURFACES` registry, and
+  a branch in `select_surface`. Everything above the transport is surface-agnostic.
 - **A new answer type**: extend the `Answer` discriminated union in `types.py` and `_finalize` in `client.py`.
 
 ## Testing

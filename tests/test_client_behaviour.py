@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 
 import pytest
 from fakes import async_openai_client, chat_body, openai_client, responses_body
@@ -445,3 +447,113 @@ def test_labels_cover_the_two_letter_range_and_stop_there():
     with pytest.raises(InvalidQuestionError) as error:
         labels_for(677)
     assert "0..676" in str(error.value)
+
+
+# -- concurrency -----------------------------------------------------------------------
+
+
+class _ConcurrencyChatClient:
+    """Duck client recording the peak number of in-flight requests; optionally blocks on a barrier."""
+
+    def __init__(self, *, barrier: threading.Barrier | None = None, delay: float = 0.0) -> None:
+        self.barrier = barrier
+        self.delay = delay
+        self.in_flight = 0
+        self.peak = 0
+        self._lock = threading.Lock()
+        outer = self
+
+        class Completions:
+            def create(self, **kwargs):
+                with outer._lock:
+                    outer.in_flight += 1
+                    outer.peak = max(outer.peak, outer.in_flight)
+                try:
+                    if outer.barrier is not None:
+                        outer.barrier.wait(timeout=5)
+                    if outer.delay:
+                        time.sleep(outer.delay)
+                    return chat_body(content="A", logprobs=CHOICE_LOGS)
+                finally:
+                    with outer._lock:
+                        outer.in_flight -= 1
+
+        class Chat:
+            completions = Completions()
+
+        self.chat = Chat()
+
+
+def test_questions_run_concurrently_up_to_max_concurrency():
+    duck = _ConcurrencyChatClient(barrier=threading.Barrier(4, timeout=5))
+    client = SystemOneClient(duck, model="stub", api="chat_completions", max_concurrency=4)
+
+    response = client.system_one(
+        state="s", questions={f"q{index}": Choice(criteria=CRITERIA) for index in range(4)}
+    )
+
+    # The barrier only releases once all four requests are in flight at the same time.
+    assert duck.peak == 4
+    assert len(response.answers) == 4
+
+
+def test_max_concurrency_one_serializes_requests():
+    duck = _ConcurrencyChatClient(delay=0.02)
+    client = SystemOneClient(duck, model="stub", api="chat_completions", max_concurrency=1)
+
+    client.system_one(
+        state="s", questions={f"q{index}": Choice(criteria=CRITERIA) for index in range(4)}
+    )
+
+    assert duck.peak == 1
+
+
+class _AsyncConcurrencyChatClient:
+    """Duck async client recording peak in-flight requests; the sleep yields so tasks interleave."""
+
+    def __init__(self, *, delay: float = 0.02) -> None:
+        self.delay = delay
+        self.in_flight = 0
+        self.peak = 0
+        outer = self
+
+        class Completions:
+            async def create(self, **kwargs):
+                outer.in_flight += 1
+                outer.peak = max(outer.peak, outer.in_flight)
+                try:
+                    await asyncio.sleep(outer.delay)
+                    return chat_body(content="A", logprobs=CHOICE_LOGS)
+                finally:
+                    outer.in_flight -= 1
+
+        class Chat:
+            completions = Completions()
+
+        self.chat = Chat()
+
+
+def test_async_client_runs_questions_concurrently():
+    duck = _AsyncConcurrencyChatClient()
+    client = AsyncSystemOneClient(duck, model="stub", api="chat_completions", max_concurrency=4)
+
+    asyncio.run(
+        client.system_one(
+            state="s", questions={f"q{index}": Choice(criteria=CRITERIA) for index in range(4)}
+        )
+    )
+
+    assert duck.peak == 4
+
+
+def test_async_max_concurrency_one_serializes_requests():
+    duck = _AsyncConcurrencyChatClient()
+    client = AsyncSystemOneClient(duck, model="stub", api="chat_completions", max_concurrency=1)
+
+    asyncio.run(
+        client.system_one(
+            state="s", questions={f"q{index}": Choice(criteria=CRITERIA) for index in range(4)}
+        )
+    )
+
+    assert duck.peak == 1
