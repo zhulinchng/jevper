@@ -24,8 +24,9 @@ from .errors import (
     LabelReadoutError,
     MalformedAnswerError,
     ProviderError,
+    _LogprobsUnavailable,
 )
-from .labels import labels_for
+from .labels import MAX_LABEL_OPTIONS, labels_for
 from .normalize import (
     PROBABILITY_TOLERANCE,
     choice_confidence,
@@ -51,13 +52,21 @@ from .reasoning import (
     reasoning_text,
     resolve_reasoning_mode,
 )
-from .transport import CallResult, CallSpec, Transport, make_transport, select_surface
+from .transport import (
+    CallResult,
+    CallSpec,
+    Surface,
+    Transport,
+    make_transport,
+    select_surface,
+)
 from .types import (
     Answer,
     Api,
     ChoiceAnswer,
     Example,
     Method,
+    MethodSelection,
     NoulAnswer,
     Question,
     ScoreAnswer,
@@ -67,10 +76,16 @@ from .types import (
 )
 
 TRANSIENT_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 529})
+# 429 means "slow down", the rest mean "the server failed" — only the latter can be the request's fault.
+_SERVER_ERROR_STATUS_CODES = TRANSIENT_STATUS_CODES - {429}
+_LOGPROB_REJECTION_STATUS_CODES = frozenset({400, 403, 422})
 _TRANSIENT_NAME_MARKERS = ("Connection", "Timeout")
 _TRANSIENT_TRANSPORT_CLASSES = frozenset({"TransportError", "TimeoutException"})
 METHODS: tuple[Method, ...] = ("logprobs", "grammar", "structured", "discrete")
+METHOD_SELECTIONS: tuple[MethodSelection, ...] = ("auto", *METHODS)
 APIS: tuple[Api, ...] = ("auto", "chat_completions", "responses")
+AUTO_METHOD: Method = "logprobs"  # what method="auto" tries first
+FALLBACK_METHOD: Method = "structured"  # what it answers with when logprobs are unavailable
 MAX_TOP_LOGPROBS = 20
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens")
 
@@ -112,6 +127,16 @@ def _retry_delay(policy: RetryPolicy, attempt: int) -> float:
     return min(policy.base_delay * 3**attempt, policy.max_delay)
 
 
+def _logprobs_rejected(exc: BaseException) -> bool:
+    """The provider refused the request because of the logprob fields it carried.
+
+    Both shapes seen in the wild name the field: Gemini's OpenAI-compatibility layer answers
+    ``Unknown name "logprobs": Cannot find field.`` and a reasoning model behind an OpenAI-shaped
+    gateway answers ``logprobs are not supported with reasoning models.``
+    """
+    return _status_code(exc) in _LOGPROB_REJECTION_STATUS_CODES and "logprob" in str(exc).lower()
+
+
 def _dump_model(obj: Any) -> Any:
     dump = getattr(obj, "model_dump", None)
     if callable(dump):
@@ -141,6 +166,9 @@ class _CallContext:
     state_messages: tuple[dict[str, str], ...]
     answer_reasoning: ReasoningConfig | None
     analysis_reasoning: ReasoningConfig | None
+    auto: bool = False
+    """``method="auto"``: choose per question, and fall back when logprobs are unavailable. ``method``
+    then holds the resolved default rather than what the caller asked for."""
 
 
 @dataclass
@@ -192,6 +220,7 @@ class _QuestionOutcome:
     attempts: list[dict[str, Any]]
     retry_reasons: list[str]
     readout_debug: dict[str, Any]
+    method: Method
     probability_error: float | None = None
     original_probabilities: dict[str, float] | None = None
     missing_labels: tuple[str, ...] = ()
@@ -203,7 +232,7 @@ class _BaseClient:
         client: Any,
         *,
         model: str,
-        method: Method = "logprobs",
+        method: MethodSelection = "auto",
         api: Api = "auto",
         reasoning: ReasoningConfig | None = None,
         examples: Examples = (),
@@ -217,8 +246,8 @@ class _BaseClient:
         extra_body: Mapping[str, Any] | None = None,
         extra_headers: Mapping[str, str] | None = None,
     ) -> None:
-        if method not in METHODS:
-            raise JevperError(f"method must be one of {METHODS!r}, got {method!r}")
+        if method not in METHOD_SELECTIONS:
+            raise JevperError(f"method must be one of {METHOD_SELECTIONS!r}, got {method!r}")
         if api not in APIS:
             raise JevperError(f"api must be one of {APIS!r}, got {api!r}")
         if not 0 <= top_logprobs <= MAX_TOP_LOGPROBS:
@@ -253,6 +282,9 @@ class _BaseClient:
         self.extra_headers = extra_headers
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._executor_lock = threading.Lock()
+        # What method="auto" has learned about this provider, per (model, surface).
+        self._auto_methods: dict[tuple[str, Surface], Method] = {}
+        self._auto_lock = threading.Lock()
 
     # -- shared helpers ----------------------------------------------------------------
 
@@ -273,6 +305,46 @@ class _BaseClient:
         )
         return _is_transient(exc)
 
+    # -- method="auto" -----------------------------------------------------------------
+
+    def _auto_method(self, model: str, surface: Surface) -> Method:
+        """The method ``auto`` uses here: what this client learned, or the preferred method."""
+        with self._auto_lock:
+            return self._auto_methods.get((model, surface), AUTO_METHOD)
+
+    def _remember_logprobs_unavailable(self, model: str, surface: Surface) -> None:
+        """Remember that this provider cannot return logprobs, for the rest of this client's life."""
+        with self._auto_lock:
+            self._auto_methods[(model, surface)] = FALLBACK_METHOD
+
+    def _call_failure(
+        self, exc: Exception, spec: CallSpec, context: _CallContext, log: _CallLog
+    ) -> JevperError:
+        """The error to give up on a call with: a logprob verdict under ``auto``, else the provider's.
+
+        A rejected logprob request is a fact about the provider, so it is remembered. A server error
+        that survived every retry is only a bad minute, so it is not.
+        """
+        if context.auto and spec.logprobs:
+            failure = f"{type(exc).__name__}: {exc}"
+            if _logprobs_rejected(exc):
+                return _LogprobsUnavailable(f"the provider rejected the logprob request ({failure})")
+            if _status_code(exc) in _SERVER_ERROR_STATUS_CODES:
+                return _LogprobsUnavailable(
+                    f"the provider failed every attempt at the logprob request ({failure})",
+                    capability=False,
+                )
+        return ProviderError(f"{type(exc).__name__}: {exc}", attempts=log.attempts)
+
+    def _question_method(self, question: Question, context: _CallContext) -> Method:
+        """The method one question is answered with."""
+        if not context.auto:
+            return context.method
+        if question.type == "choice" and len(question.criteria) > MAX_LABEL_OPTIONS:
+            # A label token cannot tell "AA" from "A", so a wide choice never uses a label readout.
+            return FALLBACK_METHOD
+        return context.method
+
     def _prepare(
         self,
         state: Any,
@@ -289,14 +361,20 @@ class _BaseClient:
         # Fail fast, before any provider call, and reuse the rendered turns for every question.
         state_messages = tuple(render_state_messages(state))
         parsed = {question_id: parse_question(question_id, raw) for question_id, raw in questions.items()}
-        effective_method = method or self.method
-        if effective_method not in METHODS:
-            raise JevperError(f"method must be one of {METHODS!r}, got {effective_method!r}")
-        surface = select_surface(self.client, api or self.api, effective_method)
-        if effective_method == "grammar":
+        requested = method or self.method
+        if requested not in METHOD_SELECTIONS:
+            raise JevperError(f"method must be one of {METHOD_SELECTIONS!r}, got {requested!r}")
+        auto = requested == "auto"
+        # The surface is picked for the method auto tries first; the fallback runs on either surface.
+        surface = select_surface(self.client, api or self.api, AUTO_METHOD if auto else requested)
+        if requested == "grammar":
             methods.require_grammar_surface(surface)
-        for question_id, question in parsed.items():
-            methods.require_label_readout(effective_method, question, question_id)
+        effective_model = model or self.model
+        effective_method = self._auto_method(effective_model, surface) if auto else requested
+        if not auto:
+            # auto never reaches the label-readout cap: a wide Choice is answered in JSON.
+            for question_id, question in parsed.items():
+                methods.require_label_readout(effective_method, question, question_id)
         effective_reasoning = reasoning if reasoning is not None else self.reasoning
         mode = resolve_reasoning_mode(effective_reasoning, surface)
         context = _CallContext(
@@ -307,7 +385,7 @@ class _BaseClient:
                 extra_body=self.extra_body,
                 extra_headers=self.extra_headers,
             ),
-            model=model or self.model,
+            model=effective_model,
             method=effective_method,
             mode=mode,
             temperature=temperature if temperature is not None else self.temperature,
@@ -317,6 +395,7 @@ class _BaseClient:
             analysis_reasoning=(
                 effective_reasoning if mode == "two_step" and surface == "responses" else None
             ),
+            auto=auto,
         )
         return context, parsed
 
@@ -347,13 +426,39 @@ class _BaseClient:
         context: _CallContext,
         log: _CallLog,
     ) -> Generator[CallSpec, CallResult, _QuestionOutcome]:
+        """One question's calls, restarted once with a logprob-free method when the provider needs it."""
+        retry_reasons: list[str] = []
+        fell_back = False
+        while True:
+            try:
+                return (
+                    yield from self._answer_steps(question_id, question, context, log, retry_reasons)
+                )
+            except _LogprobsUnavailable as exc:
+                if not context.auto or fell_back:
+                    raise
+                fell_back = True
+                retry_reasons.append(f"{exc} — answering with method={FALLBACK_METHOD!r}")
+                if exc.capability:
+                    self._remember_logprobs_unavailable(context.model, context.transport.surface)
+                # Questions that have not started yet take the fallback without paying for it.
+                context.method = FALLBACK_METHOD
+
+    def _answer_steps(
+        self,
+        question_id: str,
+        question: Question,
+        context: _CallContext,
+        log: _CallLog,
+        retry_reasons: list[str],
+    ) -> Generator[CallSpec, CallResult, _QuestionOutcome]:
+        method = self._question_method(question, context)
         labels = labels_for(2 if question.type == "noul" else len(question.criteria))
         examples = self._resolve_examples(question, labels, question_id, context.examples)
-        parts = build_parts(context.state_messages, question, labels, examples, method=context.method)
-        messages = assemble(parts, system=system_prompt(context.method))
+        parts = build_parts(context.state_messages, question, labels, examples, method=method)
+        messages = assemble(parts, system=system_prompt(method))
         native_reasoning: tuple[ReasoningContentPart, ...] = ()
         trace: str | None = None
-        retry_reasons: list[str] = []
         if context.mode == "two_step":
             analysis = assemble(parts, system=ANALYSIS_SYSTEM_PROMPT)
             result = yield CallSpec(messages=analysis, reasoning=context.analysis_reasoning)
@@ -375,7 +480,7 @@ class _BaseClient:
         correction: str | None = None
         for attempt in range(self.n_retry_malformed + 1):
             spec = methods.build_spec(
-                context.method,
+                method,
                 messages + ([{"role": "user", "content": correction}] if correction else []),
                 question,
                 labels,
@@ -385,21 +490,23 @@ class _BaseClient:
             )
             result = yield spec
             try:
-                readout = methods.readout(context.method, result, question, labels)
+                readout = methods.readout(method, result, question, labels)
+            except _LogprobsUnavailable:
+                raise  # the provider cannot supply logprobs; correcting the model cannot help
             except (LabelReadoutError, MalformedAnswerError) as exc:
                 if attempt >= self.n_retry_malformed:
                     raise
                 retry_reasons.append(str(exc))
                 correction = (
                     structured_correction_message(str(exc))
-                    if context.method in ("structured", "discrete")
+                    if method in ("structured", "discrete")
                     else correction_message(str(exc), labels)
                 )
                 continue
             break
         native_reasoning = native_reasoning + result.reasoning
         return self._finalize(
-            question, labels, readout, context, trace, native_reasoning, retry_reasons, log
+            question, labels, readout, method, context, trace, native_reasoning, retry_reasons, log
         )
 
     def _finalize(
@@ -407,6 +514,7 @@ class _BaseClient:
         question: Question,
         labels: Sequence[str],
         readout: methods.Readout,
+        method: Method,
         context: _CallContext,
         trace: str | None,
         native_reasoning: tuple[ReasoningContentPart, ...],
@@ -416,7 +524,7 @@ class _BaseClient:
         probabilities = readout.probabilities
         error: float | None = None
         original: dict[str, float] | None = None
-        if context.method == "structured":
+        if method == "structured":
             error = probability_error(probabilities)
             if error > PROBABILITY_TOLERANCE:
                 if self.normalize_probabilities:
@@ -465,6 +573,7 @@ class _BaseClient:
             attempts=log.attempts,
             retry_reasons=retry_reasons,
             readout_debug=readout_debug,
+            method=method,
             probability_error=error,
             original_probabilities=original,
             missing_labels=readout.missing_labels,
@@ -515,6 +624,11 @@ class _BaseClient:
             "original_probabilities": original_probabilities,
             "labels_missing": labels_missing,
         }
+        if context.auto:
+            # The method was chosen rather than pinned, so report what each question actually used.
+            debug["methods"] = {
+                question_id: outcome.method for question_id, outcome in outcomes.items()
+            }
         return SystemOneResponse(
             model=context.model,
             answers=answers,
@@ -529,8 +643,9 @@ class _BaseClient:
 class SystemOneClient(_BaseClient):
     """Blocking Jev-shaped client over any OpenAI-compatible client object.
 
-    ``method`` selects how the decision is elicited; ``api`` selects the surface (auto-detected by
-    default). ``examples`` provides few-shot demonstrations for every question in the call, and each
+    ``method`` selects how the decision is elicited — ``"auto"`` (the default) uses logprobs where the
+    provider returns them and ``structured`` where it does not; ``api`` selects the surface (auto-detected
+    by default). ``examples`` provides few-shot demonstrations for every question in the call, and each
     question may carry its own ``examples``, which take precedence.
 
     ``temperature`` is not sent unless you pass it. ``temperature=0.0`` is recommended for
@@ -546,7 +661,13 @@ class SystemOneClient(_BaseClient):
         try:
             spec = next(steps)
             while True:
-                spec = steps.send(self._call(log, question_id, spec, context))
+                try:
+                    result = self._call(log, question_id, spec, context)
+                except _LogprobsUnavailable as exc:
+                    # Hand the verdict back to the generator: it owns the fallback decision.
+                    spec = steps.throw(exc)
+                else:
+                    spec = steps.send(result)
         except StopIteration as stop:
             return stop.value
 
@@ -561,7 +682,7 @@ class SystemOneClient(_BaseClient):
                 if not self._record_failure(log, question_id, spec, context, exc) or (
                     attempt >= self.retry.n_retries
                 ):
-                    raise ProviderError(f"{type(exc).__name__}: {exc}", attempts=log.attempts) from exc
+                    raise self._call_failure(exc, spec, context, log) from exc
                 log.n_retries += 1
                 time.sleep(_retry_delay(self.retry, attempt))
                 attempt += 1
@@ -582,7 +703,7 @@ class SystemOneClient(_BaseClient):
         questions: Mapping[str, Question | Mapping[str, Any]],
         examples: Examples = (),
         model: str | None = None,
-        method: Method | None = None,
+        method: MethodSelection | None = None,
         api: Api | None = None,
         reasoning: ReasoningConfig | None = None,
         temperature: float | None = None,
@@ -643,7 +764,13 @@ class AsyncSystemOneClient(_BaseClient):
         try:
             spec = next(steps)
             while True:
-                spec = steps.send(await self._call(log, question_id, spec, context))
+                try:
+                    result = await self._call(log, question_id, spec, context)
+                except _LogprobsUnavailable as exc:
+                    # Hand the verdict back to the generator: it owns the fallback decision.
+                    spec = steps.throw(exc)
+                else:
+                    spec = steps.send(result)
         except StopIteration as stop:
             return stop.value
 
@@ -658,7 +785,7 @@ class AsyncSystemOneClient(_BaseClient):
                 if not self._record_failure(log, question_id, spec, context, exc) or (
                     attempt >= self.retry.n_retries
                 ):
-                    raise ProviderError(f"{type(exc).__name__}: {exc}", attempts=log.attempts) from exc
+                    raise self._call_failure(exc, spec, context, log) from exc
                 log.n_retries += 1
                 await asyncio.sleep(_retry_delay(self.retry, attempt))
                 attempt += 1
@@ -679,7 +806,7 @@ class AsyncSystemOneClient(_BaseClient):
         questions: Mapping[str, Question | Mapping[str, Any]],
         examples: Examples = (),
         model: str | None = None,
-        method: Method | None = None,
+        method: MethodSelection | None = None,
         api: Api | None = None,
         reasoning: ReasoningConfig | None = None,
         temperature: float | None = None,

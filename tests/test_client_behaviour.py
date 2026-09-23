@@ -92,7 +92,9 @@ def test_question_limits_are_enforced_at_construction():
 
 def test_label_readout_methods_stop_at_26_options(stub_server):
     stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
-    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="logprobs", api="chat_completions"
+    )
     wide = {f"k{index}": None for index in range(27)}
 
     with pytest.raises(InvalidQuestionError) as error:

@@ -25,7 +25,7 @@ caller (`close()` only shuts down jevper's own thread pool).
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `model` | required | Model id sent with every call; overridable per `system_one` call |
-| `method` | `"logprobs"` | `"logprobs"`, `"grammar"`, `"structured"` or `"discrete"` |
+| `method` | `"auto"` | `"auto"`, `"logprobs"`, `"grammar"`, `"structured"` or `"discrete"`; `"auto"` resolves per model and surface — see [methods.md](methods.md#auto) |
 | `api` | `"auto"` | `"auto"`, `"chat_completions"` or `"responses"` |
 | `reasoning` | `None` | A `ReasoningConfig`; `None` disables reasoning entirely |
 | `examples` | `()` | Default few-shot examples: a sequence for all questions, or a mapping keyed by question id |
@@ -174,7 +174,8 @@ wall-clock seconds for the whole `system_one` call.
 
 | Key | Content |
 | --- | --- |
-| `method` | Effective method |
+| `method` | Effective method: what `method="auto"` resolved to, or the method you pinned |
+| `methods` | `{question_id: method}` — only for `method="auto"`, since the method is then chosen per question |
 | `api` | Surface actually used (`"chat_completions"` or `"responses"`) |
 | `reasoning_mode` | `"off"`, `"native"` or `"two_step"` |
 | `llm_attempts` | One record per provider call: `question_id`, `surface`, `request`, `response`, `error`, `readout` |
@@ -183,7 +184,8 @@ wall-clock seconds for the whole `system_one` call.
 | `original_probabilities` | The model's raw distribution, only for questions that were rescaled |
 | `labels_missing` | Labels the provider did not report a logprob for, per question |
 
-Every key is always present; the last three are empty mappings when nothing applies. `request` holds the exact
+Every key is always present — except `methods`, which only `method="auto"` adds — and the last three are empty
+mappings when nothing applies. `request` holds the exact
 kwargs sent to the provider — for a failed call, the kwargs that were about to be sent, so the shape is the
 same either way — `response` holds the provider object dumped with `model_dump(mode="json")` when available,
 `error` is a `"Type: message"` string, and `readout` is the parsed readout: `source`, `probabilities` (string
@@ -228,15 +230,18 @@ All inherit from `JevperError`.
 | `InvalidQuestionError` | question or example is locally invalid; also raised when `logprobs`/`grammar` get a `Choice` with more than 26 options |
 | `UnsupportedMethodError` | `method="grammar"` and the selected surface is not Chat Completions |
 | `ClientCapabilityError` | the client lacks the attribute a surface needs, or a chat response carried no choices |
-| `LabelReadoutError` | no logprobs, no non-whitespace token, a first token that is not a label, no logprob for the answer token, a non-finite logprob, or no probability mass on any label |
+| `LabelReadoutError` | no logprobs at all, no alternatives for the answer token, no non-whitespace token, a first token that is not a label, no logprob for the answer token, a non-finite logprob, or no probability mass on any label. The first two are the provider's doing, so they are not corrective-retried and `method="auto"` answers with `structured` instead |
 | `MalformedAnswerError` | JSON answer missing/extra keys, a non-finite or out-of-range number, an unknown label, a score that is not a level index |
 | `ProviderError` | provider failure after transient retries; `.attempts` holds the attempt records |
 | `JevperError` | base class, and the type used for constructor misuse, bad `state` messages, and content that is not JSON-serializable or contains a non-finite number |
 
 ## Constants
 
-`Method` and `Api` are `Literal` aliases; the runtime tuples are `jevper.client.METHODS` and
-`jevper.client.APIS`. `jevper.client.TRANSIENT_STATUS_CODES`, `jevper.client.MAX_TOP_LOGPROBS` (`20`),
+`Method`, `MethodSelection` and `Api` are `Literal` aliases; the runtime tuples are `jevper.client.METHODS`
+(the four concrete methods), `jevper.client.METHOD_SELECTIONS` (those plus `"auto"`) and `jevper.client.APIS`.
+`jevper.client.AUTO_METHOD` (`"logprobs"`) and `jevper.client.FALLBACK_METHOD` (`"structured"`) are what
+`method="auto"` tries and falls back to.
+`jevper.client.TRANSIENT_STATUS_CODES`, `jevper.client.MAX_TOP_LOGPROBS` (`20`),
 `jevper.labels.MAX_LABEL_OPTIONS` (`26`, the single-token alphabet), `jevper.labels.MAX_CHOICE_OPTIONS` and
 `jevper.types.CHOICE_MAX_OPTIONS` (`255`), `jevper.types.SCORE_MAX_LEVELS` (`10`) and
 `jevper.normalize.PROBABILITY_TOLERANCE` (`1e-6`) are available for callers that need to validate their own

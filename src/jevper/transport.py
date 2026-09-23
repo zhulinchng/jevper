@@ -36,6 +36,8 @@ class TokenLogprob:
     token: str
     logprob: float | None
     top_logprobs: tuple[tuple[str, float], ...] = ()
+    reported_alternatives: int = 0
+    """Entries the provider put in ``top_logprobs``, whether or not they were usable."""
 
 
 @dataclass(frozen=True)
@@ -165,7 +167,9 @@ def _token_logprobs(logprobs: Any) -> tuple[TokenLogprob, ...]:
             continue
         logprob = _get(entry, "logprob")
         tops: list[tuple[str, float]] = []
+        reported = 0
         for top in _get(entry, "top_logprobs") or ():
+            reported += 1
             top_token = _get(top, "token")
             top_logprob = _get(top, "logprob")
             if top_token is None or top_logprob is None:
@@ -177,6 +181,7 @@ def _token_logprobs(logprobs: Any) -> tuple[TokenLogprob, ...]:
                 # A missing logprob stays missing: 0.0 would read as certainty.
                 logprob=None if logprob is None else float(logprob),
                 top_logprobs=tuple(tops),
+                reported_alternatives=reported,
             )
         )
     return tuple(tokens)

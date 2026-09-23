@@ -18,6 +18,7 @@ from .errors import (
     LabelReadoutError,
     MalformedAnswerError,
     UnsupportedMethodError,
+    _LogprobsUnavailable,
 )
 from .labels import MAX_CHOICE_OPTIONS, MAX_LABEL_OPTIONS, label_to_key
 from .reasoning import ReasoningConfig
@@ -183,7 +184,11 @@ def softmax_over_labels(values: Mapping[str, float]) -> dict[str, float]:
 def first_answer_token(result: CallResult, labels: Sequence[str], *, method: Method) -> TokenLogprob:
     """The first non-whitespace token, which must be one of the labels."""
     if not result.token_logprobs:
-        raise LabelReadoutError(f"no logprobs returned for the answer token (method={method!r})")
+        raise _LogprobsUnavailable(
+            f"no logprobs returned for the answer token (method={method!r}); this provider does not "
+            f"report them — use method='structured' for the model's own probabilities, or "
+            f"method='discrete' for one label, neither of which needs logprobs"
+        )
     for token in result.token_logprobs:
         if not token.token.strip():
             continue
@@ -206,6 +211,16 @@ def _logprob_readout(
     if token.logprob is None:
         raise LabelReadoutError(
             f"the provider returned no logprob for the answer token {token.token!r} (method={method!r})"
+        )
+    if token.reported_alternatives < 2:
+        # Nothing but the sampled token came back, so there is no distribution to read: the answer
+        # would be a one-hot built from absence of data. A provider that reports two or more entries
+        # but nulls for some of them is a different case — those labels are missing, not unknown,
+        # and land in debug["labels_missing"].
+        raise _LogprobsUnavailable(
+            f"the provider returned {token.reported_alternatives} top_logprobs for the answer token "
+            f"{token.token!r} (method={method!r}), which is not a distribution over the options; use "
+            f"method='structured' for the model's own probabilities, or method='discrete' for one label"
         )
     answer_label = token.token.strip().upper()
     logprobs: dict[str, float] = {label: float("-inf") for label in labels}

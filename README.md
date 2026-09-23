@@ -61,7 +61,7 @@ pytest -q
 ```mermaid
 flowchart LR
     A["state + questions"] --> B["build_parts + assemble: system prompt, state turns, few-shot turns, question block"]
-    B --> C{"method"}
+    B --> C{"method (auto resolves first)"}
     C -->|logprobs| D["logprobs=true, top_logprobs=20"]
     C -->|grammar| E["+ GBNF grammar in extra_body"]
     C -->|structured| F["strict JSON schema: probabilities"]
@@ -93,7 +93,7 @@ labelled options, `Score` rates on an ordered scale:
 `Choice` takes up to 255 options, the Jev API limit. The two methods that read a label *token* —
 `logprobs` and `grammar` — stop at 26, because the first token of `"AA"` is `"A"`; past 26 options they
 raise `InvalidQuestionError` pointing at `structured` and `discrete`, which answer in JSON and use
-two-letter labels.
+two-letter labels. The default `method="auto"` never hits that error: it answers a wide `Choice` in JSON.
 
 Questions can also be passed as raw mappings (`{"type": "choice", "criteria": {...}}`) and are validated the
 same way.
@@ -106,14 +106,19 @@ single-letter labels, so they cap at 26 options).
 
 | Method | Request | Readout | Needs |
 | --- | --- | --- | --- |
-| `logprobs` (default) | `logprobs=true, top_logprobs=20` | softmax over the labels' logprobs of the first answer token | a provider that returns chat logprobs (or the Responses surface with `include` logprobs) |
+| `auto` (default) | `logprobs`, or `structured` where the provider cannot return logprobs | whichever method it resolved to | a provider that returns logprobs, or JSON-schema structured output |
+| `logprobs` | `logprobs=true, top_logprobs=20` | softmax over the labels' logprobs of the first answer token | a provider that returns chat logprobs (or the Responses surface with `include` logprobs) |
 | `grammar` | the same plus a GBNF `grammar` in `extra_body` | same as `logprobs` | a Chat Completions server that accepts `grammar` (llama.cpp and friends) |
 | `structured` | strict JSON schema, model returns a probability per option | the model's own numbers, rescaled to sum 1 when off by more than `1e-6` | JSON-schema structured output |
 | `discrete` | strict JSON schema, model returns one option | one-hot distribution | JSON-schema structured output |
 
-`logprobs` is the default because it needs no provider-specific field beyond `logprobs`, and it reads the
-model's real distribution rather than a sampled answer. See [docs/methods.md](https://github.com/zhulinchng/jevper/blob/main/docs/methods.md) for the exact
-request bodies, readout rules and failure modes.
+`auto` is the default because logprobs are not universal: OpenAI's reasoning models reject them
+(`logprobs are not supported with reasoning models.`), Anthropic and Gemini's OpenAI-compatibility endpoint
+never had them, and a model that returns a logprob with no alternatives gives you no distribution at all.
+`auto` reads the logprobs where they exist — they are one short call and the model's real distribution
+rather than a self-report — and answers in JSON where they do not, remembering the verdict per model and
+surface. See [docs/methods.md](https://github.com/zhulinchng/jevper/blob/main/docs/methods.md#auto) for the
+provider table, the exact request bodies, the readout rules and the failure modes.
 
 ## Reasoning
 
@@ -183,7 +188,7 @@ unusable `state`, or `grammar` on a surface that cannot carry a grammar.
 | `InvalidQuestionError` | question or few-shot example is locally invalid |
 | `UnsupportedMethodError` | `method="grammar"` on the Responses surface |
 | `ClientCapabilityError` | the client lacks the attribute the chosen surface needs, or returned no choices |
-| `LabelReadoutError` | the first answer token is not a label, or no logprobs (or no logprob for that token) came back |
+| `LabelReadoutError` | the first answer token is not a label, or the provider returned no logprobs (or no alternatives, or no logprob for that token). The provider-side cases are not corrective-retried, and `method="auto"` answers them with `structured` |
 | `MalformedAnswerError` | the JSON answer had an unusable shape after corrective retries |
 | `ProviderError` | a provider call failed; `.attempts` carries the attempt history |
 | `JevperError` | constructor misuse, a bad `state` message, or content that is not JSON-serializable |

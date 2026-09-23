@@ -2,11 +2,12 @@
 
 *Independent implementation of the documented System One wire format — not affiliated with TypeSafe.*
 
-`method=` picks how the model is asked to decide, and how its answer is turned back into a distribution. All
-four methods share the same label machinery: options are labelled `A`, `B`, `C`, … in criteria order, and
-`label_to_key` maps a label back to the option key (`Choice`), the zero-based level index (`Score`) or `True`/
-`False` (`Noul`). Switching methods never changes your question or answer types — only the request body and the
-readout.
+`method=` picks how the model is asked to decide, and how its answer is turned back into a distribution. The
+default, `auto`, picks one of the four concrete methods per client, model and surface — `logprobs` where the
+provider returns them, `structured` where it does not (see [auto](#auto)). All four methods share the same
+label machinery: options are labelled `A`, `B`, `C`, … in criteria order, and `label_to_key` maps a label back
+to the option key (`Choice`), the zero-based level index (`Score`) or `True`/`False` (`Noul`). Switching
+methods never changes your question or answer types — only the request body and the readout.
 
 Labels are single letters while a question has 26 options or fewer. Past that they become two letters (`AA`,
 `AB`, … `ZZ`), which only `structured` and `discrete` can use: they answer in JSON, where a label is just a
@@ -24,7 +25,57 @@ string. `logprobs` and `grammar` read the label *token*, and the first token of 
 Pick `logprobs` when the provider returns chat logprobs: it is one short call, and the numbers are the model's
 real distribution rather than a self-report. Pick `structured` when logprobs are unavailable or the provider
 supports strict JSON schema, and `discrete` when you only need the decision and want to skip probabilities.
-`grammar` exists for self-hosted Chat Completions servers that accept a `grammar` field.
+`grammar` exists for self-hosted Chat Completions servers that accept a `grammar` field. Leaving `method` at
+`auto` makes that choice for you and costs at most one extra call per model.
+
+## `auto`
+
+`method="auto"` — the default — answers with `logprobs` where the provider returns them and with `structured`
+where it does not, so the same code works against a logprob-capable server, a reasoning model, and a provider
+that never implemented logprobs. The choice is made per (model, surface) by observation and remembered for the
+life of the client.
+
+Three things count as *this provider cannot do logprobs*:
+
+| Evidence | Response |
+| --- | --- |
+| The provider rejects the logprob fields with a 4xx that names them — Gemini's OpenAI-compatibility layer answers `Unknown name "logprobs": Cannot find field.`, a reasoning model behind an OpenAI-shaped gateway answers `logprobs are not supported with reasoning models.` | Re-ask the question with `structured`, and remember the verdict |
+| The answer carries no logprobs at all (`logprobs: null`, or a compatibility layer that drops the field) | same |
+| The answer token's logprobs carry no alternatives — `top_logprobs` empty, or nothing but the sampled token — so there is no distribution to read | same |
+
+A server error (5xx) that survives the transient retries also falls back for that question, because a request
+carrying `top_logprobs` is what some OpenAI models fail on; unlike the three above it is *not* remembered, so
+one bad minute does not downgrade a working provider.
+
+Cost and consequences:
+
+- The first question of the first call pays for the discovery: at most one extra provider call, or two under
+  `reasoning`, where the analysis pass is re-run for the new method. Later questions and later calls go
+  straight to the resolved method.
+- The fallback asks for the model's own probabilities, which are a different quantity from a token
+  distribution. `debug["methods"]` says which method each question used, and
+  `debug["llm_attempts"][*]["readout"]["source"]` says which one produced a given attempt.
+- A `Choice` with more than 26 options is answered in JSON without ever asking for logprobs: one label token
+  cannot distinguish `AA` from `A`.
+- The verdict lives on the client instance and is keyed by model and surface: a new client, or an explicit
+  `method="logprobs"`, starts over. Passing `method` to `system_one` overrides it for that call.
+
+Provider support, as of this release — check your provider's docs, since this moves:
+
+| Provider | `logprobs` | Note |
+| --- | --- | --- |
+| OpenAI `gpt-4o`, `gpt-4.1` | yes | |
+| OpenAI reasoning models (`o`-series, `gpt-5` family) | no | `400 logprobs are not supported with reasoning models.` |
+| OpenAI Responses surface | partial | `include` alone returns the sampled token and no alternatives; some models fail outright on `top_logprobs >= 2` |
+| Anthropic Claude | no | no logprob API at all |
+| Gemini via the OpenAI-compatibility endpoint | no | `400 Unknown name "logprobs": Cannot find field.` |
+| Gemini native API | yes | not reachable through an OpenAI-compatible client |
+| DeepSeek | yes | `top_logprobs` up to 20 |
+| Together | yes | send `top_logprobs` for alternatives; `logprobs: 1` alone returns the sampled token |
+| Ollama, llama.cpp, vLLM | yes | |
+| everything else | unknown | reasoning models and thin compatibility layers are the ones that say no |
+
+With `auto` you do not have to know this table.
 
 ## Surface selection
 
@@ -82,8 +133,9 @@ For criteria `{"billing", "technical", "sales"}` and logprobs `A:-0.12, B:-2.47,
 
 Caveats:
 
-- With `top_logprobs=0` only the answer token is reported, so its probability becomes `1.0` and every other
-  option `0.0`. Raise `top_logprobs` (20 covers 21 options) to get a real distribution.
+- `top_logprobs=0` reports nothing but the answer token, and one logprob is not a distribution: the readout
+  raises rather than reporting certainty, and `auto` falls back to `structured` instead. Raise `top_logprobs`
+  (20 covers 21 options) to get a real distribution.
 - A truncated `top_logprobs` list silently zeroes the missing options; check `debug["labels_missing"]` when
   that matters.
 - The distribution is the model's preference over the *next token*, so the prompt must leave the label as the
@@ -91,11 +143,18 @@ Caveats:
 - OpenAI reports `-9999.0` for tokens outside the top 20 rather than omitting them; that underflows to `0.0`
   like any other very low logprob, so it needs no special handling.
 
-Failure modes, each raising `LabelReadoutError`: no logprobs at all (`no logprobs returned for the answer
-token (method='logprobs')`), no non-whitespace token, a first token that is not a label (`first
-non-whitespace token 'The' is not one of the labels [...]`), no logprob for the answer token, or a non-finite
-logprob (`nan`/`inf`) from the provider — a `nan` distribution would otherwise poison `confidence` and
-`score`. The client retries once with a correction message before giving up.
+Failure modes, all raising `LabelReadoutError` or a subclass:
+
+- **No distribution at all**: no logprobs came back (`no logprobs returned for the answer token
+  (method='logprobs')`), or the answer token's `top_logprobs` held nothing but the sampled token. The message
+  names `structured` and `discrete`, and no corrective retry is spent — re-asking with a correction turn
+  cannot make a provider report logprobs it does not have. `auto` answers these with `structured` instead of
+  raising.
+- **Unusable answer**: no non-whitespace token, or a first token that is not a label (`first non-whitespace
+  token 'The' is not one of the labels [...]`). These *are* retried once with a correction message: the model,
+  not the provider, is at fault.
+- **Unusable number**: no logprob for the answer token, or a non-finite logprob (`nan`/`inf`) from the
+  provider — a `nan` distribution would otherwise poison `confidence` and `score`.
 
 ## `grammar`
 
@@ -191,3 +250,7 @@ labels, `Your previous reply was invalid: {reason}. Reply with exactly one of th
 A, B, C.`; for JSON, `Your previous reply was invalid: {reason}. Return only a JSON object matching the
 schema.` — and re-issues the answer call up to `n_retry_malformed` times (default 1). Reasons are recorded in
 `debug["retry_reasons"]`, and each retry is a provider call, so it counts towards `usage.n_calls`.
+
+A `LabelReadoutError` that says the provider cannot report logprobs — no logprobs at all, or no alternatives
+for the answer token — is not corrected, because another turn cannot change what the provider returns;
+`method="auto"` answers those questions with `structured` instead.

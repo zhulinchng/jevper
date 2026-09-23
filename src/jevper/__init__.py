@@ -31,6 +31,7 @@ from .types import (
     Example,
     JSONContent,
     Method,
+    MethodSelection,
     Noul,
     NoulAnswer,
     NoulCriteria,
@@ -41,7 +42,7 @@ from .types import (
     Usage,
 )
 
-__version__ = "0.1.3"
+__version__ = "0.2.0"
 
 __all__ = [
     "Answer",
@@ -58,6 +59,7 @@ __all__ = [
     "LabelReadoutError",
     "MalformedAnswerError",
     "Method",
+    "MethodSelection",
     "Noul",
     "NoulAnswer",
     "NoulCriteria",

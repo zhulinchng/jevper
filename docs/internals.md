@@ -26,16 +26,21 @@ imports `types.py` at runtime (it is duck-typed on `question.type`) so the graph
 ```mermaid
 flowchart TD
     A["system_one(state, questions, ...)"] --> B["_prepare: validate questions, render the state turns, resolve method/api/reasoning/examples"]
-    B --> C["select_surface + make_transport"]
+    B --> B2{"method == auto"}
+    B2 -->|"yes"| B3["_auto_method(model, surface): what this client learned, else logprobs"]
+    B2 -->|"no"| C
+    B3 --> C["select_surface + make_transport"]
     C --> D["per question, concurrently"]
-    D --> E["labels_for + _resolve_examples + build_parts"]
-    E --> F["_question_steps: assemble each pass from the parts"]
+    D --> E["_question_method + labels_for + _resolve_examples + build_parts"]
+    E --> F["_answer_steps: assemble each pass from the parts"]
     F --> G["analysis CallSpec (two_step only)"]
     F --> H["answer CallSpec via methods.build_spec"]
     H --> I["transport.call / acall -> CallResult"]
     I --> J["methods.readout -> Readout"]
-    J -->|"LabelReadoutError / MalformedAnswerError"| K["correction turn, retry up to n_retry_malformed"]
+    J -->|"unusable answer"| K["correction turn, retry up to n_retry_malformed"]
     K --> H
+    J -->|"logprobs unavailable"| K2["auto only: remember the verdict, re-answer with structured"]
+    K2 --> E
     J --> L["_finalize -> Answer + reasoning + accounting"]
     L --> M["_assemble -> SystemOneResponse"]
 ```
@@ -45,25 +50,44 @@ question reuses them), resolves method, surface, reasoning mode and examples, an
 before any provider call, so a bad question, an empty `questions` mapping, an unusable `state` or `grammar` on
 the Responses surface produces zero HTTP requests.
 
+`method="auto"` is resolved there too: `_auto_method(model, surface)` returns what this client has learned
+about that provider, or `logprobs` when it has learned nothing. The verdict lives in
+`_BaseClient._auto_methods`, keyed by `(model, surface)` under a lock, so a second `system_one` call on the
+same client skips the discovery entirely. The surface is picked for `logprobs` rather than for the resolved
+method, because the fallback method runs on either surface.
+
 ## The per-question generator
 
-The sequence "analysis pass → answer pass → corrective retries" is written once, in `_question_steps`, as a
+The sequence "analysis pass → answer pass → corrective retries" is written once, in `_answer_steps`, as a
 generator that yields a `CallSpec` and receives a `CallResult` back:
 
 ```python
 steps = self._question_steps(...)
 spec = next(steps)
 while True:
-    spec = steps.send(self._call(log, question_id, spec, context))
+    try:
+        result = self._call(log, question_id, spec, context)
+    except _LogprobsUnavailable as exc:
+        spec = steps.throw(exc)  # the generator owns the fallback decision
+    else:
+        spec = steps.send(result)
 ```
 
 `StopIteration.value` is the finished `_QuestionOutcome`. The sync and async clients differ only in their
 driver (`_call` uses the sync or async transport), which keeps the two implementations from drifting.
 
-`_question_steps` renders a question's prompt once, as `prompts.PromptParts` (`build_parts`), and every pass is
+`_question_steps` is a thin wrapper over `_answer_steps` that exists for one reason: the provider's verdict
+arrives in the driver, not inside the generator, so it is thrown back in (`steps.throw`). Under
+`method="auto"` the wrapper records the verdict, switches `_CallContext.method` to `structured` — so questions
+that have not started yet take the fallback for free — and re-enters `_answer_steps`, which re-renders the
+prompt because `structured` uses a different system prompt and different example turns. One fallback per
+question, enforced by a local flag; a pinned method re-raises instead.
+
+`_answer_steps` renders a question's prompt once, as `prompts.PromptParts` (`build_parts`), and every pass is
 assembled from those parts (`assemble`). The two-step analysis and answer calls therefore share the rendered
 state turns, example turns and question block instead of re-rendering them; the state itself is rendered once
-per `system_one` call, in `_prepare`.
+per `system_one` call, in `_prepare`. The method it uses comes from `_question_method`, which is
+`_CallContext.method` unless `auto` needs a JSON method for a `Choice` past the 26-label alphabet.
 
 ## Concurrency
 
@@ -118,9 +142,13 @@ omitted it (a reported `0` is preserved). `_CallLog.add_result` implements exact
 | --- | --- |
 | `method`, `api`, `reasoning_mode` | `_CallContext` (the resolved values, not the requested ones) |
 | `llm_attempts` | One record per provider call, including failed ones; the last record for a question carries its `readout` |
-| `retry_reasons` | Corrective retries, in order |
+| `retry_reasons` | Corrective retries and method fallbacks, in order |
 | `probability_errors`, `original_probabilities` | `structured` normalization only |
 | `labels_missing` | Labels the provider reported no logprob for |
+
+A ninth key, `methods` (`{question_id: method}`), is added only for `method="auto"`, where the method is a
+decision per question rather than a pinned fact. Every other key is present either way, which is what keeps a
+pinned method's `debug` byte-identical across releases.
 
 ## Invariants
 
@@ -150,6 +178,18 @@ Worth keeping when editing:
   instead of putting an unparseable prompt or example in front of the model.
 - Probability normalization never raises: out-of-tolerance distributions are recorded in `debug` and either
   rescaled (default) or passed through.
+- `method="auto"` never changes what a pinned method does. It resolves to a concrete method before any spec is
+  built, so a provider that returns logprobs sees byte-identical requests whether the method was pinned or
+  resolved, and a pinned `logprobs` call still raises `ProviderError` on a rejection.
+- Only evidence about the provider is remembered. A 4xx that names the logprob fields, a response with no
+  logprobs, and a response whose only logprob is the sampled token are all `_LogprobsUnavailable(capability=
+  True)` and are cached per `(model, surface)`; a 5xx that survived the retries is `capability=False` and is
+  *not* cached, because one bad minute is not a verdict.
+- Capability failures are not corrective-retried: a correction turn changes the prompt, not what the provider
+  reports. Only the model-side failures (a non-label token, an unusable JSON shape) are worth another call.
+- A logprob readout needs at least two candidates. `top_logprobs` with nothing but the sampled token is not a
+  distribution, so it raises instead of reporting the answer as certain; a provider that reports entries but
+  nulls for some of them is the documented partial case and keeps `labels_missing` semantics.
 
 ## Extending
 
