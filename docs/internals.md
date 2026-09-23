@@ -123,7 +123,7 @@ not the Python.
 
 | Kind | Trigger | Counted in |
 | --- | --- | --- |
-| Transient | `status_code` in `{429, 500, 502, 503, 504, 529}`, or `Connection`/`Timeout` in the name of the exception class or any base class, or an `httpx`-family `TransportError`/`TimeoutException` in the MRO | `usage.n_retries`, with delays `min(base_delay · 3ⁿ, max_delay)` |
+| Transient | `status_code` in `{408, 429, 500, 502, 503, 504, 529}` (read from the exception or from `exc.response.status_code`), or `Connection`/`Timeout` in the name of the exception class or any base class, or an `httpx`-family `TransportError`/`TimeoutException` in the MRO | `usage.n_retries`, with delays `min(base_delay · 3ⁿ, max_delay)` |
 | Corrective | `LabelReadoutError` or `MalformedAnswerError` on the answer call | `usage.n_calls` (each is a provider call) and `debug["retry_reasons"]` |
 
 Transient retries wrap the failing call; a non-transient error, or a transient one with the retries exhausted,
@@ -181,10 +181,12 @@ Worth keeping when editing:
 - `method="auto"` never changes what a pinned method does. It resolves to a concrete method before any spec is
   built, so a provider that returns logprobs sees byte-identical requests whether the method was pinned or
   resolved, and a pinned `logprobs` call still raises `ProviderError` on a rejection.
-- Only evidence about the provider is remembered. A 4xx that names the logprob fields, a response with no
-  logprobs, and a response whose only logprob is the sampled token are all `_LogprobsUnavailable(capability=
-  True)` and are cached per `(model, surface)`; a 5xx that survived the retries is `capability=False` and is
-  *not* cached, because one bad minute is not a verdict.
+- Only evidence about the provider is remembered. A response with no logprobs, a response whose only logprob
+  is the sampled token, and a 4xx that *refuses the field* — naming it in the message, `param` or `code`
+  alongside an unsupported/unknown signal — are all `_LogprobsUnavailable(capability=True)` and are cached per
+  `(model, surface)`. A 4xx that only complains about the value it was sent (a server whose `top_logprobs` cap
+  is below the default) and a 5xx that survived the retries are `capability=False` and are *not* cached: the
+  question is answered with a logprob-free method, but the next call tries logprobs again.
 - Capability failures are not corrective-retried: a correction turn changes the prompt, not what the provider
   reports. Only the model-side failures (a non-label token, an unusable JSON shape) are worth another call.
 - A logprob readout needs at least two candidates. `top_logprobs` with nothing but the sampled token is not a

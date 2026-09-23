@@ -9,6 +9,7 @@ from fakes import chat_body, openai_client, responses_body
 
 from jevper import (
     Choice,
+    LabelReadoutError,
     MalformedAnswerError,
     Noul,
     Score,
@@ -288,3 +289,15 @@ def test_responses_surface_logprobs(stub_server):
     assert answer.choice == "billing"
     assert answer.probabilities["billing"] == pytest.approx(0.884873983, abs=1e-9)
     assert response.debug["api"] == "responses"
+
+
+def test_grammar_without_logprobs_spends_no_corrective_retry(stub_server):
+    """The server cannot be talked into reporting logprobs, so no correction turn is spent."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A")))
+    client = SystemOneClient(openai_client(stub), model="stub", method="grammar")
+
+    with pytest.raises(LabelReadoutError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "grammar mode needs logprobs in the response" in str(error.value)
+    assert len(stub.bodies("/chat/completions")) == 1

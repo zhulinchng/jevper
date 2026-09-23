@@ -11,6 +11,7 @@ import json
 import threading
 from collections.abc import Callable, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from typing import Any
 
 Script = Callable[[dict[str, Any]], "tuple[int, dict[str, Any]]"]
@@ -193,6 +194,28 @@ class StubServer:
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+
+class StatusError(Exception):
+    """An ``httpx.HTTPStatusError``-shaped failure: the status lives on the response, not the exception."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"server error '{status_code}'")
+        self.response = SimpleNamespace(status_code=status_code)
+
+
+class RaisingClient:
+    """A duck-typed client whose chat call always raises the given exception."""
+
+    def __init__(self, exc: Exception) -> None:
+        class Completions:
+            def create(self, **kwargs: Any) -> Any:
+                raise exc
+
+        class Chat:
+            completions = Completions()
+
+        self.chat = Chat()
 
 
 def openai_client(stub: StubServer) -> Any:

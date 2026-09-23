@@ -9,9 +9,9 @@ from jevper import SystemOneClient, AsyncSystemOneClient, Choice, Noul, Score, E
 ```
 
 `__all__` also contains `Answer`, `Api`, `ChoiceAnswer`, `Example`, `Examples`, `JSONContent`, `Method`,
-`NoulAnswer`, `NoulCriteria`, `ProviderError`, `Question`, `Readout`, `ReasoningContentPart`,
-`ReasoningSummaryPart`, `ReasoningTextPart`, `RetryPolicy`, `ScoreAnswer`, `SystemOneResponse`, `Usage`,
-`reasoning_text`, the five other error classes, and `__version__`.
+`MethodSelection`, `NoulAnswer`, `NoulCriteria`, `ProviderError`, `Question`, `Readout`,
+`ReasoningContentPart`, `ReasoningSummaryPart`, `ReasoningTextPart`, `RetryPolicy`, `ScoreAnswer`,
+`SystemOneResponse`, `Usage`, `reasoning_text`, the five other error classes, and `__version__`.
 
 ## `SystemOneClient`
 
@@ -199,7 +199,8 @@ RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0)
 ```
 
 Applies per provider call. A failure is transient when the exception exposes a `status_code` reading as one of
-`{429, 500, 502, 503, 504, 529}` (an int, an `http.HTTPStatus`, or a digit string), or when its class — or any
+`{408, 429, 500, 502, 503, 504, 529}` (an int, an `http.HTTPStatus`, or a digit string, taken from the
+exception or from `exc.response.status_code` when only the response carries it), or when its class — or any
 class in its MRO — contains `Connection` or
 `Timeout`, or is an `httpx`-family transport failure (`TransportError`, `TimeoutException`). That last clause
 is what covers `httpx.ConnectError`, `ReadError` and `RemoteProtocolError`, whose names carry neither marker;
@@ -234,6 +235,12 @@ All inherit from `JevperError`.
 | `MalformedAnswerError` | JSON answer missing/extra keys, a non-finite or out-of-range number, an unknown label, a score that is not a level index |
 | `ProviderError` | provider failure after transient retries; `.attempts` holds the attempt records |
 | `JevperError` | base class, and the type used for constructor misuse, bad `state` messages, and content that is not JSON-serializable or contains a non-finite number |
+
+The provider-side logprob failures — a rejected logprob request, no logprobs at all, no alternatives for the
+answer token — are raised as `_LogprobsUnavailable`, a private `LabelReadoutError` subclass. It is private
+because `method="auto"` is the only thing that reads it: its `capability` attribute records whether the failure
+is evidence about the provider (`True`, which `auto` remembers) or a bad minute (`False`, which it does not).
+Catch the public `LabelReadoutError`.
 
 ## Constants
 

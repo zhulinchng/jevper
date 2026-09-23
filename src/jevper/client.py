@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from . import methods
 from .errors import (
+    ClientCapabilityError,
     InvalidQuestionError,
     JevperError,
     LabelReadoutError,
@@ -75,10 +76,24 @@ from .types import (
     parse_question,
 )
 
-TRANSIENT_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 529})
-# 429 means "slow down", the rest mean "the server failed" — only the latter can be the request's fault.
-_SERVER_ERROR_STATUS_CODES = TRANSIENT_STATUS_CODES - {429}
+TRANSIENT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504, 529})
+# 429 means "slow down" and 408 means the request timed out; only the server's own failures can be the
+# logprob request's fault, so neither counts as capability evidence.
+_SERVER_ERROR_STATUS_CODES = TRANSIENT_STATUS_CODES - {408, 429}
 _LOGPROB_REJECTION_STATUS_CODES = frozenset({400, 403, 422})
+# Text that says the provider refuses the *field itself*: the capability evidence ``auto`` remembers.
+_UNSUPPORTED_MARKERS = (
+    "not supported",
+    "unsupported",
+    "unknown name",
+    "cannot find field",
+    "does not support",
+    "unrecognized",
+    "not recognized",
+    "not allowed",
+)
+# Text that says only the *value* was wrong: the field exists, so this is not a capability verdict.
+_VALUE_MARKERS = ("must be between", "out of range", "maximum", "max_logprobs", "exceeds")
 _TRANSIENT_NAME_MARKERS = ("Connection", "Timeout")
 _TRANSIENT_TRANSPORT_CLASSES = frozenset({"TransportError", "TimeoutException"})
 METHODS: tuple[Method, ...] = ("logprobs", "grammar", "structured", "discrete")
@@ -103,6 +118,10 @@ class RetryPolicy(BaseModel):
 def _status_code(exc: BaseException) -> int | None:
     """The provider's HTTP status, when the exception carries one in a readable form."""
     status = getattr(exc, "status_code", None)
+    if status is None:
+        # httpx.HTTPStatusError keeps it on the response instead, and its MRO carries no transport
+        # marker, so without this it would be neither retried nor classified.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
     if status is None or isinstance(status, bool):
         return None
     try:
@@ -127,6 +146,16 @@ def _retry_delay(policy: RetryPolicy, attempt: int) -> float:
     return min(policy.base_delay * 3**attempt, policy.max_delay)
 
 
+def _logprob_evidence(exc: BaseException) -> str:
+    """Everything the provider said about the failure: its message, and the param/code it named."""
+    parts = [str(exc)]
+    for attr in ("param", "code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, str) and value:
+            parts.append(value)
+    return " ".join(parts).lower()
+
+
 def _logprobs_rejected(exc: BaseException) -> bool:
     """The provider refused the request because of the logprob fields it carried.
 
@@ -134,7 +163,23 @@ def _logprobs_rejected(exc: BaseException) -> bool:
     ``Unknown name "logprobs": Cannot find field.`` and a reasoning model behind an OpenAI-shaped
     gateway answers ``logprobs are not supported with reasoning models.``
     """
-    return _status_code(exc) in _LOGPROB_REJECTION_STATUS_CODES and "logprob" in str(exc).lower()
+    return _status_code(exc) in _LOGPROB_REJECTION_STATUS_CODES and "logprob" in _logprob_evidence(exc)
+
+
+def _logprobs_unsupported(exc: BaseException) -> bool:
+    """The rejection reads as a missing capability rather than a bad value, so it is worth remembering.
+
+    ``logprobs are not supported with reasoning models.`` and ``Unknown name "logprobs": Cannot find
+    field.`` both refuse the field. ``Invalid 'top_logprobs': integer must be between 0 and 5, but got
+    20.`` — a server whose cap is lower than the default — refuses the value, so the question is
+    answered with a logprob-free method without writing off logprobs for the rest of the client's life.
+    """
+    if not _logprobs_rejected(exc):
+        return False
+    evidence = _logprob_evidence(exc)
+    if any(marker in evidence for marker in _VALUE_MARKERS):
+        return False
+    return any(marker in evidence for marker in _UNSUPPORTED_MARKERS)
 
 
 def _dump_model(obj: Any) -> Any:
@@ -322,13 +367,22 @@ class _BaseClient:
     ) -> JevperError:
         """The error to give up on a call with: a logprob verdict under ``auto``, else the provider's.
 
-        A rejected logprob request is a fact about the provider, so it is remembered. A server error
-        that survived every retry is only a bad minute, so it is not.
+        A rejection that reads as a missing capability is a fact about the provider, so it is
+        remembered; one that only complains about the value it was sent is answered in JSON without
+        being remembered. A server error that survived every retry is only a bad minute, so it is not.
         """
         if context.auto and spec.logprobs:
             failure = f"{type(exc).__name__}: {exc}"
             if _logprobs_rejected(exc):
-                return _LogprobsUnavailable(f"the provider rejected the logprob request ({failure})")
+                capability = _logprobs_unsupported(exc)
+                note = (
+                    ""
+                    if capability
+                    else " (not remembered: the rejection names a bad value, not a missing capability)"
+                )
+                return _LogprobsUnavailable(
+                    f"the provider rejected the logprob request ({failure}){note}", capability=capability
+                )
             if _status_code(exc) in _SERVER_ERROR_STATUS_CODES:
                 return _LogprobsUnavailable(
                     f"the provider failed every attempt at the logprob request ({failure})",
@@ -682,6 +736,8 @@ class SystemOneClient(_BaseClient):
                 if not self._record_failure(log, question_id, spec, context, exc) or (
                     attempt >= self.retry.n_retries
                 ):
+                    if isinstance(exc, ClientCapabilityError):
+                        raise  # the client cannot read this surface; another attempt cannot help
                     raise self._call_failure(exc, spec, context, log) from exc
                 log.n_retries += 1
                 time.sleep(_retry_delay(self.retry, attempt))
@@ -785,6 +841,8 @@ class AsyncSystemOneClient(_BaseClient):
                 if not self._record_failure(log, question_id, spec, context, exc) or (
                     attempt >= self.retry.n_retries
                 ):
+                    if isinstance(exc, ClientCapabilityError):
+                        raise  # the client cannot read this surface; another attempt cannot help
                     raise self._call_failure(exc, spec, context, log) from exc
                 log.n_retries += 1
                 await asyncio.sleep(_retry_delay(self.retry, attempt))

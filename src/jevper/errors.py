@@ -18,7 +18,11 @@ class UnsupportedMethodError(JevperError):
 
 
 class ClientCapabilityError(JevperError):
-    """The supplied client does not expose the attribute a surface requires."""
+    """The supplied client does not expose the attribute a surface requires.
+
+    Also raised when a chat response carried no choices at all: the surface answered, but nothing in
+    it can be read.
+    """
 
 
 class LabelReadoutError(JevperError):

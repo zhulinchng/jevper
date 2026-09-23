@@ -247,7 +247,9 @@ def readout_logprobs(result: CallResult, question: Question, labels: Sequence[st
 def readout_grammar(result: CallResult, question: Question, labels: Sequence[str]) -> Readout:
     require_grammar_surface(result.surface)
     if not result.token_logprobs:
-        raise LabelReadoutError(
+        # A provider-side fact, so no corrective retry is spent on it — another turn cannot change
+        # what the server reports. Same message, same public class (a LabelReadoutError subclass).
+        raise _LogprobsUnavailable(
             "grammar mode needs logprobs in the response; pass method='discrete' to skip probabilities"
         )
     return _logprob_readout(result, question, labels, "grammar", "grammar")

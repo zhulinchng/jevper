@@ -174,9 +174,9 @@ response.debug                 # per-attempt requests/responses, retry reasons, 
 ```
 
 `response.model_dump_json()` serializes to the Jev answer shape — the answer field names and JSON keys match
-`POST /v1/systemone`. Token counts are `None` when any constituent call omitted them; `n_calls` counts every
-provider call including analysis passes and corrective retries, while `n_retries` counts transient-failure
-retries only. See [docs/api.md](https://github.com/zhulinchng/jevper/blob/main/docs/api.md) for the full reference.
+`POST /v1/systemone`. Token counts are `None` when any constituent call omitted them; `n_calls` counts the
+provider calls that returned a result, including analysis passes and corrective retries, while `n_retries`
+counts transient-failure retries only. A failed attempt appears in `debug["llm_attempts"]` but not in `usage`. See [docs/api.md](https://github.com/zhulinchng/jevper/blob/main/docs/api.md) for the full reference.
 
 ## Failures
 
@@ -193,7 +193,7 @@ unusable `state`, or `grammar` on a surface that cannot carry a grammar.
 | `ProviderError` | a provider call failed; `.attempts` carries the attempt history |
 | `JevperError` | constructor misuse, a bad `state` message, or content that is not JSON-serializable |
 
-Transient failures (HTTP 429/500/502/503/504/529, connection and timeout errors — including the `httpx`
+Transient failures (HTTP 408/429/500/502/503/504/529, connection and timeout errors — including the `httpx`
 transport errors whose class names carry neither word) are retried per call with
 `RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0)` and exponential
 backoff `min(base_delay · 3ⁿ, max_delay)`. Unreadable answers get one corrective retry

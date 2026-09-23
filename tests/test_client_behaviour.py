@@ -8,11 +8,19 @@ import threading
 import time
 
 import pytest
-from fakes import async_openai_client, chat_body, openai_client, responses_body
+from fakes import (
+    RaisingClient,
+    StatusError,
+    async_openai_client,
+    chat_body,
+    openai_client,
+    responses_body,
+)
 
 from jevper import (
     AsyncSystemOneClient,
     Choice,
+    ClientCapabilityError,
     InvalidQuestionError,
     JevperError,
     Noul,
@@ -559,3 +567,85 @@ def test_async_max_concurrency_one_serializes_requests():
     )
 
     assert duck.peak == 1
+
+
+def test_empty_choices_is_a_client_capability_error(stub_server):
+    stub = stub_server(chat=lambda _: (200, {"choices": []}))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    with pytest.raises(ClientCapabilityError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "provider returned no choices" in str(error.value)
+
+
+def test_non_string_question_id_fails_before_any_request(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    with pytest.raises(InvalidQuestionError) as error:
+        client.system_one(state="s", questions={1: Choice(criteria=CRITERIA)})
+
+    assert "question id must be a string" in str(error.value)
+    assert stub.requests == []
+
+
+def test_408_is_retried(stub_server):
+    stub = stub_server(chat=lambda _: (408, {"error": {"message": "Request Timeout"}}))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        retry=RetryPolicy(n_retries=1, base_delay=0.0),
+    )
+
+    with pytest.raises(ProviderError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert len(error.value.attempts) == 2
+    assert len(stub.bodies("/chat/completions")) == 2
+
+
+def test_408_is_not_capability_evidence(stub_server):
+    """A timed-out request is not a verdict on the provider, so auto keeps asking for logprobs."""
+    stub = stub_server(chat=lambda _: (408, {"error": {"message": "Request Timeout"}}))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        retry=RetryPolicy(n_retries=1, base_delay=0.0),
+    )
+
+    with pytest.raises(ProviderError):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    bodies = stub.bodies("/chat/completions")
+    assert len(bodies) == 2
+    assert all(body["logprobs"] is True for body in bodies)
+
+
+def test_status_carried_on_the_response_is_read():
+    retry = RetryPolicy(n_retries=1, base_delay=0.0)
+    question = {"q": Choice(criteria=CRITERIA)}
+
+    transient = SystemOneClient(
+        RaisingClient(StatusError(503)),
+        model="m",
+        method="discrete",
+        api="chat_completions",
+        retry=retry,
+    )
+    with pytest.raises(ProviderError) as error:
+        transient.system_one(state="s", questions=question)
+    assert len(error.value.attempts) == 2
+
+    permanent = SystemOneClient(
+        RaisingClient(StatusError(400)),
+        model="m",
+        method="discrete",
+        api="chat_completions",
+        retry=retry,
+    )
+    with pytest.raises(ProviderError) as error:
+        permanent.system_one(state="s", questions=question)
+    assert len(error.value.attempts) == 1

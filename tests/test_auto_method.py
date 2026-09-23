@@ -310,3 +310,80 @@ def test_method_selection_is_validated():
 
     assert "must be one of" in str(error.value)
     assert "'auto'" in str(error.value)
+
+
+RANGE_REJECTION = {
+    "error": {
+        "message": "Invalid 'top_logprobs': integer must be between 0 and 5, but got 20.",
+        "type": "invalid_request_error",
+        "param": "top_logprobs",
+        "code": "invalid_value",
+    }
+}
+
+
+class AttributeRejection(Exception):
+    """A 400 that names the logprob field in its attributes, not in its message."""
+
+    status_code = 400
+    param = "logprobs"
+    code = "unsupported_parameter"
+
+
+class AttrRejectingClient:
+    """A duck-typed provider that refuses logprobs and answers in JSON otherwise."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+        outer = self
+
+        class Completions:
+            def create(self, **kwargs):
+                outer.requests.append(kwargs)
+                if kwargs.get("logprobs"):
+                    raise AttributeRejection("Request rejected.")
+                return chat_body(content=STRUCTURED)
+
+        class Chat:
+            completions = Completions()
+
+        self.chat = Chat()
+
+
+def range_hostile(body):
+    """A server whose top_logprobs cap is lower than the default: it refuses the value, not the field."""
+    if body.get("logprobs"):
+        return 400, RANGE_REJECTION
+    return 200, chat_body(content=STRUCTURED)
+
+
+def test_auto_does_not_remember_a_value_rejection(stub_server):
+    stub = stub_server(chat=range_hostile)
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions", retry=NO_RETRY)
+
+    first = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    second = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert first.answers["q"].choice == "billing"
+    assert second.answers["q"].choice == "billing"
+    assert first.debug["methods"] == {"q": "structured"}
+    assert second.debug["methods"] == {"q": "structured"}
+    assert "not remembered" in first.debug["retry_reasons"][0]
+
+    bodies = stub.bodies("/chat/completions")
+    assert len(bodies) == 4
+    assert bodies[2]["top_logprobs"] == 20  # the second call tried logprobs again
+
+
+def test_auto_remembers_a_rejection_that_names_the_field_only_in_param():
+    stub = AttrRejectingClient()
+    client = SystemOneClient(stub, model="stub", api="chat_completions", retry=NO_RETRY)
+
+    first = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    second = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert first.answers["q"].choice == "billing"
+    assert second.answers["q"].choice == "billing"
+    assert first.debug["methods"] == {"q": "structured"}
+    assert len(stub.requests) == 3
+    assert "logprobs" not in stub.requests[2]  # the verdict was remembered

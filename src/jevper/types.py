@@ -135,6 +135,12 @@ QuestionAdapter = TypeAdapter(Annotated[Noul | Choice | Score, Field(discriminat
 
 def parse_question(question_id: str, raw: Question | Mapping[str, Any]) -> Question:
     """Coerce a question instance or raw mapping into a validated ``Question``."""
+    if not isinstance(question_id, str):
+        # The answer mapping is keyed by str, so a non-string id would fail only after the provider
+        # call had been paid for. Fail with the library's own error, before anything is sent.
+        raise InvalidQuestionError(
+            f"question id must be a string, got {type(question_id).__name__} {question_id!r}"
+        )
     if isinstance(raw, (Noul, Choice, Score)):
         validate_question(raw, question_id)
         return raw

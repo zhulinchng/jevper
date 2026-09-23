@@ -59,6 +59,10 @@ Cost and consequences:
   cannot distinguish `AA` from `A`.
 - The verdict lives on the client instance and is keyed by model and surface: a new client, or an explicit
   `method="logprobs"`, starts over. Passing `method` to `system_one` overrides it for that call.
+- Only a rejection that refuses the *field* is remembered. A 4xx that complains about the value it was sent —
+  a server whose `top_logprobs` cap is lower than the default answers `Invalid 'top_logprobs': integer must be
+  between 0 and 5, but got 20.` — still falls back to `structured` for that question, but nothing is cached:
+  the next call tries logprobs again.
 
 Provider support, as of this release — check your provider's docs, since this moves:
 
@@ -72,7 +76,8 @@ Provider support, as of this release — check your provider's docs, since this 
 | Gemini native API | yes | not reachable through an OpenAI-compatible client |
 | DeepSeek | yes | `top_logprobs` up to 20 |
 | Together | yes | send `top_logprobs` for alternatives; `logprobs: 1` alone returns the sampled token |
-| Ollama, llama.cpp, vLLM | yes | |
+| llama.cpp, vLLM | yes | vLLM caps `top_logprobs` at its own `--max-logprobs` |
+| Ollama | partial | local builds since Nov 2025 return logprobs; Ollama Cloud and older builds do not, and the compatibility page still lists Logprobs as unsupported |
 | everything else | unknown | reasoning models and thin compatibility layers are the ones that say no |
 
 With `auto` you do not have to know this table.
@@ -142,6 +147,10 @@ Caveats:
   only sensible continuation — that is what the system prompt and the `Options:` block are for.
 - OpenAI reports `-9999.0` for tokens outside the top 20 rather than omitting them; that underflows to `0.0`
   like any other very low logprob, so it needs no special handling.
+- Option descriptions and instructions are rendered verbatim into the options block. A description containing a
+  newline followed by a label-shaped line (`B: something`) injects a pseudo-option into the prompt; the readout
+  only accepts the allocated labels, so the result is a `LabelReadoutError` and one corrective retry, but keep
+  descriptions single-line and free of label-like lines.
 
 Failure modes, all raising `LabelReadoutError` or a subclass:
 
@@ -177,7 +186,8 @@ Constraints:
   similar servers); pass api='chat_completions'
   ```
 - The server must still return logprobs; if it does not, the readout raises `LabelReadoutError` suggesting
-  `method="discrete"`, which skips probabilities.
+  `method="discrete"`, which skips probabilities, and no corrective retry is spent — another turn cannot change
+  what the provider reports.
 - Most hosted providers reject or ignore an unknown `grammar` field, so this is a self-hosted-server method.
 
 ## `structured`

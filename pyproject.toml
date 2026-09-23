@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jevper"
-version = "0.2.0"
+version = "0.2.1"
 description = "The Jev (System One) interface over any OpenAI-compatible model: noul, choice and score questions in one call"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,13 +20,16 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
   "Typing :: Typed",
 ]
 dependencies = ["pydantic>=2.7"]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "openai>=1.40"]
+# openai>=1.92 is the first release whose responses.create accepts top_logprobs (1.91 and earlier
+# reject the keyword); the suite exercises that surface directly.
+test = ["pytest>=8", "openai>=1.92"]
 
 [project.urls]
 Homepage = "https://github.com/zhulinchng/jevper"
