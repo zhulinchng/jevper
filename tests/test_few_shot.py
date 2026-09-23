@@ -141,7 +141,11 @@ def test_structured_examples_render_json_answers(stub_server):
         },
     )
 
-    choice_body, noul_body = stub.bodies("/chat/completions")
+    bodies = stub.bodies("/chat/completions")
+    assert len(bodies) == 2
+    # The two questions are answered concurrently, so arrival order is not guaranteed.
+    choice_body = next(body for body in bodies if "A: billing" in body["messages"][-1]["content"])
+    noul_body = next(body for body in bodies if "A: Yes" in body["messages"][-1]["content"])
     messages = choice_body["messages"]
     assert messages[0]["content"].startswith("You are a precise classification engine. Answer the question by returning a JSON object")
     assert json.loads(messages[3]["content"]) == {
