@@ -215,23 +215,43 @@ Worth keeping when editing:
   is below the default) and a 5xx that survived the retries are `capability=False` and are *not* cached: the
   question is answered with a logprob-free method, but the next call tries logprobs again.
 - A request field jevper added for capability is dropped, not fatal. A 4xx that refuses structured output, the
-  reasoning parameters, the Responses `include` list or the cache key moves that field one step down its ladder
-  — `json_schema` → `json_object` → nothing, then reasoning, then include, then the key — and the same call is
-  re-asked, with the limit remembered per surface and reported in `debug["server_limits"]`. None of the four is
-  needed to answer, so the question is answered instead of failing. The ladder is finite, so a server that
-  refuses everything still ends in a `ProviderError`, and a rejection that names the logprob fields belongs to
-  the readout fallback instead and never reaches it.
+  reasoning parameters, the Responses `include` list, the cache key or the Messages `thinking` field moves that
+  field one step down its ladder — `json_schema` → `json_object` → nothing, then reasoning, then include, then
+  the key, then thinking — and the same call is re-asked, with the limit remembered per surface and reported in
+  `debug["server_limits"]`. None of them is needed to answer, so the question is answered instead of failing.
+  The ladder is finite, so a server that refuses everything still ends in a `ProviderError`, and a rejection
+  that names the logprob fields belongs to the readout fallback instead and never reaches it.
+- A refusal of the *value* is not a refusal of the *field*, and only the second moves the ladder.
+  `budget_tokens: must be at least 1024` and `reasoning_effort must be one of low, medium, high` name fields
+  the server knows and numbers it will not take; dropping the field there would answer the question with the
+  caller's reasoning quietly switched off and remember that as the server's limit for a configuration the
+  caller never repeated, so the provider's own error travels back and nothing is cached. A refusal of the
+  schema is deliberately exempt: dropping to `json_object` does not lose the schema, which travels in the
+  prompt from then on. The ladder is read against the transport that issued the request, not against the
+  shared call context, which another question's worker may have moved in the meantime.
+- A capability field the caller put in `extra_body` is dropped with jevper's own. The SDK merges `extra_body`
+  last, so a key named there is what reaches the wire; leaving it in place would make the "re-ask without it"
+  the same bytes again. A key the caller names is also the effective one for the builder's own decisions — a
+  caller's `response_format` means no schema of jevper's is in the request, so the schema goes in the prompt
+  beside it.
 - The derived cache key is a function of the prefix, not of the request. `prompts.derived_cache_key` hashes the
-  model, the example turns and the question block — everything that determines what a provider can reuse — and
-  never the state, so every state classified with one rubric keys alike. The two reasoning passes of a
-  two-step call therefore share a key even though their system prompts differ, and a fallback to another
-  method does not: another method's examples and prompt are another prefix. A caller's own key replaces the
-  derived one everywhere, including in the re-asks the ladder performs.
-- An answer that never arrived says why. `CallResult.stop` carries the provider's own reason — `finish_reason`
-  on Chat Completions, `incomplete_details.reason` on the Responses surface — and the readouts append it to
-  the error raised for a missing or unparseable answer. A reasoning model that spends the whole output budget
-  thinking (vLLM and SGLang answer `status: "incomplete"`, llama.cpp and ollama `finish_reason: "length"`)
-  otherwise fails with "no non-whitespace token in the response", which is true and useless.
+  model, the method, the example turns and the question block — everything that determines what a provider can
+  reuse — and never the state, so every state classified with one rubric keys alike. The method belongs in it
+  because its system prompt and answer shape are part of the cached prefix: a `logprobs` request and a
+  `structured` one for the same question must not be routed into one bucket. The two reasoning passes of a
+  two-step call still share a key even though their system prompts differ, because the point of the key is to
+  route the answer pass at the analysis pass's cache. A caller's own key replaces the derived one everywhere,
+  including in the re-asks the ladder performs.
+- An answer that never arrived says why, on every path that reports it. `CallResult.stop` carries the
+  provider's own reason — `finish_reason` on Chat Completions, `incomplete_details.reason` on the Responses
+  surface, `stop_reason` on the Messages API — and the readouts append it to the error raised for a missing or
+  unparseable answer, including the two `parse_json_object` paths where the answer contained a `{` but could
+  not be read. A reasoning model that spends the whole output budget thinking (vLLM and SGLang answer
+  `status: "incomplete"`, llama.cpp and ollama `finish_reason: "length"`, the Messages API `stop_reason:
+  "max_tokens"`) otherwise fails with "no non-whitespace token in the response", which is true and useless.
+  A model's refusal is the other reason an answer never arrives — OpenAI's `refusal` sibling of a null
+  `content`, the Messages API's `stop_reason: "refusal"` — and `CallResult.refusal` carries the model's own
+  words so it reads as a refusal rather than as malformed JSON.
 - Capability failures are not corrective-retried: a correction turn changes the prompt, not what the provider
   reports. Only the model-side failures (a non-label token, an unusable JSON shape) are worth another call.
 - A logprob readout needs at least two candidates. `top_logprobs` with nothing but the sampled token is not a

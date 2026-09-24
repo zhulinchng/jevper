@@ -197,9 +197,9 @@ release of each project that ships the route.
 | Server | Since | `thinking` field | Thinking blocks back | `usage` cache counts |
 | --- | --- | --- | --- | --- |
 | LM Studio | 0.4.1 | accepted, and the answer is still separated from it | `thinking` blocks when the model thinks | `cache_read_input_tokens`, including a reported `0` on a cold call |
-| llama.cpp | b7187 | accepted | reported | not documented |
-| vLLM | 0.11.1 | **absent from its protocol**, so the request is refused and jevper drops the field and re-asks | `thinking` blocks | yes |
-| SGLang | 0.5.9 | accepted, including `type: enabled/disabled/adaptive` | `thinking` blocks | yes |
+| llama.cpp | b7187 | accepted, and the budget grows `max_tokens` as below | reported | not documented |
+| vLLM | 0.11.1 | **accepted and ignored**: its request model has no `thinking` field and pydantic drops extras, so the field reaches nothing and no downgrade fires — the answer comes back with no thinking and no way to tell | `thinking` blocks | yes |
+| SGLang | 0.5.9 | **refused**: this version has no `thinking` field at all, so the request is answered `400` and jevper drops the field and re-asks, reporting `debug["server_limits"]["thinking"]` | `thinking` blocks | yes |
 | ollama | 0.14.0 | accepted, but `budget_tokens` is accepted and **not enforced** | `thinking` blocks | no cache fields at all |
 
 No server returns logprobs through this route — the API has no field for one — so `method="structured"` or
@@ -207,7 +207,8 @@ No server returns logprobs through this route — the API has no field for one �
 to find out. `max_tokens` is required by vLLM's and SGLang's implementations and has no default on any of
 them, so jevper always sends one: 1024, or 1024 plus the caller's `ReasoningConfig(budget_tokens=…)`, because
 this API also requires the thinking budget to be *strictly below* `max_tokens` and would refuse the 1024 its
-own documentation calls the floor. `extra_body={"max_tokens": n}` overrides both.
+own documentation calls the floor. Measured on all five: a 1024 budget sends `max_tokens: 2048`, a 2048 budget
+sends `3072`, and a caller's own `extra_body={"max_tokens": 4096}` still wins outright.
 
 Anthropic has since added mid-conversation `system` messages, but no server here implements them: they render
 a `system` turn positionally into the chat template, so jevper still moves it to the top-level `system` field,
