@@ -89,7 +89,9 @@ answer — so `response.debug["llm_attempts"]` and the trace tell the same story
 Two failure modes are worth knowing. A request the provider *rejects* — a 400, a 404, a refused field —
 leaves a span with an error status, and the call still raises jevper's own error. A response the provider
 *answers* that jevper cannot read is different: a refusal or a spent budget arrives as an HTTP 200, so the
-span is `OK` while jevper raises `MalformedAnswerError`/`LabelReadoutError`. The rule behind both is that the
+span is `OK` while jevper raises `ModelRefusalError`/`IncompleteAnswerError` (both `ProviderError`
+subclasses, and both terminal — a refusal is not re-asked and a spent budget is not corrected). The rule
+behind all of it is that the
 span's status follows the *SDK call*: `OK` if it returned, error if it raised — which also means a 200 whose
 body the SDK itself cannot parse is an error span, while one whose shape the SDK tolerates and jevper then
 trips over is not. The span tells you what the provider said; jevper's error tells you whether an answer came

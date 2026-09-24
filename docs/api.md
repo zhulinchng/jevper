@@ -81,6 +81,14 @@ per-call `method` of `logprobs`/`grammar` with `top_logprobs` below 2, and for a
 | `{"messages": [...]}` | same as above |
 | any other JSON value | one `user` turn holding `<document>` around `json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2)` |
 
+A list is read as chat turns when its elements are all dicts — a conversation by intent, so a missing
+`content`, an unknown role or a typo in a key is a `JevperError` rather than a quoted blob, and an empty
+list is refused for the same reason. A list of anything else (`[1, 2]`, `["a", "b"]`) is not a
+conversation and is quoted like any other JSON value. A `system`/`developer` turn inside a chat list is
+moved into the leading system message, because no server here accepts one in a later position — and it
+is quoted on the way in, since moving it is a position fix and not a statement that the caller's state
+is trusted.
+
 A state handed over as one value is quoted, and every angle bracket inside it is written as its JSON
 escape, so the document cannot close its own quote and carry on as prompt text: the state is the
 content under judgement, and content under judgement is what an attacker would try to steer an
@@ -91,9 +99,9 @@ conversation they are.
 Whichever form it takes, the state is rendered into the **last** messages of the prompt — after the system
 prompt, the few-shot turns and the question block — so that every state classified with one rubric shares the
 same prefix and the provider can reuse its cache. A chat-list state's own `system`/`developer` turns are
-folded into that system prompt — every server here refuses a `system` turn that is not first, and jevper's own
-prompt leads — while the rest of the state stays verbatim and goes last. See
-[local-servers.md](local-servers.md#message-order-is-what-decides-the-reuse).
+folded into that system prompt — every server here refuses a `system` turn that is not first, jevper's own
+prompt leads, and the content arrives quoted — while the rest of the state stays verbatim and goes last.
+See [local-servers.md](local-servers.md#message-order-is-what-decides-the-reuse).
 
 The one exception is a chat-list state whose last turn is the **assistant's**: the question turn then follows
 the state instead, so the conversation still ends on a question. Ending it on the assistant's turn is not a
@@ -250,10 +258,18 @@ a client-side `LocalProtocolError` is not retried.
 The wait is whatever the provider asked for when it said: a `Retry-After` (delta-seconds or an HTTP date)
 or the millisecond `retry-after-ms` some providers send instead replaces the computed backoff, which is
 what the TypeSafe clients do by default — coming back sooner than a rate limit asked is one way to extend
-it. `max_delay` caps jevper's own curve, not the server's instruction, so a header asking for minutes is
-waited out in minutes; `respect_retry_after=False` goes back to the curve alone, and `n_retries=0` fails on
-the first rate-limited response. A header jevper cannot read — not a number, not a date, negative — is
-the backoff's business, never a reason to skip the wait.
+it. Header names are matched case-insensitively, as HTTP requires, so a client that hands its exceptions a
+plain `{"RETRY-AFTER": "120"}` dict is heard the same as one that carries an `httpx.Headers`, and a date
+already past means come back now — a wait of zero. `max_delay` caps jevper's own curve, not the server's
+instruction, so a header asking for minutes is waited out in minutes, up to `jevper.client.MAX_RETRY_AFTER` (2^53
+seconds: the largest integer a float holds exactly, and no real provider's idea of a wait). Past that the
+header is not an instruction any runtime can carry out, so the curve answers rather than `time.sleep`
+raising `OverflowError`. `respect_retry_after=False` goes back to the curve alone, and `n_retries=0` fails
+on the first rate-limited response. A header jevper cannot read — not a number, not a date, negative — is
+the backoff's business, never a reason to skip the wait. Only an exception the SDK raised for a failed
+status carries headers to read: a provider failure carried in the body of a `200` (OpenRouter's
+overloaded-upstream answer) is a plain model object with no headers on it, so that case waits out the
+curve too.
 
 Without a readable header the delay before retry `n` is `min(base_delay · 3ⁿ, max_delay)` (so 0.5s, 1.5s, …
 by default). Anything else — and a transient failure with the retries exhausted — is raised as
@@ -286,7 +302,7 @@ All inherit from `JevperError`.
 | `MalformedAnswerError` | JSON answer missing/extra keys, a non-finite or out-of-range number, an unknown label, a score that is not a level index |
 | `IncompleteAnswerError` | the provider stopped generating before the answer was complete — `finish_reason: "length"`, `stop_reason: "max_tokens"`, a Responses `status: "incomplete"`, or a filtered answer. A `ProviderError` subclass, and terminal: a cut-off generation is not a malformed answer to correct, because another attempt spends a call to be cut off the same way |
 | `ModelRefusalError` | the model declined to answer and the provider said so — OpenAI's `refusal` field or content part, `stop_reason: "refusal"`. A `ProviderError` subclass, and terminal: a refusal is complete, not broken, so a corrective retry would only be refused again |
-| `ProviderError` | provider failure after transient retries; `.attempts` holds the attempt records and `.status_code` the status the provider reported, including one carried inside a `200` body. Also raised when every surface `api="auto"` could try answered `404`: the route is missing, so the failure is the provider's, not a private verdict's |
+| `ProviderError` | provider failure after transient retries; `.attempts` holds the attempt records and `.status_code` the status the provider reported, including one carried inside a `200` body. Also raised when every surface `api="auto"` could try answered `404` (the route is missing, so the failure is the provider's, not a private verdict's), and when a Responses call reports a `status` that is neither `completed` nor `incomplete` — `failed`, `cancelled` — which is a generation the provider did not finish, not a malformed answer to correct |
 | `JevperError` | base class, and the type used for constructor misuse, bad `state` messages, and content that is not JSON-serializable or contains a non-finite number |
 
 The provider-side logprob failures — a rejected logprob request, no logprobs at all, no alternatives for the

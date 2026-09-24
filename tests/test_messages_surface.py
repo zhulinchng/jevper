@@ -180,6 +180,99 @@ def test_extra_body_travels_without_a_temperature(stub_server):
     assert body["top_k"] == 20
 
 
+def test_the_thinking_off_knob_travels_without_a_temperature(stub_server):
+    """The documented way to turn thinking off on a local server is a caller's ``extra_body`` field.
+
+    Attaching that body only inside the temperature branch would drop the one field a Messages caller
+    needs most — ``chat_template_kwargs`` — exactly when it is needed, since the knob is passed on
+    its own, and the answer that comes back without it is a thinking block and no text at all.
+    """
+    stub = stub_server(messages=answer())
+    ask(client_for(stub, extra_body={"chat_template_kwargs": {"enable_thinking": False}}))
+
+    sent = body_sent(stub)
+    assert "temperature" not in sent
+    assert sent["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_the_schema_field_reaches_an_sdk_that_has_never_heard_of_it():
+    """``output_config`` postdates ``anthropic>=0.49``, whose ``messages.create`` has no such parameter.
+
+    Sent as a typed keyword it raises ``TypeError: unexpected keyword argument`` before a request is
+    made, which no amount of ladder can recover from. Through ``extra_body`` — a body, not a keyword —
+    the oldest supported SDK sends the same top-level JSON a new one would, and the strict signature
+    below is what proves it: a parameter jevper invented could not get through this call at all.
+    """
+
+    class OldSDK:
+        """A client with the 0.49 signature: every parameter it knows, and nothing else."""
+
+        def __init__(self) -> None:
+            self.messages = SimpleNamespace(create=self._create)
+            self.seen: dict = {}
+
+        def _create(
+            self,
+            *,
+            model: str,
+            max_tokens: int,
+            messages: list,
+            system: str | None = None,
+            thinking: dict | None = None,
+            temperature: float | None = None,
+            extra_body: dict | None = None,
+            extra_headers: dict | None = None,
+        ) -> object:
+            self.seen = {"model": model, "messages": messages, "system": system, "extra_body": extra_body}
+            return SimpleNamespace(
+                id="msg_1",
+                model=model,
+                content=[SimpleNamespace(type="text", text=JSON_ANSWER)],
+                stop_reason="end_turn",
+                usage=SimpleNamespace(input_tokens=10, output_tokens=5),
+            )
+
+    old = OldSDK()
+    response = SystemOneClient(old, model="stub", api="messages", method="structured").system_one(
+        state="s", questions={"q": Choice(criteria=CRITERIA)}
+    )
+
+    assert response.answers["q"].choice == "billing"
+    assert old.seen["extra_body"]["output_config"]["format"]["type"] == "json_schema"
+
+
+def test_the_schema_sent_is_one_anthropic_accepts(stub_server):
+    """Anthropic's structured outputs reject numerical constraints; the bound travels as a description.
+
+    jevper's own schemas bound every probability at 0 and every Noul answer from 0 to 1, so this is
+    the difference between the field working and a 400 that turns it off for the client's life.
+    """
+    stub = stub_server(messages=answer())
+    ask(client_for(stub))
+
+    sent = body_sent(stub)
+    rendered = json.dumps(sent["output_config"]["format"]["schema"])
+    assert "minimum" not in rendered
+    assert "maximum" not in rendered
+    assert "at least 0" in rendered
+    # The prompt keeps the full schema: text can carry a constraint the wire format cannot.
+    assert '"minimum":0' in sent["system"]
+
+
+def test_a_schema_with_no_bounds_is_sent_as_it_is(stub_server):
+    """A discrete schema has nothing to move, and a transform that edited it anyway would be a bug."""
+    stub = stub_server(messages=lambda _: (200, messages_body(text='{"choice": "A"}')))
+    ask(client_for(stub, method="discrete"))
+
+    assert body_sent(stub)["output_config"]["format"]["schema"] == {
+        "type": "object",
+        "properties": {"choice": {"type": "string", "enum": ["A", "B", "C"]}},
+        "required": ["choice"],
+        "additionalProperties": False,
+    }
+
+
+
 def test_temperature_and_extra_body_travel(stub_server):
     stub = stub_server(messages=answer())
     ask(client_for(stub, extra_body={"top_k": 20}), temperature=0.6)
@@ -565,6 +658,28 @@ def test_a_truncated_messages_answer_names_the_budget(stub_server):
 
     assert "before the answer was complete" in str(error.value)
     assert "max_tokens" in str(error.value)
+    assert len(stub.requests) == 1
+
+
+def test_a_spent_context_window_does_not_ask_for_a_bigger_output_budget(stub_server):
+    """``model_context_window_exceeded`` is the other way to run out of room, and the opposite remedy.
+
+    The request is already too long for the model to answer in: raising ``max_tokens`` lengthens it.
+    Both stops stay terminal and both are an ``IncompleteAnswerError``; only the advice differs, which
+    is why the reason is named rather than grouped.
+    """
+    stub = stub_server(
+        messages=lambda _: (200, messages_body(text=JSON_ANSWER, stop_reason="model_context_window_exceeded"))
+    )
+    client = client_for(stub, n_retry_malformed=2)
+
+    with pytest.raises(IncompleteAnswerError) as error:
+        ask(client)
+
+    message = str(error.value)
+    assert "context window ran out" in message
+    assert "shorten the state" in message
+    assert "extra_body" not in message
     assert len(stub.requests) == 1
 
 

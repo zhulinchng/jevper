@@ -15,6 +15,10 @@ string. `logprobs` and `grammar` read the label *token*, and the first token of 
 `InvalidQuestionError` past 26 options and name the two methods that can take more (up to the Jev API limit of
 255).
 
+With a single option there is no distribution to read: the sampled label *is* the answer, so `logprobs`
+and `grammar` report it with probability 1.0 and confidence 1.0 whether or not the provider sends
+alternatives. The two-candidate rule below applies to a question that has something to compete with.
+
 | Method | Asks for | Distribution comes from |
 | --- | --- | --- |
 | `logprobs` | one label, plus the logprobs of the alternatives | the model's own next-token distribution |
@@ -170,8 +174,12 @@ first answer token. Any other provider field goes through `extra_body`.
 The Messages surface has no logprobs at all, and it does have a schema field of its own: Anthropic's
 `output_config={"format": {"type": "json_schema", "schema": ...}}`, the counterpart of the two above and
 what the TypeSafe reference adapter sends there. jevper sends it *and* keeps the schema in the system
-prompt, because a server can take that field and discard it without a word — vLLM's Messages request
-model drops what it does not model — and the five local servers constrain nothing on this route.
+prompt: vLLM implements the field (a schema naming a constant the prompt never mentions comes back with
+that constant in the answer), while llama.cpp, LM Studio and ollama accept it and ignore it, which no error
+reports — and a server that discards a field it accepted looks exactly like one that never read it. The
+schema is also rewritten for Anthropic's documented subset on the way out (numerical constraints are a
+`400` there), and the whole field travels in the request body rather than as an SDK keyword, since the
+oldest Anthropic SDK jevper supports has no such parameter.
 
 When a server refuses one of the fields above — `400 response_format is not supported`, the Responses
 `text.format`, the Messages `output_config`, `reasoning_effort`, or the `reasoning.encrypted_content`
@@ -359,11 +367,14 @@ for the answer token — is not corrected, because another turn cannot change wh
 When there is no answer to read at all, the message says why, because the parse error alone sends a caller
 looking for a bug that is not there:
 
-- **The output budget ran out.** Each surface has its own word for it — Chat Completions `finish_reason:
-  "length"`, the Messages API `stop_reason: "max_tokens"` or `"model_context_window_exceeded"`, the Responses
-  surface `status: "incomplete"` with `incomplete_details.reason: "max_output_tokens"` — and all of them reach
-  the caller as *the provider ran out of output tokens before the answer was complete*, with the field to raise.
-  This holds however the answer was cut off: mid-object, or with no `{` at all.
+- **The budget ran out.** Each surface has its own word for it — Chat Completions `finish_reason:
+  "length"`, the Messages API `stop_reason: "max_tokens"`, the Responses surface `status: "incomplete"`
+  with `incomplete_details.reason: "max_output_tokens"` — and all of them reach the caller as *the
+  provider ran out of output tokens before the answer was complete*, with the field to raise. This
+  holds however the answer was cut off: mid-object, or with no `{` at all. The Messages API's other
+  reason, `model_context_window_exceeded`, is the same failure with the opposite remedy — the request
+  is already too long to answer in — so it arrives as *the provider's context window ran out*, naming
+  the state and the examples as what to shorten.
 - **The model refused.** Each surface puts a refusal in its own place, and jevper reads all three: a
   `refusal` sibling of a null `content` on Chat Completions, a `refusal` content part on Responses, and
   `stop_reason: "refusal"` on the Messages API. The message carries the model's own words, so a refusal

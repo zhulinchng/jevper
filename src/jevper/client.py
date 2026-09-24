@@ -249,20 +249,44 @@ _RETRY_AFTER = "retry-after"
 
 
 def _header(headers: Any, name: str) -> str | None:
-    """One response header as text, from an httpx ``Headers`` or a plain mapping."""
+    """One response header as text, from an ``httpx.Headers`` or a plain mapping.
+
+    HTTP field names are case-insensitive, and a plain mapping is not: a client that hands its
+    exceptions a ``{"RETRY-AFTER": "120"}`` dict is saying the same thing as one that spells it
+    ``Retry-After``, so the lookup compares names case-folded rather than probing two spellings.
+    """
     if headers is None:
         return None
     getter = getattr(headers, "get", None)
     if getter is None:
         return None
-    for key in (name, name.title()):
-        try:
-            value = getter(key)
-        except (AttributeError, KeyError, TypeError, ValueError):  # not a mapping after all
+    wanted = name.casefold()
+    items = getattr(headers, "items", None)
+    try:
+        if callable(items):
+            for key, value in items():
+                if str(key).casefold() == wanted and isinstance(value, str) and value.strip():
+                    return value.strip()
             return None
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+        for key in (name, name.title()):
+            value = getter(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    except (AttributeError, KeyError, TypeError, ValueError):  # not a mapping after all
+        return None
     return None
+
+
+_RETRY_AFTER_MS = "retry-after-ms"
+_RETRY_AFTER = "retry-after"
+
+# The longest wait a retry will take from a header, and a validity bound rather than a policy cap:
+# ``max_delay`` still does not apply to a header jevper honors. It is the largest integer a float
+# holds exactly, which every 64-bit runtime can sleep and which no real provider approaches — a
+# date in 2099 is about 2.3e9 seconds away. Above it the header is not an instruction any client can
+# carry out, and honoring it literally is the ``OverflowError`` ``time.sleep`` raises for a delay
+# outside the platform's range, so the backoff curve answers instead.
+MAX_RETRY_AFTER = float(2**53)
 
 
 def _retry_after_seconds(exc: BaseException) -> float | None:
@@ -271,6 +295,10 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
     ``retry-after-ms`` is the millisecond form OpenRouter and Anthropic send; ``Retry-After`` is
     either delta-seconds or an HTTP date, which is how a proxy states the same wait. Anything
     unreadable falls back to the backoff rather than being guessed at.
+
+    Only an exception the SDK raised for a failed status carries a response to read the headers from.
+    A provider failure carried in the body of a ``200`` — OpenRouter's way of reporting an overloaded
+    upstream — is a plain model object with no headers on it, so that case uses the backoff too.
     """
     headers = getattr(exc, "headers", None)
     if _header(headers, _RETRY_AFTER_MS) is None and _header(headers, _RETRY_AFTER) is None:
@@ -290,8 +318,9 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
                 continue
             if when.tzinfo is None:
                 when = when.replace(tzinfo=timezone.utc)
-            seconds = when.timestamp() - time.time()
-        if math.isfinite(seconds) and seconds >= 0:
+            # A date already past means come back now, which is what the header asked for.
+            seconds = max(0.0, when.timestamp() - time.time())
+        if 0 <= seconds <= MAX_RETRY_AFTER:
             return seconds
     return None
 
@@ -605,7 +634,11 @@ class _BaseClient:
             raise JevperError(f"method must be one of {METHOD_SELECTIONS!r}, got {method!r}")
         if api not in APIS:
             raise JevperError(f"api must be one of {APIS!r}, got {api!r}")
-        _require_count("top_logprobs", top_logprobs, maximum=MAX_TOP_LOGPROBS)
+        # The count is a provider field, so its own range is the floor: OpenAI and every server here
+        # answer [0, 20]. Only the label readouts need the lower bound of 2 (see _require_top_logprobs);
+        # a negative count is not a small count, and letting it reach the provider spends a request to
+        # be told what a client can say for free.
+        _require_count("top_logprobs", top_logprobs, minimum=0, maximum=MAX_TOP_LOGPROBS)
         _require_count("max_concurrency", max_concurrency, minimum=1)
         _require_count("n_retry_malformed", n_retry_malformed, minimum=0)
         _require_model(model)

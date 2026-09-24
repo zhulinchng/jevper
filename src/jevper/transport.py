@@ -129,6 +129,52 @@ def _schema_in_prompt(messages: list[dict[str, str]], spec: CallSpec) -> list[di
     return [{**first, "content": f"{first.get('content') or ''}\n\n{instruction}"}, *rest]
 
 
+# Anthropic's structured outputs implement a subset of JSON Schema: their documentation lists
+# numerical constraints among the unsupported features, and an unsupported keyword is a ``400``, not
+# a warning. Their own SDK helpers answer it the same way — drop the constraint, keep its meaning in
+# the description — so the wire schema is one the API accepts and the model is still told the bound.
+_UNSUPPORTED_BOUNDS = {
+    "minimum": "at least {value}",
+    "maximum": "at most {value}",
+    "exclusiveMinimum": "greater than {value}",
+    "exclusiveMaximum": "less than {value}",
+    "multipleOf": "a multiple of {value}",
+    "minItems": "at least {value} items",
+    "maxItems": "at most {value} items",
+    "minLength": "at least {value} characters",
+    "maxLength": "at most {value} characters",
+    "minProperties": "at least {value} properties",
+    "maxProperties": "at most {value} properties",
+}
+
+
+def _api_schema(schema: Any) -> Any:
+    """The schema as this API accepts it: every unsupported bound folded into a description.
+
+    jevper's own schemas bound every probability at ``minimum: 0`` and every Noul answer from 0 to 1,
+    so this is not a shape the raw schema can skip: sending it untransformed costs a refused request
+    on the first schema-bearing call and turns the field off for the rest of the client's life. The
+    prompt keeps the full schema — text can say what a constraint says — so nothing is lost.
+    """
+    if isinstance(schema, Mapping):
+        out: dict[str, Any] = {}
+        bounds: list[str] = []
+        for key, value in schema.items():
+            template = _UNSUPPORTED_BOUNDS.get(key)
+            if template is not None and isinstance(value, (int, float)) and not isinstance(value, bool):
+                bounds.append(template.format(value=value))
+            else:
+                out[key] = _api_schema(value)
+        if bounds:
+            note = ", ".join(bounds)
+            said = out.get("description")
+            out["description"] = f"{said} (must be {note})" if said else f"Must be {note}."
+        return out
+    if isinstance(schema, list):
+        return [_api_schema(item) for item in schema]
+    return schema
+
+
 def _caller_body(extra_body: Mapping[str, Any] | None, limits: Limits) -> dict[str, Any]:
     """The caller's own request fields, minus the capability fields this server has refused.
 
@@ -522,6 +568,18 @@ def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
         if failure is not None:
             raise failure
     usage = _get(response, "usage")
+    status = _get(response, "status")
+    if status is not None and status not in ("completed", "incomplete"):
+        # A generation the provider did not finish is a provider failure, not an answer. Reading
+        # ``failed`` or ``cancelled`` as an empty answer spends corrective retries re-asking a request
+        # that was never going to arrive, and a failed generation that still carries text would be
+        # reported as one. The reference adapter raises for any status but ``completed``.
+        failure = _get(response, "error") or _get(_get(response, "incomplete_details"), "reason")
+        detail = _get(failure, "message") or failure
+        raise ProviderError(
+            f"the provider reported status={status!r} before the answer was complete"
+            + (f": {detail}" if isinstance(detail, str) and detail.strip() else "")
+        )
     details = _get(usage, "output_tokens_details")
     input_details = _get(usage, "input_tokens_details")
     # A Responses call that hit the output budget says so here rather than in a finish_reason.
@@ -627,7 +685,13 @@ def build_messages_kwargs(
     if thinking:
         kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
     if native_schema:
-        kwargs["output_config"] = {"format": {"type": "json_schema", "schema": spec.json_schema}}
+        # Through ``extra_body`` rather than as a typed keyword: the field postdates the oldest
+        # Anthropic SDK jevper supports (``anthropic>=0.49`` has no ``output_config`` parameter and
+        # answers ``TypeError: unexpected keyword argument`` before a request is sent), and the SDK
+        # merges the body into the same top-level JSON either way.
+        body["output_config"] = {
+            "format": {"type": JSON_SCHEMA_FORMAT, "schema": _api_schema(spec.json_schema)}
+        }
     if spec.temperature is not None and not thinking:
         # Not a typed parameter of the SDK's ``messages.create`` — the newest Claude models refuse a
         # non-default temperature, so the client stopped naming it — but the API itself still accepts

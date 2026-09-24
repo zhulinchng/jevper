@@ -232,8 +232,26 @@ def _answer_tokens(result: CallResult) -> tuple[TokenLogprob, ...]:
 _TRUNCATED_STOPS = frozenset(
     {"length", "max_tokens", "max_output_tokens", "model_context_window_exceeded"}
 )
-"""What each surface calls "the output budget ran out": Chat Completions ``length``, the Messages API
+"""What each surface calls "the budget ran out": Chat Completions ``length``, the Messages API
 ``max_tokens`` and ``model_context_window_exceeded``, the Responses surface ``max_output_tokens``."""
+
+_CONTEXT_STOPS = frozenset({"model_context_window_exceeded"})
+"""A spent *context window* is terminal in the same way a spent output budget is, but the remedy is
+the opposite one: the request is already too long to answer, so raising ``max_tokens`` makes it longer.
+Anthropic names the two differently for that reason, and the message says which one happened."""
+
+
+def _truncation_message(stop: str) -> str:
+    """The error text for a generation that ran out of room, naming the room that ran out."""
+    if stop in _CONTEXT_STOPS:
+        return (
+            f"the provider's context window ran out before the answer was complete ({stop!r}); "
+            f"shorten the state or the examples, or use a model with a larger context"
+        )
+    return (
+        f"the provider ran out of output tokens before the answer was complete ({stop!r}); "
+        f"raise the limit, for example extra_body={{'max_tokens': 2048}}"
+    )
 
 
 def _stop_note(result: CallResult) -> str:
@@ -249,10 +267,7 @@ def _stop_note(result: CallResult) -> str:
     otherwise, which sends a caller looking for a parsing bug that is not there.
     """
     if result.stop in _TRUNCATED_STOPS:
-        return (
-            f" — the provider ran out of output tokens before the answer was complete "
-            f"({result.stop!r}); raise the limit, for example extra_body={{'max_tokens': 2048}}"
-        )
+        return f" — {_truncation_message(result.stop)}"
     note = f" — the provider reported {result.stop!r}" if result.stop is not None else ""
     if result.refusal:
         note += f" — the model refused to answer: {result.refusal[:200]!r}"
@@ -294,10 +309,7 @@ def answer_failure(result: CallResult) -> ProviderError | None:
             message += f" — the provider reported {result.stop!r}"
         return ModelRefusalError(message)
     if result.stop in _TRUNCATED_STOPS:
-        return IncompleteAnswerError(
-            f"the provider ran out of output tokens before the answer was complete ({result.stop!r}); "
-            f"raise the limit, for example extra_body={{'max_tokens': 2048}}"
-        )
+        return IncompleteAnswerError(_truncation_message(result.stop))
     if result.stop is not None and result.stop not in _COMPLETE_STOPS.get(result.surface, frozenset()):
         return IncompleteAnswerError(
             f"the provider stopped before the answer was complete ({result.stop!r})"
@@ -340,6 +352,18 @@ def _logprob_readout(
     if token.logprob is None:
         raise LabelReadoutError(
             f"the provider returned no logprob for the answer token {token.token!r} (method={method!r})"
+        )
+    if len(labels) == 1:
+        # A one-option question has no distribution to read: the sampled token is the answer and the
+        # only label holds the whole of it. This is the case the one-option minimum makes reachable —
+        # the Jev API documents a maximum of 255 options and no minimum, and the reference adapter
+        # reports a one-option Choice with confidence 1.0 — so a pinned label readout answers it
+        # rather than refusing a distribution that cannot exist.
+        return Readout(
+            probabilities={label_to_key(question, labels)[labels[0]]: 1.0},
+            source=source,
+            missing_labels=(),
+            observed_text=result.text,
         )
     if token.reported_alternatives < 2:
         # Nothing but the sampled token came back, so there is no distribution to read: the answer

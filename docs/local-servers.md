@@ -139,6 +139,7 @@ tolerate, and the fixture tests replay them on every change.
 | unknown model id | `404` naming it | ignored, `200` | `404` naming it | Chat ignored, Responses `404` |
 | `n: 2` | accepted, one choice back | `400` | accepted, two choices | accepted, two choices |
 | `developer` role | accepted | accepted | accepted | **`400`** |
+| `output_config` on `/v1/messages` | accepted, ignored | accepted, ignored | **enforced**, invalid `format.type` a `400` | accepted, ignored |
 | unknown request field | ignored | ignored | ignored | ignored |
 | route 404 body | `404 page not found` (text) | `{"error": {...}}` | `{"detail": "Not Found"}` | `{"detail": "Not Found"}` |
 | some `400` bodies | JSON object | JSON object | JSON object | **a bare JSON string** |
@@ -271,16 +272,30 @@ no text block. `separate_reasoning: false` does not change that; dropping `--rea
 structured scenarios then answer normally. It is a property of serving a model that never emits the marker
 with a parser that waits for it, not of the client.
 
-One thing the fleet showed that the protocol did not say then: none of these five servers constrains the
-*shape* of the answer on this route. Anthropic's own API has a field for it — `output_config.format` — and
-jevper sends it wherever the server takes it, but none of these five does, so the JSON Schema also stays in
-the system prompt and the answer is only as good as the model's instruction-following. Without that the
-structured system prompt referred to "the provided schema" while nothing provided one, and a 4B model
-answered `{"intent": "A"}` — a real answer in the wrong shape — to every structured question. A server that
-*refuses* the field costs one request and is reported as `debug["server_limits"]["output_config"]`. vLLM is
-the awkward case: its Messages request model has no `thinking` field either and pydantic drops what it does
-not model, so a field it ignores produces no error and no verdict — which is exactly why the prompt keeps
-the schema on this surface whether the field is sent or not.
+`output_config.format` — Anthropic's own schema-constrained output — is implemented by **vLLM** and by none
+of the other four. Measured here with a schema whose only legal answer names a constant the prompt never
+mentions: vLLM answered `{"canary": "JEVPER-PROBE"}`, and the same request without the field answered
+`{"Name": "Canary"}`, so the shape came from the field. It also *validates* the field — an unknown
+`format.type` is a `400` naming `body.output_config.format.type` — which is the rung that lets jevper drop
+the field and remember it in `debug["server_limits"]["output_config"]`. llama.cpp, LM Studio and ollama
+accept the field and ignore it, with no error and no verdict, so on those the JSON Schema has to stay in the
+system prompt and the answer is only as good as the model's instruction-following: without it, a 4B model
+answered `{"intent": "A"}` — a real answer in the wrong shape — to every structured question, and on LM
+Studio one answer came back as the schema itself (`{"minimum": 0, "type": "number"}` in the place of a
+probability), which jevper's one corrective retry turned into a real answer. jevper keeps the schema in the
+prompt on this surface either way: a server that accepts a field and drops it is indistinguishable from one
+that never looked at it.
+
+One detail of the wire schema is Anthropic's, not jevper's: the API rejects *numerical constraints*, and a
+400 for one costs the field for the rest of the client's life, so each `minimum`/`maximum` is folded into
+the description of the field it bounded before the request goes out. vLLM takes the untransformed schema
+too (`{"n": 1}` for a `minimum: 0, maximum: 1` number), so the transform costs nothing locally and is what
+makes the field usable on the hosted API. The field travels in the request body rather than as an SDK
+keyword, because the oldest Anthropic SDK jevper supports has no `output_config` parameter at all.
+
+One knob does not reach this route: ollama honours `reasoning_effort: "none"` on its OpenAI routes and
+ignores it on `/v1/messages`, where the trace is still generated (a 256-token budget came back empty with
+`stop_reason: "max_tokens"`, and a 1024-token one answered with the trace attached as a thinking block).
 
 ## Sizing a 12 GB card
 

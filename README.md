@@ -54,6 +54,12 @@ pip install jevper
 
 Python 3.10+. The only runtime dependency is `pydantic>=2.7`.
 
+[Agent skill](https://github.com/zhulinchng/jevper-skill) for using this package:
+
+```sh
+npx skills add zhulinchng/jevper-skill
+```
+
 For development:
 
 ```sh
@@ -256,10 +262,14 @@ server:
   prompt already asks for one JSON object.
 - **Its schema field is Anthropic's own**, `output_config.format`, the counterpart of `response_format`:
   `structured`/`discrete` send it wherever the server takes it, and a server that refuses it gets it dropped
-  and the call re-asked, reported in `debug["server_limits"]["output_config"]`. The JSON Schema also stays
-  in the system prompt, because a server can take that field and discard it without a word — vLLM's
-  Messages request model drops what it does not model — and on none of the local servers is the answer's
-  shape constrained by the request.
+  and the call re-asked, reported in `debug["server_limits"]["output_config"]`. It travels in the request body
+  rather than as an SDK keyword, because the oldest Anthropic SDK jevper supports has no such parameter, and
+  the schema is rewritten for the API's documented subset first — Anthropic rejects numerical constraints, so
+  each `minimum`/`maximum` moves into the description of the field it bounded and the wire schema says
+  `Must be at least 0.` where the prompt still says `minimum: 0`. The JSON Schema also stays in the system
+  prompt: vLLM implements that field — a schema naming a constant the prompt never mentions comes back with
+  that constant in the answer — while llama.cpp, LM Studio and ollama accept it and ignore it, and a server
+  that discards a field it accepted looks exactly like one that never read it.
 - **`max_tokens` has no server-side default.** jevper sends `1024` — or `1024` plus the caller's thinking
   budget, because Anthropic requires the budget to be strictly *below* `max_tokens` and would otherwise refuse
   the 1024 its own docs call the floor. `extra_body={"max_tokens": n}` overrides both, and a value that cannot

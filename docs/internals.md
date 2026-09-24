@@ -251,16 +251,20 @@ Worth keeping when editing:
   `max_output_tokens`, `model_context_window_exceeded`) or any other non-terminal stop raises
   `IncompleteAnswerError`, and a refusal raises `ModelRefusalError`. Both are `ProviderError` subclasses and
   both are terminal, because a correction turn changes the prompt and not the budget the provider stopped at or
-  the fact that the model declined. The readouts keep the reason on the errors they raise for an answer that did
-  arrive but could not be read, including the two `parse_json_object` paths where the answer contained a `{` but
-  could not be parsed. `CallResult.refusal` carries the model's own words, so a refusal reads as a refusal
-  rather than as malformed JSON.
+  the fact that the model declined. The truncation message names the room that ran out: a spent context
+  window is told to shorten the state rather than to raise `max_tokens`, which would lengthen the request.
+  The readouts keep the reason on the errors they raise for an answer that did arrive but could not be
+  read, including the two `parse_json_object` paths where the answer contained a `{` but could not be
+  parsed. `CallResult.refusal` carries the model's own words, so a refusal reads as a refusal rather than
+  as malformed JSON.
 - Capability failures are not corrective-retried, and neither are refusals or a spent budget: a correction turn
  changes the prompt, not what the provider reports. Only the model-side failures (a non-label token, an
   unusable JSON shape) are worth another call.
-- A logprob readout needs at least two candidates. `top_logprobs` with nothing but the sampled token is not a
-  distribution, so it raises instead of reporting the answer as certain; a provider that reports entries but
-  nulls for some of them is the documented partial case and keeps `labels_missing` semantics.
+- A logprob readout needs at least two candidates, unless the question has only one option. `top_logprobs`
+  with nothing but the sampled token is not a distribution over a contest, so it raises instead of
+  reporting the answer as certain; with a single label there is no contest and the sampled token is the
+  answer, reported at probability 1.0. A provider that reports entries but nulls for some of them is
+  the documented partial case and keeps `labels_missing` semantics.
 
 ## Extending
 
