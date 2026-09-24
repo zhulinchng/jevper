@@ -285,6 +285,10 @@ class PromptParts:
     state_messages: Sequence[dict[str, str]]
     example_turns: Sequence[dict[str, str]]
     question_block: str
+    method: Method = "logprobs"
+    """The method these parts were rendered for. The answer shape — and with it the system prompt and
+    the schema — is part of the prefix a provider caches, so two methods must not share a routing key
+    even when their examples and question block are identical."""
 
 
 def system_prompt(method: Method) -> str:
@@ -310,7 +314,12 @@ def derived_cache_key(model: str, parts: PromptParts) -> str:
     question set keys alike.
     """
     digest = hashlib.sha256()
-    for chunk in (model, *(part for turn in parts.example_turns for part in turn.values()), parts.question_block):
+    for chunk in (
+        model,
+        parts.method,
+        *(part for turn in parts.example_turns for part in turn.values()),
+        parts.question_block,
+    ):
         digest.update(chunk.encode("utf-8"))
         digest.update(b"\x1f")
     return CACHE_KEY_PREFIX + digest.hexdigest()[:CACHE_KEY_DIGEST_CHARS]
@@ -334,6 +343,7 @@ def build_parts(
         state_messages=state_messages,
         example_turns=render_examples(examples, question, labels, method=method),
         question_block=render_question_block(question, labels),
+        method=method,
     )
 
 
@@ -369,11 +379,25 @@ def assemble(parts: PromptParts, *, system: str) -> list[dict[str, str]]:
     The state is never repeated. Each pass gets its own message dicts; the rendered strings are shared.
     """
     system, state = hoist_instructions(system, parts.state_messages)
+    question = {"role": "user", "content": parts.question_block}
+    state_turns = [dict(message) for message in state]
+    if state_turns and state_turns[-1]["role"] == "assistant":
+        # A state whose last turn is the assistant's leaves the conversation ending on that turn, which
+        # is not a question: the llama.cpp engines refuse it outright — ollama and LM Studio both answer
+        # ``400 Failed to initialize samplers: std::exception`` — and a server that reads it as a prefill
+        # continues the assistant's turn rather than answering. The question goes last in that one case,
+        # so the call ends where a question belongs.
+        return [
+            {"role": "system", "content": system},
+            *(dict(message) for message in parts.example_turns),
+            *state_turns,
+            question,
+        ]
     return [
         {"role": "system", "content": system},
         *(dict(message) for message in parts.example_turns),
-        {"role": "user", "content": parts.question_block},
-        *(dict(message) for message in state),
+        question,
+        *state_turns,
     ]
 
 

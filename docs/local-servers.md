@@ -205,11 +205,16 @@ release of each project that ships the route.
 No server returns logprobs through this route — the API has no field for one — so `method="structured"` or
 `"discrete"` is how to use it, and `method="auto"` resolves to `structured` there without spending a request
 to find out. `max_tokens` is required by vLLM's and SGLang's implementations and has no default on any of
-them, so jevper always sends one (1024 unless `extra_body={"max_tokens": n}` says otherwise). A `system` role
-*inside* `messages` is not part of the API, so jevper moves it to the top-level `system` field. Measured here,
-ollama, llama.cpp, vLLM and SGLang all answer `200` for one on this route: the `400 System message must be at
-the beginning.` that vLLM and SGLang give belongs to the *OpenAI* surfaces, where a state's own instruction
-turns would otherwise land in the middle of the conversation.
+them, so jevper always sends one: 1024, or 1024 plus the caller's `ReasoningConfig(budget_tokens=…)`, because
+this API also requires the thinking budget to be *strictly below* `max_tokens` and would refuse the 1024 its
+own documentation calls the floor. `extra_body={"max_tokens": n}` overrides both.
+
+Anthropic has since added mid-conversation `system` messages, but no server here implements them: they render
+a `system` turn positionally into the chat template, so jevper still moves it to the top-level `system` field,
+where it cannot be dropped or rejected. Measured here, ollama, llama.cpp, vLLM and SGLang all answer `200` for
+a `system` role inside `messages` on this route: the `400 System message must be at the beginning.` that vLLM
+and SGLang give belongs to the *OpenAI* surfaces, where a state's own instruction turns would otherwise land
+in the middle of the conversation.
 
 The reasoning parsers matter here too. With thinking left on — vLLM's and SGLang's templates default to it —
 the parser puts the whole generation into a thinking block and returns no text block at all, so there is no

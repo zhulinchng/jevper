@@ -15,18 +15,30 @@ ReasoningConfig(effort="medium", summary="auto", mode="auto")
 - `mode` — `auto`, `native`, `two_step`
 - `budget_tokens` — the thinking budget for the Messages surface's `thinking` field; unset sends no
   `thinking` at all, and `effort` is never translated into a budget, because the mapping between a name and
-  a token count is the caller's. Anthropic requires at least 1024 and strictly less than `max_tokens`
+  a token count is the caller's. Anthropic requires at least 1024 and strictly less than `max_tokens`, so
+  jevper's own `max_tokens` default grows by the budget whenever one is set: the answer keeps the whole
+  1024 and the thinking is paid for out of the extra. `extra_body={"max_tokens": n}` still wins outright.
+  A server that refuses the budget *value* — SGLang answers `budget_tokens: must be at least 1024` — gets
+  its own error back rather than a silent re-ask without thinking, because a bad number is not a missing
+  field. The field is only dropped, and remembered as this server's limit, when the server says it does not
+  know `thinking` at all.
 
 ## Mode resolution
 
 | `mode` | Responses surface | Chat Completions surface | Messages surface |
 | --- | --- | --- | --- |
-| `auto` (default) | `native` | `two_step` | `two_step` |
+| `auto` (default) | `native` | `two_step` | `two_step`, or `native` when `budget_tokens` is set |
 | `native` | provider reasoning on the answer call | `reasoning_effort` on the answer call | `thinking` on the answer call, when `budget_tokens` is set |
 | `two_step` | analysis call, then answer call | analysis call, then answer call | analysis call, then answer call |
 | reasoning not configured | off | off | off |
 
 `response.debug["reasoning_mode"]` reports what was actually used.
+
+On the Messages surface a budget resolves `auto` to `native`, because a budget is the only reason to ask
+for that surface's own thinking: `two_step` sends no `thinking` field at all, so a caller who set
+`budget_tokens` and left the mode alone would be paying for a two-step prompt path instead of getting
+the thinking they asked for. On Chat Completions `auto` stays `two_step` — `reasoning_effort` there is a
+separate decision, and the surface has no thinking budget to infer one from.
 
 ## Native
 

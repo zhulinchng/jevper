@@ -7,6 +7,8 @@ import json
 import threading
 import time
 import warnings
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from fakes import (
@@ -24,12 +26,14 @@ from jevper import (
     ClientCapabilityError,
     InvalidQuestionError,
     JevperError,
+    MalformedAnswerError,
     Noul,
     ProviderError,
     ReasoningConfig,
     RetryPolicy,
     Score,
     SystemOneClient,
+    reasoning_text,
 )
 
 CHOICE_LOGS = [("A", -0.12), ("B", -2.47), ("C", -3.48)]
@@ -203,11 +207,14 @@ def test_state_chat_messages_are_preserved_after_the_question_block(stub_server)
     )
 
     messages = stub.bodies("/chat/completions")[0]["messages"]
-    assert [message["role"] for message in messages] == ["system", "user", "user", "assistant"]
+    # The state ends on the assistant's turn, so the question goes last: llama.cpp's engines refuse a
+    # conversation that ends there — ollama and LM Studio both answer 400 "Failed to initialize
+    # samplers" — and a server that reads it as a prefill would continue it instead of answering.
+    assert [message["role"] for message in messages] == ["system", "user", "assistant", "user"]
     assert messages[0]["content"].startswith("You are a precise classification engine")
-    assert messages[1]["content"].startswith("Options:")
-    assert messages[2]["content"] == "I was charged twice."
-    assert messages[-1]["content"] == "Let me look into that."
+    assert messages[1]["content"] == "I was charged twice."
+    assert messages[2]["content"] == "Let me look into that."
+    assert messages[-1]["content"].startswith("Options:")
 
 
 def test_json_state_is_pretty_printed_into_one_turn(stub_server):
@@ -1011,7 +1018,30 @@ def test_a_state_without_an_instruction_turn_goes_last(stub_server):
     )
 
     messages = stub.bodies("/chat/completions")[0]["messages"]
-    assert [message["role"] for message in messages] == ["system", "user", "user", "assistant"]
+    # The last state turn is the assistant's, so the question turn follows it — see
+    # ``test_a_state_that_ends_with_the_assistant_keeps_the_question_last``.
+    assert [message["role"] for message in messages] == ["system", "user", "assistant", "user"]
+    assert messages[-1]["content"].startswith("Options:")
+
+
+def test_a_state_that_ends_with_the_assistant_keeps_the_question_last(stub_server):
+    """The one state shape where the question turn does not come before the state."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    client.system_one(
+        state=[
+            {"role": "user", "content": "I was charged twice."},
+            {"role": "assistant", "content": "Looking."},
+            {"role": "user", "content": "It happened again."},
+        ],
+        questions={"q": Choice(criteria={"billing": None, "sales": None})},
+    )
+
+    # Ending on a *user* turn is the common shape and keeps the documented order: the question first, so
+    # the state stays the tail that changes and the prefix stays reusable.
+    messages = stub.bodies("/chat/completions")[0]["messages"]
+    assert [message["role"] for message in messages] == ["system", "user", "user", "assistant", "user"]
     assert messages[1]["content"].startswith("Options:")
 
 
@@ -1029,3 +1059,596 @@ def test_a_state_of_only_instructions_leaves_no_state_turn(stub_server):
     assert [message["role"] for message in messages] == ["system", "user"]
     assert messages[0]["content"].endswith("Answer as a support triage assistant.")
     assert messages[1]["content"].startswith("Options:")
+
+
+# -- verdicts belong to the surface and the request that produced them ---------------------------
+
+
+def test_a_delayed_surface_failure_does_not_write_off_the_working_surface(stub_server):
+    """Workers share one call context, so a failure must be judged against its own transport.
+
+    Question 2's Responses call fails only *after* question 1 has failed over to Chat and been
+    answered. Read against the shared context — which by then says Chat — the 404 looks like a Chat
+    route that does not exist, and the surface that just answered is written off for the rest of the
+    client's life.
+    """
+    answered = threading.Event()
+    seen = {"responses": 0}
+
+    def responses(_body):
+        seen["responses"] += 1
+        if seen["responses"] > 1:
+            answered.wait(timeout=10)
+        return 404, {"error": {"message": "no such route"}}
+
+    def chat(_body):
+        answered.set()
+        return 200, chat_body(content="A", logprobs=CHOICE_LOGS)
+
+    stub = stub_server(chat=chat, responses=responses)
+    client = SystemOneClient(openai_client(stub), model="stub", max_concurrency=2)
+
+    response = client.system_one(
+        state="s",
+        questions={"first": Choice(criteria=CRITERIA), "second": Choice(criteria=CRITERIA)},
+    )
+
+    assert [answer.choice for answer in response.answers.values()] == ["billing", "billing"]
+    assert client._missing_surfaces == {"responses"}
+
+
+def test_a_downgrade_gives_the_new_request_shape_its_own_retry_budget(stub_server):
+    """The attempts one request shape spent say nothing about the shape it is replaced with."""
+    seen: list[str] = []
+
+    def script(body):
+        kind = (body.get("response_format") or {}).get("type")
+        seen.append(str(kind))
+        if len(seen) == 1:
+            return 500, {"error": {"message": "bad minute"}}
+        if kind == "json_schema":
+            return unsupported("response_format")
+        if len(seen) == 3:
+            return 500, {"error": {"message": "another bad minute"}}
+        return 200, chat_body(content=STRUCTURED)
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        method="structured",
+        retry=RetryPolicy(n_retries=1, base_delay=0.0),
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+    assert seen == ["json_schema", "json_schema", "json_object", "json_object"]
+
+
+# -- a caller's own request fields -------------------------------------------------------------
+
+
+def test_a_caller_cache_key_is_dropped_with_the_refused_field(stub_server):
+    """The key the caller put in ``extra_body`` reaches the wire last, so the ladder has to drop it too.
+
+    Otherwise the re-ask is byte-for-byte the same request and the call fails on a field jevper was
+    supposed to have removed.
+    """
+    def script(body):
+        if "prompt_cache_key" in body:
+            return unsupported("prompt_cache_key")
+        return 200, chat_body(content=STRUCTURED)
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        method="structured",
+        extra_body={"prompt_cache_key": "hand-rolled"},
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+    assert [("prompt_cache_key" in body) for body in stub.bodies("/chat/completions")] == [True, False]
+    assert response.debug["server_limits"]["cache_key"] is False
+
+
+def test_a_caller_format_field_puts_the_schema_in_the_prompt(stub_server):
+    """The caller's ``response_format`` wins on the wire, so the request carries no schema of ours."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        method="structured",
+        extra_body={"response_format": {"type": "json_object"}},
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    sent = stub.bodies("/chat/completions")[0]
+    assert sent["response_format"] == {"type": "json_object"}
+    assert "JSON Schema" in sent["messages"][0]["content"]
+    assert response.answers["q"].choice == "billing"
+
+
+# -- refusals that are not about logprobs ------------------------------------------------------
+
+
+def test_an_include_refusal_on_a_reasoning_request_drops_the_include(stub_server):
+    """The Responses ``include`` list carries reasoning as well as logprobs.
+
+    A request that asked for no logprobs can still be refused for that path, and reading it as a logprob
+    rejection would skip the include rung of the ladder and fail a call the server would have answered.
+    """
+    def script(body):
+        if "reasoning.encrypted_content" in (body.get("include") or []):
+            return 400, {
+                "error": {
+                    "message": 'Invalid option: expected one of "file_search_call.results"',
+                    "param": "include",
+                }
+            }
+        return 200, responses_body(text=STRUCTURED)
+
+    stub = stub_server(responses=script)
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="responses", method="structured"
+    )
+
+    response = client.system_one(
+        state="s",
+        questions={"q": Choice(criteria=CRITERIA)},
+        reasoning=ReasoningConfig(mode="native"),
+    )
+
+    assert response.answers["q"].choice == "billing"
+    assert "include" not in stub.bodies("/responses")[1]
+    assert response.debug["server_limits"]["include"] is False
+
+
+def test_a_value_rejected_logprob_request_does_not_move_the_surface(stub_server):
+    """A cap on ``top_logprobs`` is not a missing capability, so the surface keeps its turn."""
+    def responses(body):
+        if body.get("top_logprobs") is not None:
+            return 400, {
+                "error": {"message": "Invalid 'top_logprobs': integer must be between 0 and 5"}
+            }
+        return 200, responses_body(text=STRUCTURED)
+
+    stub = stub_server(
+        responses=responses, chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS))
+    )
+    client = SystemOneClient(openai_client(stub), model="stub")
+
+    first = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    second = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert first.answers["q"].choice == "billing"
+    assert second.answers["q"].choice == "billing"
+    # Each call asks Responses first: one bad value is not a verdict about the surface, so the
+    # label readout keeps trying the surface that can carry a distribution.
+    assert [path for path in stub.paths if path.endswith("/chat/completions")] == []
+    assert len(stub.bodies("/responses")) == 4
+
+
+# -- answer shapes a provider should not be able to break --------------------------------------
+
+
+def test_a_sglang_top_level_reasoning_count_is_read(stub_server):
+    """SGLang reports ``usage.reasoning_tokens`` beside the OpenAI nested shape, not inside it."""
+    body = chat_body(content="A", logprobs=CHOICE_LOGS, reasoning_tokens=None)
+    body["usage"]["reasoning_tokens"] = 160
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.usage.reasoning_tokens == 160
+
+
+def test_a_chat_refusal_is_reported_as_a_refusal(stub_server):
+    """``content`` is null and ``refusal`` holds the model's own words; both are the API's shape."""
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content=None, refusal="I cannot help with that."))
+    )
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        method="structured",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(MalformedAnswerError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "refused to answer" in str(error.value)
+    assert "I cannot help with that." in str(error.value)
+
+
+def test_a_truncated_answer_names_the_budget_even_when_it_parsed_partially(stub_server):
+    """The ``{`` is there, the rest is not: the parse error is real and the budget is the reason."""
+    stub = stub_server(
+        chat=lambda _: (
+            200,
+            chat_body(content='{"probabilities": {"billing": 0.5', finish_reason="length"),
+        )
+    )
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        method="structured",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(MalformedAnswerError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "ran out of output tokens" in str(error.value)
+    assert "length" in str(error.value)
+
+
+def test_an_unusable_first_choice_is_read_as_no_choice_at_all(stub_server):
+    """A 200 whose only choice is null, with the provider's failure beside it, is that failure."""
+    stub = stub_server(
+        chat=lambda _: (200, {"choices": [None], "error": {"message": "overloaded", "code": 503}})
+    )
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        retry=RetryPolicy(n_retries=0),
+    )
+
+    with pytest.raises(ProviderError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "overloaded" in str(error.value)
+    assert error.value.status_code == 503
+
+
+def test_a_reasoning_item_whose_dump_is_not_a_mapping_is_skipped():
+    """Reasoning is decoration: a client object that cannot be read must not cost the answer.
+
+    ``_as_mapping`` promises that an unreadable object maps to nothing, and a duck-typed client is
+    free to be one — the reasoning item here dumps to ``None``, which the old code handed straight to
+    a ``.get`` and took the whole answer down with it.
+    """
+    from jevper.transport import _chat_result
+
+    class Broken:
+        type = "reasoning"
+
+        def model_dump(self):
+            return None
+
+    body = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="A", reasoning=[Broken()]))],
+        usage=None,
+    )
+
+    result = _chat_result(body, {})
+
+    assert result.text == "A"
+    assert reasoning_text(result.reasoning) == ""
+
+
+def test_an_unreadable_token_count_is_reported_as_unreported(stub_server):
+    """``int(float("inf"))`` raises OverflowError; a provider bug must not escape the call."""
+    body = chat_body(content="A", logprobs=CHOICE_LOGS)
+    body["usage"]["prompt_tokens"] = float("inf")
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+    assert response.usage.input_tokens is None
+    assert response.usage.output_tokens == 3
+
+
+# -- what the caller pinned, and what they sent ------------------------------------------------
+
+
+def test_an_exhausted_surface_fallback_is_a_provider_error(stub_server):
+    """Both routes 404: the caller gets the public error, with the status and the attempt history."""
+    stub = stub_server(
+        chat=lambda _: (404, {"error": {"message": "no such route"}}),
+        responses=lambda _: (404, {"error": {"message": "no such route"}}),
+    )
+    client = SystemOneClient(openai_client(stub), model="stub")
+
+    with pytest.raises(ProviderError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert error.value.status_code == 404
+    assert [attempt["surface"] for attempt in error.value.attempts] == ["responses", "chat_completions"]
+
+
+def test_no_schema_rung_is_spent_when_structured_outputs_is_off(stub_server):
+    """The request already carried ``json_object``, so the next rung is no format field at all."""
+    seen: list[Any] = []
+
+    def script(body):
+        seen.append((body.get("response_format") or {}).get("type"))
+        if "response_format" in body:
+            return unsupported("response_format")
+        return 200, chat_body(content=STRUCTURED)
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        method="structured",
+        structured_outputs=False,
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+    assert seen == ["json_object", None]
+    assert response.debug["server_limits"]["structured"] == "none"
+
+
+def test_a_same_surface_downgrade_keeps_the_auto_fallback(stub_server):
+    """Reloading the method on a same-surface downgrade would undo the fallback this call chose."""
+    seen: list[tuple[Any, Any]] = []
+
+    def script(body):
+        seen.append((body.get("top_logprobs"), (body.get("response_format") or {}).get("type")))
+        if body.get("top_logprobs") is not None:
+            return 200, chat_body(content="A")  # answered, but with no logprobs at all
+        if (body.get("response_format") or {}).get("type") == "json_schema":
+            return unsupported("response_format")
+        return 200, chat_body(content=STRUCTURED)
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", max_concurrency=1
+    )
+
+    response = client.system_one(
+        state="s",
+        questions={"first": Choice(criteria=CRITERIA), "second": Choice(criteria=CRITERIA)},
+    )
+
+    assert [answer.choice for answer in response.answers.values()] == ["billing", "billing"]
+    assert response.debug["methods"] == {"first": "structured", "second": "structured"}
+    # The first question pays for the probe, the schema refusal and the object rung; the second one
+    # takes the fallback and the remembered limit without paying for either again.
+    assert seen == [
+        (20, None),
+        (None, "json_schema"),
+        (None, "json_object"),
+        (None, "json_object"),
+    ]
+
+
+@pytest.mark.parametrize("override", ["", "bogus"])
+def test_an_explicit_api_override_is_validated_before_any_request(stub_server, override):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub")
+
+    with pytest.raises(JevperError):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}, api=override)
+
+    assert stub.requests == []
+
+
+def test_an_explicit_empty_method_is_refused_rather_than_ignored(stub_server):
+    """An empty string is a caller mistake, not a request for the constructor's default."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", method="logprobs"
+    )
+
+    with pytest.raises(JevperError):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}, method="")
+
+    assert stub.requests == []
+
+
+def test_extra_headers_reach_the_wire(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        extra_headers={"X-Jevper-Probe": "1"},
+    )
+
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    sent = {name.lower(): value for name, value in stub.headers[0].items()}
+    assert sent.get("x-jevper-probe") == "1"
+
+
+def test_temperature_reaches_the_wire_on_both_openai_surfaces(stub_server):
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)),
+        responses=lambda _: (200, responses_body(text="A", logprobs=CHOICE_LOGS)),
+    )
+    chat = SystemOneClient(openai_client(stub), model="stub", api="chat_completions", temperature=0.0)
+    chat.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    assert stub.bodies("/chat/completions")[0]["temperature"] == 0.0
+
+    responses = SystemOneClient(openai_client(stub), model="stub", api="responses", temperature=0.5)
+    responses.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    assert stub.bodies("/responses")[0]["temperature"] == 0.5
+
+
+def test_the_backoff_follows_the_policy(stub_server, monkeypatch):
+    """``base_delay`` grows by threes and stops at ``max_delay``; the sleeps are the observable."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    def script(_body):
+        return 503, {"error": {"message": "later"}}
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        method="logprobs",
+        retry=RetryPolicy(n_retries=3, base_delay=0.5, max_delay=8.0),
+    )
+
+    with pytest.raises(ProviderError):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert sleeps == [0.5, 1.5, 4.5]
+
+
+@pytest.mark.parametrize("status", [502, 504, 529])
+def test_every_documented_transient_status_is_retried(stub_server, status):
+    seen: list[int] = []
+
+    def script(_body):
+        seen.append(status)
+        if len(seen) == 1:
+            return status, {"error": {"message": "later"}}
+        return 200, chat_body(content="A", logprobs=CHOICE_LOGS)
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        retry=RetryPolicy(n_retries=1, base_delay=0.0),
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+    assert response.usage.n_retries == 1
+
+
+def test_the_debug_payload_carries_its_documented_keys(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", method="logprobs"
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert {
+        "method",
+        "api",
+        "reasoning_mode",
+        "llm_attempts",
+        "retry_reasons",
+        "probability_errors",
+        "original_probabilities",
+        "labels_missing",
+    } <= set(response.debug)
+    # The two optional keys appear only when they have something to say.
+    assert "methods" not in response.debug and "server_limits" not in response.debug
+
+
+def test_the_first_failing_question_in_insertion_order_is_the_one_raised(stub_server):
+    """Two questions fail; the caller is told about the one they asked about first."""
+    other = {"billing": None, "refunds": None}
+
+    def script(body):
+        if "refunds" in json.dumps(body):
+            return 400, {"error": {"message": "second question is broken"}}
+        return 400, {"error": {"message": "first question is broken"}}
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        retry=RetryPolicy(n_retries=0),
+        max_concurrency=2,
+    )
+
+    with pytest.raises(ProviderError) as error:
+        client.system_one(
+            state="s",
+            questions={"first": Choice(criteria=CRITERIA), "second": Choice(criteria=other)},
+        )
+
+    assert "first question is broken" in str(error.value)
+    assert len(stub.requests) == 2  # both were attempted; the answer is about the first
+
+
+def test_an_async_transient_failure_is_retried_and_counted(stub_server):
+    """The async driver has its own retry loop, so it needs its own proof of it."""
+    seen: list[int] = []
+
+    def script(_body):
+        seen.append(1)
+        if len(seen) == 1:
+            return 503, {"error": {"message": "later"}}
+        return 200, chat_body(content="A", logprobs=CHOICE_LOGS)
+
+    stub = stub_server(chat=script)
+    client = AsyncSystemOneClient(
+        async_openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        retry=RetryPolicy(n_retries=1, base_delay=0.0),
+    )
+
+    response = asyncio.run(client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}))
+
+    assert response.answers["q"].choice == "billing"
+    assert response.usage.n_retries == 1
+    assert [attempt["error"] for attempt in response.debug["llm_attempts"]] == [
+        "InternalServerError: Error code: 503 - {'error': {'message': 'later'}}",
+        None,
+    ]
+
+
+def test_an_async_malformed_answer_is_retried_with_a_correction(stub_server):
+    seen: list[dict] = []
+
+    def script(body):
+        seen.append(body)
+        if len(seen) == 1:
+            return 200, chat_body(content="not json at all")
+        return 200, chat_body(content=STRUCTURED)
+
+    stub = stub_server(chat=script)
+    client = AsyncSystemOneClient(
+        async_openai_client(stub), model="stub", api="chat_completions", method="structured"
+    )
+
+    response = asyncio.run(client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}))
+
+    assert response.answers["q"].choice == "billing"
+    assert len(seen) == 2
+    assert "invalid" in seen[1]["messages"][-1]["content"]
+    (reason,) = response.debug["retry_reasons"]
+    assert reason.startswith("no JSON object in the answer (Expecting value: line 1 column 1 (char 0))")
+
+
+def test_examples_are_validated_before_the_first_provider_call(stub_server):
+    """A locally invalid call must cost nothing: the second question's example is checked up front."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", method="structured", max_concurrency=1
+    )
+
+    with pytest.raises(InvalidQuestionError):
+        client.system_one(
+            state="s",
+            questions={
+                "first": Choice(criteria=CRITERIA),
+                "second": Choice(
+                    criteria=CRITERIA,
+                    examples=[{"state": "charged twice", "answer": "not-an-option"}],
+                ),
+            },
+        )
+
+    assert stub.requests == []

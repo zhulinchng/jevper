@@ -226,20 +226,35 @@ def _answer_tokens(result: CallResult) -> tuple[TokenLogprob, ...]:
     return tokens
 
 
+_TRUNCATED_STOPS = frozenset(
+    {"length", "max_tokens", "max_output_tokens", "model_context_window_exceeded"}
+)
+"""What each surface calls "the output budget ran out": Chat Completions ``length``, the Messages API
+``max_tokens`` and ``model_context_window_exceeded``, the Responses surface ``max_output_tokens``."""
+
+
 def _stop_note(result: CallResult) -> str:
     """Why the provider stopped, when it stopped before writing an answer.
 
     A reasoning model can spend the entire output budget thinking: vLLM and SGLang answer with
     ``status: "incomplete"`` and an empty message, llama.cpp and ollama with ``finish_reason:
-    "length"`` and nothing but reasoning tokens. "No non-whitespace token in the response" is true
-    and useless; the budget is the actionable fact.
+    "length"`` and nothing but reasoning tokens, and the Messages API with ``stop_reason: "max_tokens"``.
+    "No non-whitespace token in the response" is true and useless; the budget is the actionable fact.
+
+    A refusal is the other reason an answer never arrives: OpenAI reports it in a ``refusal`` sibling of
+    ``content``, the Messages API as ``stop_reason: "refusal"``. Both read as a missing JSON object
+    otherwise, which sends a caller looking for a parsing bug that is not there.
     """
-    if result.stop in ("length", "max_output_tokens"):
+    if result.stop in _TRUNCATED_STOPS:
         return (
             f" — the provider ran out of output tokens before the answer was complete "
             f"({result.stop!r}); raise the limit, for example extra_body={{'max_tokens': 2048}}"
         )
     note = f" — the provider reported {result.stop!r}" if result.stop is not None else ""
+    if result.refusal:
+        note += f" — the model refused to answer: {result.refusal[:200]!r}"
+    elif result.stop == "refusal":
+        note += " — the model refused to answer"
     if not result.text.strip() and result.reasoning:
         # A reasoning parser can put the whole generation in the reasoning channel and send no answer
         # at all: vLLM and SGLang do exactly that whenever thinking is on, which is a deployment
@@ -259,6 +274,7 @@ def first_answer_token(result: CallResult, labels: Sequence[str], *, method: Met
             f"report them — use method='structured' for the model's own probabilities, or "
             f"method='discrete' for one label, neither of which needs logprobs{_stop_note(result)}",
             evidence="readout",
+            surface=result.surface,
         )
     for token in _answer_tokens(result):
         if not token.token.strip():
@@ -296,6 +312,7 @@ def _logprob_readout(
             f"{token.token!r} (method={method!r}), which is not a distribution over the options; use "
             f"method='structured' for the model's own probabilities, or method='discrete' for one label",
             evidence="readout",
+            surface=result.surface,
         )
     answer_label = token.token.strip().upper()
     logprobs: dict[str, float] = {label: float("-inf") for label in labels}
@@ -327,11 +344,18 @@ def readout_grammar(result: CallResult, question: Question, labels: Sequence[str
         raise _LogprobsUnavailable(
             "grammar mode needs logprobs in the response; pass method='discrete' to skip probabilities",
             evidence="readout",
+            surface=result.surface,
         )
     return _logprob_readout(result, question, labels, "grammar", "grammar")
 
 
 def parse_json_object(text: str, note: str = "") -> dict[str, Any]:
+    """The one JSON object in an answer, with the reason it stopped travelling on every failure.
+
+    ``note`` says why the provider stopped, and it belongs on all three failure paths: an answer cut off
+    mid-object — which is what a spent output budget looks like, and the ``{`` is there but the rest is
+    not — reads as a parse bug otherwise, when the actionable fact is the budget.
+    """
     try:
         value = json.loads(text)
     except json.JSONDecodeError as first_error:
@@ -343,9 +367,11 @@ def parse_json_object(text: str, note: str = "") -> dict[str, Any]:
         try:
             value, _ = json.JSONDecoder().raw_decode(text[start:])
         except ValueError as exc:
-            raise MalformedAnswerError(f"could not parse a JSON object from the answer ({exc})") from exc
+            raise MalformedAnswerError(
+                f"could not parse a JSON object from the answer ({exc}){note}"
+            ) from exc
     if not isinstance(value, dict):
-        raise MalformedAnswerError(f"expected a JSON object, got {type(value).__name__}")
+        raise MalformedAnswerError(f"expected a JSON object, got {type(value).__name__}{note}")
     return value
 
 

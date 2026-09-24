@@ -162,7 +162,16 @@ the ladder at a time (`json_schema` → `json_object` → no `response_format` a
 include), and the limit is remembered for the rest of the client's life. None of the three is needed to answer —
 the prompt already asks for one JSON object and the readout validates it — so the question is answered instead
 of failing. The ladder is finite, so a server that refuses everything still ends in a `ProviderError`, and
-`debug["server_limits"]` reports what was learned.
+`debug["server_limits"]` reports what was learned. A field the caller put in `extra_body` is dropped with it:
+the SDK merges `extra_body` last, so leaving it there would re-send the refused field under another name.
+
+A refusal of the *value* is not a refusal of the field, and the difference decides whether the field may be
+dropped at all. `budget_tokens: must be at least 1024`, `Invalid 'top_logprobs': integer must be between 0 and
+5`, `reasoning_effort must be one of low, medium, high` — each names a field the server knows and a number it
+will not take. Dropping the field there would answer the question with the caller's reasoning quietly switched
+off, and remember that as the server's limit for a configuration the caller never repeated, so the provider's
+own error travels back instead and nothing is cached. Only a complaint about the field's *existence* — `Extra
+inputs are not permitted`, `is not supported`, `Cannot find field` — moves the ladder.
 
 ## `logprobs`
 
@@ -324,3 +333,18 @@ schema.` — and re-issues the answer call up to `n_retry_malformed` times (defa
 A `LabelReadoutError` that says the provider cannot report logprobs — no logprobs at all, or no alternatives
 for the answer token — is not corrected, because another turn cannot change what the provider returns;
 `method="auto"` answers those questions with `structured` instead.
+
+When there is no answer to read at all, the message says why, because the parse error alone sends a caller
+looking for a bug that is not there:
+
+- **The output budget ran out.** Each surface has its own word for it — Chat Completions `finish_reason:
+  "length"`, the Messages API `stop_reason: "max_tokens"` or `"model_context_window_exceeded"`, the Responses
+  surface `status: "incomplete"` with `incomplete_details.reason: "max_output_tokens"` — and all of them reach
+  the caller as *the provider ran out of output tokens before the answer was complete*, with the field to raise.
+  This holds however the answer was cut off: mid-object, or with no `{` at all.
+- **The model refused.** OpenAI reports a safety refusal in a `refusal` sibling of a null `content`, and the
+  Messages API as `stop_reason: "refusal"`. The message carries the model's own words, so a refusal reads as a
+  refusal rather than as malformed JSON.
+- **The server separated reasoning from the answer and sent no answer.** A reasoning parser with thinking on
+  does this (see [`local-servers.md`](local-servers.md)), and the message says so instead of "no non-whitespace
+  token in the response".

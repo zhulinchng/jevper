@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -254,3 +255,50 @@ def test_a_reasoning_part_without_a_dict_is_skipped():
     response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
 
     assert response.answers["q"].choice == "billing"
+
+
+def test_a_budget_edited_after_construction_is_still_validated():
+    """The constructor is not the only way in, and the invalid number would reach the provider.
+
+    Without assignment validation, ``config.budget_tokens = 0`` skips the validator and jevper
+    serializes ``thinking={"type": "enabled", "budget_tokens": 0}`` — a value the same config refuses
+    when it is passed to the constructor.
+    """
+    config = ReasoningConfig(mode="native", budget_tokens=2048)
+
+    with pytest.raises(ValueError):
+        config.budget_tokens = 0
+    assert config.budget_tokens == 2048
+
+
+@pytest.mark.parametrize("budget", [1024, 2048])
+def test_a_thinking_budget_is_not_sent_on_the_openai_surfaces(stub_server, budget):
+    """Only the Messages API has a budget field; the OpenAI surfaces carry an effort and an object."""
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)),
+        responses=lambda _: (200, responses_body(text="A", logprobs=CHOICE_LOGS)),
+    )
+    config = ReasoningConfig(mode="native", effort="low", budget_tokens=budget)
+
+    SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", reasoning=config
+    ).system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    SystemOneClient(
+        openai_client(stub), model="stub", api="responses", reasoning=config
+    ).system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    chat = stub.bodies("/chat/completions")[0]
+    responses = stub.bodies("/responses")[0]
+    assert chat["reasoning_effort"] == "low"
+    assert "budget_tokens" not in json.dumps(chat) and "thinking" not in json.dumps(chat)
+    assert responses["reasoning"] == {"effort": "low"}
+    assert "budget_tokens" not in json.dumps(responses)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("effort", "enormous"), ("summary", "verbose"), ("context", "history"), ("mode", "sometimes")],
+)
+def test_an_unknown_reasoning_value_is_refused_locally(field, value):
+    with pytest.raises(ValueError):
+        ReasoningConfig(**{field: value})

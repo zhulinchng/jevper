@@ -198,9 +198,10 @@ client.system_one(state=record_b, questions=rubric)   # the shared prefix is reu
 Two things make it steerable and observable:
 
 - **`prompt_cache_key`** is sent with every request, derived per question from the parts of the prompt that do
-  not change between calls — model, examples, question block — so a rubric's requests are routed together.
-  Pass your own to group or account for them your way, on the client (`prompt_cache_key="tenant-42"`) or per
-  call. A server that refuses the field gets it dropped and the call re-asked, like the other optional fields.
+  not change between calls — model, method, examples, question block — so a rubric's requests are routed
+  together, and a `logprobs` request is not routed with a `structured` one whose prefix differs. Pass your own
+  to group or account for them your way, on the client (`prompt_cache_key="tenant-42"`) or per call. A server
+  that refuses the field gets it dropped and the call re-asked, like the other optional fields.
 - **`usage.cached_tokens`** is the prompt tokens the provider read from its cache, summed over the call.
   `None` means the provider said nothing — vLLM needs `--enable-prompt-tokens-details`, and SGLang's Chat
   Completions route needs `--enable-cache-report` — while a reported `0` means a cold or disabled cache.
@@ -236,13 +237,15 @@ server:
 - **There is no schema field either**, so `structured`/`discrete` put the JSON Schema in the system prompt. The
   answer's shape is then only as good as the model's instruction-following, where the other surfaces constrain
   it in the request itself.
-- **`max_tokens` has no server-side default.** jevper sends `1024`; override it with
-  `extra_body={"max_tokens": n}`.
-- **Thinking is asked for with a budget, not an effort name.** `ReasoningConfig(mode="native",
-  budget_tokens=2048)` sends `thinking={"type": "enabled", "budget_tokens": 2048}`. Anthropic requires that
-  budget to be at least 1024 and below `max_tokens`; a server whose protocol has no `thinking` field at all
-  (vLLM's) refuses it, and the field is dropped, the call re-asked, and the limit reported in
-  `debug["server_limits"]["thinking"]`.
+- **`max_tokens` has no server-side default.** jevper sends `1024` — or `1024` plus the caller's thinking
+  budget, because Anthropic requires the budget to be strictly *below* `max_tokens` and would otherwise refuse
+  the 1024 its own docs call the floor. `extra_body={"max_tokens": n}` overrides both.
+- **Thinking is asked for with a budget, not an effort name.** `ReasoningConfig(budget_tokens=2048)` sends
+  `thinking={"type": "enabled", "budget_tokens": 2048}`: a budget is the only reason to ask for this surface's
+  own thinking, so it selects it even under `mode="auto"`. A server that refuses the field gets it dropped and
+  the call re-asked, reported in `debug["server_limits"]["thinking"]`; a server that refuses the *value* —
+  SGLang answers `budget_tokens: must be at least 1024` — gets its own error back instead, because a bad
+  number is not a missing field.
 
 Thinking blocks come back as ordinary `response.reasoning` parts with the block's `signature` kept, and
 `usage.cached_tokens` is read from `cache_read_input_tokens`. Which servers implement the route, and since

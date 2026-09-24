@@ -19,10 +19,12 @@ Script = Callable[[dict[str, Any]], "tuple[int, dict[str, Any]]"]
 
 def chat_body(
     *,
-    content: str,
+    content: str | None,
     logprobs: Sequence[tuple[str, float]] | None = None,
     alternatives: Sequence[tuple[str, float]] | None = None,
     reasoning: str | None = None,
+    refusal: str | None = None,
+    finish_reason: str = "stop",
     input_tokens: int | None = 10,
     output_tokens: int | None = 3,
     reasoning_tokens: int | None = 0,
@@ -30,11 +32,17 @@ def chat_body(
 ) -> dict[str, Any]:
     """A ``chat.completion`` body. ``logprobs`` is the generated token stream for the answer, first
     entry first; the answer token's ``top_logprobs`` is the whole sequence unless ``alternatives``
-    says otherwise — a stream that carries reasoning tokens needs the distribution spelled out."""
+    says otherwise — a stream that carries reasoning tokens needs the distribution spelled out.
+
+    ``content`` may be ``None``: that is what the API returns when a model refuses (with ``refusal``
+    set beside it) or answers with tool calls only.
+    """
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if reasoning is not None:
         message["reasoning_content"] = reasoning
-    choice: dict[str, Any] = {"index": 0, "finish_reason": "stop", "message": message}
+    if refusal is not None:
+        message["refusal"] = refusal
+    choice: dict[str, Any] = {"index": 0, "finish_reason": finish_reason, "message": message}
     if logprobs is not None:
         distribution = logprobs if alternatives is None else alternatives
         choice["logprobs"] = {
@@ -197,6 +205,8 @@ class StubServer:
         self.messages = messages
         self.requests: list[dict[str, Any]] = []
         self.paths: list[str] = []
+        self.headers: list[dict[str, Any]] = []
+        """Request headers per call, so a test can prove an ``extra_headers`` value reached the wire."""
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -208,6 +218,7 @@ class StubServer:
                 body = json.loads(raw or b"{}")
                 stub.requests.append(body)
                 stub.paths.append(self.path)
+                stub.headers.append(dict(self.headers))
                 if self.path.endswith("/responses"):
                     script = stub.responses
                 elif self.path.endswith("/messages"):

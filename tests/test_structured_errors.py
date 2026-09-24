@@ -1,0 +1,304 @@
+"""Client-side validation of structured and discrete answers.
+
+Every case goes through the real client and the real ``openai`` SDK talking to ``StubServer``, so what
+is pinned is the caller's outcome — the answer, or the exception type and the message it carries —
+rather than the parse path behind it. A malformed answer costs one corrective retry (the default
+``n_retry_malformed=1``), so a rejected answer is asked for twice before the error reaches the caller.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+from fakes import chat_body, openai_client
+
+from jevper import Choice, MalformedAnswerError, Noul, Score, SystemOneClient
+
+STATE = "My invoice shows a charge I do not recognize and I need it explained."
+CRITERIA = {"billing": None, "technical": None, "sales": None}
+LEVELS = ["Calm", "Frustrated", "Very angry"]
+
+
+def structured_client(stub_server, content, **kwargs):
+    """A structured call whose provider answer is ``content`` verbatim."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content=content)))
+    return SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions", **kwargs
+    )
+
+
+def discrete_client(stub_server, content, **kwargs):
+    """A discrete call whose provider answer is ``content`` verbatim."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content=content)))
+    return SystemOneClient(
+        openai_client(stub), model="stub", method="discrete", api="chat_completions", **kwargs
+    )
+
+
+# --- finding the object in the answer ----------------------------------------------------------
+
+
+def test_structured_reads_the_object_inside_prose(stub_server):
+    content = (
+        "The customer is asking about an invoice.\n"
+        '{"probabilities": {"billing": 0.8, "technical": 0.1, "sales": 0.1}}\n'
+        "Let me know if you need anything else."
+    )
+    client = structured_client(stub_server, content)
+
+    response = client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
+
+    answer = response.answers["q"]
+    assert answer.choice == "billing"
+    assert answer.probabilities == {"billing": 0.8, "technical": 0.1, "sales": 0.1}
+
+
+def test_structured_reads_the_object_inside_a_markdown_fence(stub_server):
+    content = '```json\n{"probabilities": {"billing": 0.2, "technical": 0.3, "sales": 0.5}}\n```'
+    client = structured_client(stub_server, content)
+
+    response = client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
+
+    answer = response.answers["q"]
+    assert answer.choice == "sales"
+    assert answer.probabilities == {"billing": 0.2, "technical": 0.3, "sales": 0.5}
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("[1, 2, 3]", "expected a JSON object, got list"),
+        ('"billing"', "expected a JSON object, got str"),
+        ("42", "expected a JSON object, got int"),
+        ("null", "expected a JSON object, got NoneType"),
+        ("true", "expected a JSON object, got bool"),
+    ],
+)
+def test_structured_rejects_anything_that_is_not_a_json_object(stub_server, content, expected):
+    client = structured_client(stub_server, content)
+
+    with pytest.raises(MalformedAnswerError) as error:
+        client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
+
+    assert expected in str(error.value)
+
+
+def test_structured_rejects_a_trailing_comma(stub_server):
+    content = '{"probabilities": {"billing": 0.5, "technical": 0.3, "sales": 0.2,}}'
+    client = structured_client(stub_server, content)
+
+    with pytest.raises(MalformedAnswerError) as error:
+        client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "could not parse a JSON object" in str(error.value)
+
+
+# --- the numbers inside a structured answer ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("probabilities", "expected"),
+    [
+        ({"billing": 0.5, "technical": 0.5}, ["must have exactly the option keys", "'sales'"]),
+        (
+            {"billing": 0.5, "technical": 0.3, "sales": 0.1, "other": 0.1},
+            ["must have exactly the option keys", "'other'"],
+        ),
+        (
+            {"billing": "high", "technical": 0.3, "sales": 0.1},
+            ["probability for 'billing' must be a finite number", "'high'"],
+        ),
+        (
+            {"billing": -0.5, "technical": 0.3, "sales": 0.1},
+            ["probability for 'billing' must be >= 0", "-0.5"],
+        ),
+        (
+            {"billing": float("nan"), "technical": 0.3, "sales": 0.1},
+            ["probability for 'billing' must be a finite number"],
+        ),
+        (
+            {"billing": float("inf"), "technical": 0.3, "sales": 0.1},
+            ["probability for 'billing' must be a finite number"],
+        ),
+        (
+            {"billing": True, "technical": 0.3, "sales": 0.1},
+            ["probability for 'billing' must be a finite number", "True"],
+        ),
+    ],
+)
+def test_structured_rejects_a_probability_it_cannot_read(stub_server, probabilities, expected):
+    client = structured_client(stub_server, json.dumps({"probabilities": probabilities}))
+
+    with pytest.raises(MalformedAnswerError) as error:
+        client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
+
+    message = str(error.value)
+    for fragment in expected:
+        assert fragment in message
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (1.5, "'noul' must be in [0, 1.0], got 1.5"),
+        (-0.1, "'noul' must be in [0, 1.0], got -0.1"),
+    ],
+)
+def test_structured_rejects_a_noul_outside_the_unit_interval(stub_server, value, expected):
+    client = structured_client(stub_server, json.dumps({"noul": value}))
+
+    with pytest.raises(MalformedAnswerError) as error:
+        client.system_one(state=STATE, questions={"q": Noul()})
+
+    assert expected in str(error.value)
+
+
+# --- discrete answers --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected_choice"),
+    [
+        ("B", "technical"),
+        ("sales", "sales"),
+        ("b", "technical"),
+    ],
+)
+def test_discrete_reads_a_choice_given_as_a_label_or_an_option_key(
+    stub_server, answer, expected_choice
+):
+    client = discrete_client(stub_server, json.dumps({"choice": answer}))
+
+    response = client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
+
+    answer_obj = response.answers["q"]
+    assert answer_obj.choice == expected_choice
+    assert answer_obj.probabilities == {
+        key: (1.0 if key == expected_choice else 0.0) for key in CRITERIA
+    }
+
+
+def test_discrete_prefers_an_exact_option_key_over_a_label(stub_server):
+    """An option key that is also a label must not be read as the first option by accident."""
+    criteria = {"b": None, "A": None, "C": None}
+    client = discrete_client(stub_server, json.dumps({"choice": "A"}))
+
+    response = client.system_one(state=STATE, questions={"q": Choice(criteria=criteria)})
+
+    answer = response.answers["q"]
+    # "A" is the second option's key; the label "A" names the first option and must lose to it.
+    assert answer.choice == "A"
+    assert answer.probabilities == {"b": 0.0, "A": 1.0, "C": 0.0}
+
+
+def test_discrete_rejects_a_choice_that_is_neither_a_label_nor_a_key(stub_server):
+    client = discrete_client(stub_server, json.dumps({"choice": "zzz"}))
+
+    with pytest.raises(MalformedAnswerError) as error:
+        client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
+
+    message = str(error.value)
+    assert "'choice' must be one of the labels" in message
+    assert "'zzz'" in message
+
+
+@pytest.mark.parametrize("value", [2, 2.0, "2"])
+def test_discrete_reads_a_score_index_in_any_integral_form(stub_server, value):
+    client = discrete_client(stub_server, json.dumps({"score": value}))
+
+    response = client.system_one(state=STATE, questions={"anger": Score(criteria=LEVELS)})
+
+    answer = response.answers["anger"]
+    assert answer.score == 2.0
+    assert answer.probabilities == {0: 0.0, 1: 0.0, 2: 1.0}
+
+
+@pytest.mark.parametrize("value", [1.5, 5, -1])
+def test_discrete_rejects_a_score_that_is_not_a_level_index(stub_server, value):
+    client = discrete_client(stub_server, json.dumps({"score": value}))
+
+    with pytest.raises(MalformedAnswerError) as error:
+        client.system_one(state=STATE, questions={"anger": Score(criteria=LEVELS)})
+
+    message = str(error.value)
+    assert "must be one of the level indexes" in message
+    assert repr(value) in message
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected_noul"),
+    [
+        (True, 1.0),
+        ("true", 1.0),
+        (False, 0.0),
+    ],
+)
+def test_discrete_reads_a_noul_given_as_a_boolean_or_its_string(stub_server, answer, expected_noul):
+    client = discrete_client(stub_server, json.dumps({"noul": answer}))
+
+    response = client.system_one(state=STATE, questions={"verdict": Noul()})
+
+    assert response.answers["verdict"].noul == expected_noul
+
+
+# --- distributions that do not sum to one ------------------------------------------------------
+
+
+def test_structured_all_zero_distribution_falls_back_to_uniform(stub_server):
+    content = json.dumps({"probabilities": {"billing": 0, "technical": 0, "sales": 0}})
+    client = structured_client(stub_server, content)
+
+    response = client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
+
+    answer = response.answers["q"]
+    assert answer.probabilities == {key: pytest.approx(1 / 3) for key in CRITERIA}
+    assert answer.confidence == pytest.approx(0.0, abs=1e-12)
+    assert response.debug["probability_errors"]["q"] == pytest.approx(1.0, abs=1e-12)
+    # The zeros the model sent are what the uniform fallback replaced, so they are kept.
+    assert response.debug["original_probabilities"]["q"] == {
+        "billing": 0.0,
+        "technical": 0.0,
+        "sales": 0.0,
+    }
+
+
+def test_structured_without_normalization_reports_the_models_own_numbers(stub_server):
+    payload = {"probabilities": {"0": 0.5, "1": 0.1, "2": 0.1}}
+    client = structured_client(stub_server, json.dumps(payload), normalize_probabilities=False)
+
+    response = client.system_one(state=STATE, questions={"anger": Score(criteria=LEVELS)})
+
+    answer = response.answers["anger"]
+    assert answer.probabilities == {0: 0.5, 1: 0.1, 2: 0.1}
+    assert answer.score == pytest.approx(0.3, abs=1e-12)
+    assert response.debug["probability_errors"]["anger"] == pytest.approx(0.3, abs=1e-12)
+    # Nothing was rewritten, so there is no pre-normalization copy of the distribution.
+    assert "original_probabilities" in response.debug
+    assert response.debug["original_probabilities"] == {}
+
+
+# --- the corrective retry ----------------------------------------------------------------------
+
+
+def test_a_malformed_answer_is_retried_and_the_reason_names_the_failure(stub_server):
+    answers = [json.dumps({"choice": "zzz"}), json.dumps({"choice": "sales"})]
+    stub = stub_server(chat=lambda _: (200, chat_body(content=answers.pop(0))))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="discrete",
+        api="chat_completions",
+        n_retry_malformed=1,
+    )
+
+    response = client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "sales"
+    assert len(stub.bodies("/chat/completions")) == 2
+    reasons = response.debug["retry_reasons"]
+    assert len(reasons) == 1
+    assert "'choice' must be one of the labels" in reasons[0]
+    correction = stub.bodies("/chat/completions")[1]["messages"][-1]
+    assert correction["role"] == "user"
+    assert "'choice' must be one of the labels" in correction["content"]

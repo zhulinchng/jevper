@@ -107,7 +107,22 @@ _UNSUPPORTED_MARKERS = (
 )
 # Text that says only the *value* was wrong: the field exists, so this is not a capability verdict.
 # Any "between" phrasing bounds a value — ollama answers ``top_logprobs must be between 0 and 20``.
-_VALUE_MARKERS = ("between", "out of range", "maximum", "max_logprobs", "exceeds")
+# The "must be" phrasings are how a server that knows the field rejects the number in it: SGLang
+# answers ``budget_tokens: must be at least 1024`` and a gateway with a narrower effort enum answers
+# ``reasoning_effort must be one of low, medium, high``.
+_VALUE_MARKERS = (
+    "between",
+    "out of range",
+    "maximum",
+    "max_logprobs",
+    "exceeds",
+    "must be at least",
+    "must be less than",
+    "must be greater than",
+    "must be one of",
+    "invalid value",
+    "not a valid",
+)
 # Text that names a *field jevper added for capability* rather than a bad value: the server does not
 # implement structured outputs, the reasoning parameters, or the Responses ``include`` list. None of the
 # three is needed to answer a question — the prompt already asks for one JSON object — so the field is
@@ -238,7 +253,10 @@ def _add_count(current: int | None, value: Any) -> int | None:
         return None
     try:
         return current + int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # ``int(float("inf"))`` raises OverflowError, which is the same kind of provider bug as a word
+        # in a token count: "not reported" is the honest answer, and a raw OverflowError escaping the
+        # call would not be.
         return None
 
 
@@ -278,22 +296,25 @@ def _include_refused(evidence: str) -> bool:
     )
 
 
-def _logprobs_rejected(exc: BaseException) -> bool:
+def _logprobs_rejected(exc: BaseException, spec: CallSpec | None = None) -> bool:
     """The provider refused the request because of the logprob fields it carried.
 
     Both shapes seen in the wild name the field: Gemini's OpenAI-compatibility layer answers
     ``Unknown name "logprobs": Cannot find field.`` and a reasoning model behind an OpenAI-shaped
-    gateway answers ``logprobs are not supported with reasoning models.`` A Responses request asks
-    for logprobs through ``include`` instead, so the field it can be refused for is that one — see
-    ``_include_refused``.
+    gateway answers ``logprobs are not supported with reasoning models.`` A Responses request asks for
+    logprobs through ``include`` instead, so the field it can be refused for is that one — but only
+    when ``spec`` says this request asked for logprobs at all: the same ``include`` list also carries
+    the reasoning include, and a refusal of that path is about reasoning, not about logprobs.
     """
     if _status_code(exc) not in _LOGPROB_REJECTION_STATUS_CODES:
         return False
     evidence = _error_evidence(exc)
-    return "logprob" in evidence or _include_refused(evidence)
+    if "logprob" in evidence:
+        return True
+    return bool(spec is not None and spec.logprobs and _include_refused(evidence))
 
 
-def _logprobs_unsupported(exc: BaseException) -> bool:
+def _logprobs_unsupported(exc: BaseException, spec: CallSpec | None = None) -> bool:
     """The rejection reads as a missing capability rather than a bad value, so it is worth remembering.
 
     ``logprobs are not supported with reasoning models.`` and ``Unknown name "logprobs": Cannot find
@@ -301,7 +322,7 @@ def _logprobs_unsupported(exc: BaseException) -> bool:
     20.`` — a server whose cap is lower than the default — refuses the value, so the question is
     answered with a logprob-free method without writing off logprobs for the rest of the client's life.
     """
-    if not _logprobs_rejected(exc):
+    if not _logprobs_rejected(exc, spec):
         return False
     evidence = _error_evidence(exc)
     if any(marker in evidence for marker in _VALUE_MARKERS):
@@ -309,6 +330,22 @@ def _logprobs_unsupported(exc: BaseException) -> bool:
     if _include_refused(evidence):
         return True
     return any(marker in evidence for marker in _UNSUPPORTED_MARKERS)
+
+
+def _value_refused(evidence: str) -> bool:
+    """The provider complained about the value it was sent, not about the field's existence.
+
+    The distinction decides whether a capability field may be dropped. ``budget_tokens: must be at
+    least 1024`` names a field the server knows and a number it will not take, so re-asking without the
+    field would answer the question with the caller's reasoning quietly switched off — and remember that
+    as this server's limit for the rest of the client's life. ``reasoning_effort: Extra inputs are not
+    permitted`` is the other case: the field itself is what is missing.
+
+    A refusal of the schema is deliberately not covered: dropping to ``json_object`` does not lose the
+    schema, which travels in the prompt from then on, so the ladder is worth a rung even when the
+    complaint is about the schema's contents.
+    """
+    return any(marker in evidence for marker in _VALUE_MARKERS)
 
 
 def _dump_model(obj: Any) -> Any:
@@ -504,13 +541,19 @@ class _BaseClient:
         question_id: str,
         spec: CallSpec,
         context: _CallContext,
+        transport: Transport,
         exc: Exception,
     ) -> bool:
-        """Record a failed attempt and report whether it may be retried."""
+        """Record a failed attempt and report whether it may be retried.
+
+        The record names the transport that made the call — not whatever the shared context holds by the
+        time the failure is handled — so a delayed failure still shows the surface and the request that
+        produced it.
+        """
         log.add_attempt(
             question_id,
-            surface=context.transport.surface,
-            request=context.transport.kwargs(spec, context.model),
+            surface=transport.surface,
+            request=transport.kwargs(spec, context.model),
             error=f"{type(exc).__name__}: {exc}",
         )
         return _is_transient(exc)
@@ -574,7 +617,7 @@ class _BaseClient:
         with self._auto_lock:
             self._limits[surface] = limits
 
-    def _downgrade(self, exc: Exception, spec: CallSpec, context: _CallContext) -> Limits | None:
+    def _downgrade(self, exc: Exception, spec: CallSpec, transport: Transport) -> Limits | None:
         """The next request shape to try when a server refuses a field jevper added for capability.
 
         A server that does not implement structured outputs, the reasoning parameters or the Responses
@@ -583,30 +626,48 @@ class _BaseClient:
         ladder at a time, remembered afterwards, so the discovery is paid once. The ladder is bounded,
         so a server that refuses everything still ends in a ``ProviderError``. A rejection that names
         the logprob fields belongs to the label-readout fallback, not here.
+
+        The verdict is read against the transport that made the call, so a failure that arrives after
+        another question moved the shared context still descends *its own* ladder rather than the one
+        belonging to a surface it never touched.
         """
-        if _status_code(exc) not in _LOGPROB_REJECTION_STATUS_CODES or _logprobs_rejected(exc):
+        if _status_code(exc) not in _LOGPROB_REJECTION_STATUS_CODES or _logprobs_rejected(exc, spec):
             return None
         evidence = _error_evidence(exc)
-        limits = context.transport.limits
+        # A complaint about the number is not a complaint about the field: dropping the field there
+        # would answer the question with the caller's reasoning off, and remember that as the server's
+        # limit. The provider's own error says which number it wanted, so it travels back instead.
+        value_complaint = _value_refused(evidence)
+        limits = transport.limits
         if spec.json_schema is not None and any(marker in evidence for marker in _SCHEMA_MARKERS):
             if limits.structured == "schema":
+                # With ``structured_outputs=False`` the request already carried a plain
+                # ``json_object``: the next rung is no format field at all, and re-sending the same
+                # bytes would only spend a second call on the same refusal.
+                if not transport.structured_outputs:
+                    return replace(limits, structured="none")
                 return replace(limits, structured="object")
             if limits.structured == "object":
                 return replace(limits, structured="none")
         if (
-            spec.reasoning is not None
+            not value_complaint
+            and spec.reasoning is not None
             and limits.reasoning
             and any(marker in evidence for marker in _REASONING_MARKERS)
         ):
             return replace(limits, reasoning=False)
         if spec.reasoning is not None and limits.include and "include" in evidence:
             return replace(limits, include=False)
-        if spec.prompt_cache_key is not None and limits.cache_key and any(
-            marker in evidence for marker in _CACHE_KEY_MARKERS
+        if (
+            not value_complaint
+            and spec.prompt_cache_key is not None
+            and limits.cache_key
+            and any(marker in evidence for marker in _CACHE_KEY_MARKERS)
         ):
             return replace(limits, cache_key=False)
         if (
-            spec.reasoning is not None
+            not value_complaint
+            and spec.reasoning is not None
             and limits.thinking
             and any(marker in evidence for marker in _THINKING_MARKERS)
         ):
@@ -647,6 +708,7 @@ class _BaseClient:
         ``_assemble`` reports the surface from the context it was handed, and the driver reads the
         transport per call, so the switch has to be visible on the object they already hold.
         """
+        moved = surface != context.transport.surface
         context.transport = make_transport(
             self.client,
             surface,
@@ -655,9 +717,12 @@ class _BaseClient:
             extra_headers=self.extra_headers,
             limits=self._limits_for(surface),
         )
-        if context.auto:
-            # The method verdict is keyed by surface, so the surface that just changed has its own:
-            # coming back to one that is known to withhold logprobs must not ask for them again.
+        if context.auto and moved:
+            # The method verdict is keyed by surface, so a surface that just changed has its own:
+            # coming back to one that is known to withhold logprobs must not ask for them again. Only a
+            # real move reloads it: on a same-surface downgrade the reload would undo the fallback this
+            # call just chose, because a first weak absence is deliberately not cached and the verdict
+            # still says "logprobs" — the next question would pay for the same probe again.
             context.method = self._auto_method(context.model, surface)
         context.mode = resolve_reasoning_mode(context.reasoning, surface)
         context.answer_reasoning = context.reasoning if context.mode == "native" else None
@@ -666,7 +731,12 @@ class _BaseClient:
         )
 
     def _call_failure(
-        self, exc: Exception, spec: CallSpec, context: _CallContext, log: _CallLog
+        self,
+        exc: Exception,
+        spec: CallSpec,
+        context: _CallContext,
+        transport: Transport,
+        log: _CallLog,
     ) -> JevperError:
         """The error to give up on a call with: a logprob verdict under ``auto``, else the provider's.
 
@@ -676,15 +746,17 @@ class _BaseClient:
         """
         if context.auto and spec.logprobs:
             failure = f"{type(exc).__name__}: {exc}"
-            if _logprobs_rejected(exc):
-                capability = _logprobs_unsupported(exc)
+            if _logprobs_rejected(exc, spec):
+                capability = _logprobs_unsupported(exc, spec)
                 note = (
                     ""
                     if capability
                     else " (not remembered: the rejection names a bad value, not a missing capability)"
                 )
                 return _LogprobsUnavailable(
-                    f"the provider rejected the logprob request ({failure}){note}", capability=capability
+                    f"the provider rejected the logprob request ({failure}){note}",
+                    capability=capability,
+                    surface=transport.surface,
                 )
             if _status_code(exc) in _SERVER_ERROR_STATUS_CODES:
                 return _LogprobsUnavailable(
@@ -693,6 +765,7 @@ class _BaseClient:
                     # Not evidence about the surface: another surface would have failed too, so this
                     # must not move the label readout anywhere.
                     evidence="transient",
+                    surface=transport.surface,
                 )
         if isinstance(exc, ProviderError):
             # The transport already built the right error — an embedded provider failure — so keep
@@ -736,15 +809,26 @@ class _BaseClient:
         # Fail fast, before any provider call, and reuse the rendered turns for every question.
         state_messages = tuple(render_state_messages(state))
         parsed = {question_id: parse_question(question_id, raw) for question_id, raw in questions.items()}
-        requested = method or self.method
+        # Every few-shot example is checked here too. A question whose example is invalid would
+        # otherwise only fail inside its own worker — after the questions ahead of it had already spent
+        # provider calls on a call that was locally invalid from the start.
+        for question_id, question in parsed.items():
+            labels = labels_for(2 if question.type == "noul" else len(question.criteria))
+            self._resolve_examples(question, labels, question_id, examples)
+        requested = self.method if method is None else method
         if requested not in METHOD_SELECTIONS:
             raise JevperError(f"method must be one of {METHOD_SELECTIONS!r}, got {requested!r}")
         auto = requested == "auto"
-        api_auto = (api or self.api) == "auto"
-        effective_model = model or self.model
+        # ``is None`` rather than truthiness: an explicit empty string is a caller mistake the eager
+        # validation below has to catch, not a request to fall back to the constructor's value.
+        effective_api = self.api if api is None else api
+        if effective_api not in APIS:
+            raise JevperError(f"api must be one of {APIS!r}, got {effective_api!r}")
+        api_auto = effective_api == "auto"
+        effective_model = self.model if model is None else model
         effective_reasoning = reasoning if reasoning is not None else self.reasoning
         # The surface is picked for the method auto tries first; the fallback runs on either surface.
-        surface = select_surface(self.client, api or self.api, AUTO_METHOD if auto else requested)
+        surface = select_surface(self.client, effective_api, AUTO_METHOD if auto else requested)
         if api_auto and self._surface_missing(surface):
             # This server answered 404 for the route before: do not pay for the discovery again.
             surface = "chat_completions" if surface == "responses" else "responses"
@@ -840,17 +924,19 @@ class _BaseClient:
             except _LogprobsUnavailable as exc:
                 if not context.auto or fell_back:
                     raise
-                if exc.evidence != "transient" and context.api_auto:
-                    alternative = self._logprob_surface_alternative(
-                        context.transport.surface, context.reasoning
-                    )
+                # The surface that produced the verdict, which is not necessarily the one the shared
+                # context holds now: another question's worker may have moved it while this call was
+                # in flight.
+                surface = exc.surface or context.transport.surface
+                if exc.capability and exc.evidence != "transient" and context.api_auto:
+                    alternative = self._logprob_surface_alternative(surface, context.reasoning)
                     if alternative is not None and not self._logprobs_absent_here(
                         context.model, alternative
                     ):
                         # The verdict is about this surface — it answered without logprobs, or refused
                         # the fields outright, as llama.cpp's Responses shim does. Mark it, so later
                         # calls start where the distribution is, and answer this question there.
-                        self._remember_logprobs_unavailable(context.model, context.transport.surface)
+                        self._remember_logprobs_unavailable(context.model, surface)
                         retry_reasons.append(
                             f"{exc} — retrying the label readout on api={alternative!r}"
                         )
@@ -858,20 +944,21 @@ class _BaseClient:
                         continue
                 fell_back = True
                 retry_reasons.append(f"{exc} — answering with method={FALLBACK_METHOD!r}")
-                self._note_surface_absence(context.model, context.transport.surface, exc)
+                self._note_surface_absence(context.model, surface, exc)
                 # Questions that have not started yet take the fallback without paying for it.
                 context.method = FALLBACK_METHOD
             except _SurfaceUnavailable as exc:
                 if not context.api_auto:
                     raise
-                self._remember_surface_missing(context.transport.surface)
-                other: Surface = (
-                    "chat_completions" if context.transport.surface == "responses" else "responses"
-                )
+                self._remember_surface_missing(exc.surface)
+                other: Surface = "chat_completions" if exc.surface == "responses" else "responses"
                 if self._surface_missing(other) or not _has_attribute(
                     self.client, f"{SURFACES[other][2]}.create"
                 ):
-                    raise  # nowhere left to go: this 404 is the answer
+                    # Nowhere left to go: this 404 is the answer, and it is a provider failure like any
+                    # other — a public error carrying the status and the attempt history, not the
+                    # private verdict this fallback runs on.
+                    raise ProviderError(str(exc), attempts=log.attempts, status_code=404) from exc
                 retry_reasons.append(f"{exc} — answering on api={other!r}")
                 self._switch_surface(context, other)
 
@@ -1127,30 +1214,38 @@ class SystemOneClient(_BaseClient):
     ) -> CallResult:
         attempt = 0
         while True:
+            # The transport that issues *this* attempt. Another question's worker can switch the shared
+            # context to another surface while this call is in flight, so a failure has to be judged
+            # against the surface that produced it: judging it against whatever the context holds now
+            # records a Responses 404 as a Chat one and writes off the surface that was working.
+            transport = context.transport
             try:
-                result = context.transport.call(spec, context.model)
+                result = transport.call(spec, context.model)
             except Exception as exc:
-                if not self._record_failure(log, question_id, spec, context, exc) or (
+                if not self._record_failure(log, question_id, spec, context, transport, exc) or (
                     attempt >= self.retry.n_retries
                 ):
                     if isinstance(exc, ClientCapabilityError):
                         raise  # the client cannot read this surface; another attempt cannot help
                     if context.api_auto and _route_missing(
-                        exc, surface=context.transport.surface, model=context.model
+                        exc, surface=transport.surface, model=context.model
                     ):
                         # A server with no such route: hand the verdict to the generator, which owns
                         # the fallback decision, exactly as with an unavailable logprob readout.
                         raise _SurfaceUnavailable(
-                            f"the server has no {context.transport.surface!r} route: {exc}",
-                            surface=context.transport.surface,
+                            f"the server has no {transport.surface!r} route: {exc}",
+                            surface=transport.surface,
                         ) from exc
-                    downgraded = self._downgrade(exc, spec, context)
+                    downgraded = self._downgrade(exc, spec, transport)
                     if downgraded is not None:
-                        # The field is optional; the question is not. Remember the limit and re-ask.
-                        self._remember_limits(context.transport.surface, downgraded)
-                        self._switch_surface(context, context.transport.surface)
+                        # The field is optional; the question is not. Remember the limit and re-ask —
+                        # with a fresh retry budget, because the attempts the old request shape spent
+                        # say nothing about this one.
+                        attempt = 0
+                        self._remember_limits(transport.surface, downgraded)
+                        self._switch_surface(context, transport.surface)
                         continue
-                    failure = self._call_failure(exc, spec, context, log)
+                    failure = self._call_failure(exc, spec, context, transport, log)
                     # An embedded provider error is the caught exception itself; raising it `from`
                     # itself would print as its own cause.
                     raise failure from (None if failure is exc else exc)
@@ -1253,30 +1348,34 @@ class AsyncSystemOneClient(_BaseClient):
     ) -> CallResult:
         attempt = 0
         while True:
+            # Same as the sync driver: the verdict belongs to the surface that produced the failure.
+            transport = context.transport
             try:
-                result = await context.transport.acall(spec, context.model)
+                result = await transport.acall(spec, context.model)
             except Exception as exc:
-                if not self._record_failure(log, question_id, spec, context, exc) or (
+                if not self._record_failure(log, question_id, spec, context, transport, exc) or (
                     attempt >= self.retry.n_retries
                 ):
                     if isinstance(exc, ClientCapabilityError):
                         raise  # the client cannot read this surface; another attempt cannot help
                     if context.api_auto and _route_missing(
-                        exc, surface=context.transport.surface, model=context.model
+                        exc, surface=transport.surface, model=context.model
                     ):
                         # A server with no such route: hand the verdict to the generator, which owns
                         # the fallback decision, exactly as with an unavailable logprob readout.
                         raise _SurfaceUnavailable(
-                            f"the server has no {context.transport.surface!r} route: {exc}",
-                            surface=context.transport.surface,
+                            f"the server has no {transport.surface!r} route: {exc}",
+                            surface=transport.surface,
                         ) from exc
-                    downgraded = self._downgrade(exc, spec, context)
+                    downgraded = self._downgrade(exc, spec, transport)
                     if downgraded is not None:
-                        # The field is optional; the question is not. Remember the limit and re-ask.
-                        self._remember_limits(context.transport.surface, downgraded)
-                        self._switch_surface(context, context.transport.surface)
+                        # The field is optional; the question is not. Remember the limit and re-ask —
+                        # with a fresh retry budget for the new request shape.
+                        attempt = 0
+                        self._remember_limits(transport.surface, downgraded)
+                        self._switch_surface(context, transport.surface)
                         continue
-                    failure = self._call_failure(exc, spec, context, log)
+                    failure = self._call_failure(exc, spec, context, transport, log)
                     # An embedded provider error is the caught exception itself; raising it `from`
                     # itself would print as its own cause.
                     raise failure from (None if failure is exc else exc)

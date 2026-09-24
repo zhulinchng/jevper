@@ -428,3 +428,34 @@ def test_the_async_client_sends_a_caller_key(stub_server):
     asyncio.run(client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}))
 
     assert keys_sent(stub) == ["tenant-9"]
+
+
+def test_the_key_differs_per_method_and_is_shared_by_both_reasoning_passes(stub_server):
+    """A method is a different prefix: another system prompt, another answer shape, another key.
+
+    The two passes of a two-step call are the deliberate exception. They share everything except the
+    system prompt, and the point of the key is to route the answer pass at the analysis pass's cache,
+    so both passes of one call key alike.
+    """
+    structured_answer = '{"probabilities": {"billing": 0.8, "technical": 0.1, "sales": 0.1}}'
+
+    def script(body):
+        if body.get("response_format") is not None:
+            return 200, chat_body(content=structured_answer)
+        return 200, chat_body(content="A", logprobs=CHOICE_LOGS)
+
+    stub = stub_server(chat=script)
+    question = Choice(criteria=CRITERIA)
+    client_for(stub, method="logprobs").system_one(state="s", questions={"q": question})
+    client_for(stub, method="structured").system_one(state="s", questions={"q": question})
+    client_for(stub, method="structured", reasoning=ReasoningConfig(mode="two_step")).system_one(
+        state="s", questions={"q": question}
+    )
+
+    keys = keys_sent(stub)
+    assert all(isinstance(key, str) for key in keys)
+    assert keys[0] != keys[1]  # the same question, the same state, another method
+    assert keys[2] == keys[3]  # analysis pass, answer pass — the routing the design wants
+    # Two-step is a way of *asking*, not another prefix: it keys like the method it answers with, so
+    # the analysis pass and a plain call with the same rubric still land in one bucket.
+    assert keys[2] == keys[1]

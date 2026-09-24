@@ -47,7 +47,10 @@ class ReasoningConfig(BaseModel):
     """Reasoning request. ``mode="auto"`` uses native reasoning on the Responses surface and the
     two-step think-then-classify path everywhere else."""
 
-    model_config = ConfigDict(extra="forbid")
+    # ``validate_assignment`` is what keeps the budget rule true for a config that is edited after it
+    # was built: without it, ``config.budget_tokens = 0`` skips the validator and the invalid number
+    # reaches the provider, where the same value is refused when it is passed to the constructor.
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     effort: ReasoningEffort | None = None
     summary: ReasoningSummary | None = None
@@ -88,5 +91,13 @@ def resolve_reasoning_mode(config: ReasoningConfig | None, surface: str) -> Reas
     if config is None:
         return "off"
     if config.mode == "auto":
-        return "native" if surface == "responses" else "two_step"
+        if surface == "responses":
+            return "native"
+        if surface == "messages" and config.budget_tokens is not None:
+            # The Messages API is the only surface with a thinking *budget*, and a budget is the only
+            # reason to set one: a caller who asks for it is asking for this surface's own ``thinking``
+            # field. Resolving to the two-step path instead would send no ``thinking`` at all, which is
+            # what the field's own documentation promises it does.
+            return "native"
+        return "two_step"
     return config.mode

@@ -44,12 +44,24 @@ class _LogprobsUnavailable(LabelReadoutError):
     refusing the logprob fields — an explicit statement about what it can do, remembered at once.
     ``"readout"`` is an answer whose logprobs could not be read — one anomalous response says very
     little, so auto waits for a second one before giving up on the provider.
+
+    ``surface`` is the surface that produced the verdict. Workers share one call context, so the
+    handler that acts on a verdict cannot read it off the context: by the time a slow failure arrives,
+    another question may have moved the context somewhere else.
     """
 
-    def __init__(self, message: str, *, capability: bool = True, evidence: str = "provider") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        capability: bool = True,
+        evidence: str = "provider",
+        surface: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.capability = capability
         self.evidence = evidence
+        self.surface = surface
 
 
 class MalformedAnswerError(JevperError):

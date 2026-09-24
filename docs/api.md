@@ -38,7 +38,7 @@ Anthropic SDK's, pointed at any server that implements the Messages API); it sta
 | `retry` | `None` | Transient-failure retries; `RetryPolicy()` (2 retries, 0.5s base, 8s cap) when unset |
 | `temperature` | `None` | Not sent unless set. `0.0` is recommended for `structured`/`discrete`; `logprobs` needs no setting |
 | `prompt_cache_key` | `None` | The provider's cache-routing key. Unset, jevper derives one per question from the parts of the prompt that do not change between calls, so a rubric's requests are routed together; set it to group (or account for) requests your own way |
-| `extra_body` | `None` | Merged into every request body (the grammar field is merged here too). On the Messages surface, `max_tokens` comes from here — jevper always sends one there, defaulting to `DEFAULT_MAX_TOKENS` (1024) |
+| `extra_body` | `None` | Merged into every request body (the grammar field is merged here too). A key it names is the value that reaches the wire — the SDK merges `extra_body` *after* the typed parameters — so jevper leaves that field alone rather than sending a typed value the caller's own key would override. `response_format`/`text` named here therefore also puts the JSON Schema in the prompt, since no schema of jevper's is in the request. On the Messages surface, `max_tokens` comes from here — jevper always sends one there, defaulting to `DEFAULT_MAX_TOKENS` (1024), or 1024 plus `ReasoningConfig(budget_tokens=…)` |
 | `extra_headers` | `None` | Sent with every request |
 
 Constructor validation is eager: an unknown `method`/`api`, `top_logprobs` outside `[0, 20]` or below 2 with a
@@ -87,6 +87,12 @@ same prefix and the provider can reuse its cache. A chat-list state's own `syste
 folded into that system prompt — every server here refuses a `system` turn that is not first, and jevper's own
 prompt leads — while the rest of the state stays verbatim and goes last. See
 [local-servers.md](local-servers.md#message-order-is-what-decides-the-reuse).
+
+The one exception is a chat-list state whose last turn is the **assistant's**: the question turn then follows
+the state instead, so the conversation still ends on a question. Ending it on the assistant's turn is not a
+question at all — the llama.cpp engines refuse it outright (`400 Failed to initialize samplers`, from both
+ollama and LM Studio) and a server that reads it as a prefill continues that turn rather than answering. The
+cost is that this one shape cannot reuse the question block as a cached prefix.
 
 ### `close()` / `aclose()`
 
@@ -204,7 +210,7 @@ SGLang's `--enable-cache-report` for its Chat Completions route. See
 | `retry_reasons` | Corrective-retry messages, in order |
 | `probability_errors` | `{question_id: abs(sum − 1)}` for `structured` distributions outside `1e-6` |
 | `original_probabilities` | The model's raw distribution, only for questions that were rescaled |
-| `server_limits` | Only when the server refused a capability field: `structured` (`"schema"`/`"object"`/`"none"`), `reasoning`, `include` and `cache_key` as it last accepted them |
+| `server_limits` | Only when the server refused a capability field: `structured` (`"schema"`/`"object"`/`"none"`), `reasoning`, `include`, `cache_key` and `thinking` as it last accepted them |
 | `labels_missing` | Labels the provider did not report a logprob for, per question |
 
 Every key is always present — except `methods`, which only `method="auto"` adds — and the last three are empty
@@ -259,7 +265,7 @@ All inherit from `JevperError`.
 | `ClientCapabilityError` | the client lacks the attribute a surface needs, or a response carried no choices and no explanation of why |
 | `LabelReadoutError` | no logprobs at all, no alternatives for the answer token, no non-whitespace token, a first token that is not a label, no logprob for the answer token, a non-finite logprob, or no probability mass on any label. The first two are the provider's doing, so they are not corrective-retried and `method="auto"` answers with `structured` instead |
 | `MalformedAnswerError` | JSON answer missing/extra keys, a non-finite or out-of-range number, an unknown label, a score that is not a level index |
-| `ProviderError` | provider failure after transient retries; `.attempts` holds the attempt records and `.status_code` the status the provider reported, including one carried inside a `200` body |
+| `ProviderError` | provider failure after transient retries; `.attempts` holds the attempt records and `.status_code` the status the provider reported, including one carried inside a `200` body. Also raised when every surface `api="auto"` could try answered `404`: the route is missing, so the failure is the provider's, not a private verdict's |
 | `JevperError` | base class, and the type used for constructor misuse, bad `state` messages, and content that is not JSON-serializable or contains a non-finite number |
 
 The provider-side logprob failures — a rejected logprob request, no logprobs at all, no alternatives for the

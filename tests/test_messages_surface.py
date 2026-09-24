@@ -31,6 +31,7 @@ from jevper import (
     Choice,
     JevperError,
     MalformedAnswerError,
+    ProviderError,
     ReasoningConfig,
     SystemOneClient,
     UnsupportedMethodError,
@@ -374,3 +375,150 @@ def test_a_mapping_shaped_response_is_read_too():
     assert result.stop == "max_tokens"
     assert result.input_tokens == 5 and result.output_tokens == 6
     assert result.token_logprobs == ()
+
+
+# -- the budget, the stop reason, and a refusal -----------------------------------------
+
+
+def test_the_default_budget_grows_by_the_thinking_budget(stub_server):
+    """Anthropic requires the budget to be strictly below ``max_tokens`` and answers 400 otherwise.
+
+    jevper owns the default, so the pair the docs recommend — the 1024 they call the floor — would be
+    refused by jevper's own 1024. The answer keeps the whole default and the thinking is paid for out
+    of the extra.
+    """
+    stub = stub_server(messages=answer())
+    client = client_for(stub, reasoning=ReasoningConfig(mode="native", budget_tokens=2048))
+
+    ask(client)
+
+    sent = body_sent(stub)
+    assert sent["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+    assert sent["max_tokens"] == DEFAULT_MAX_TOKENS + 2048
+    assert sent["max_tokens"] > sent["thinking"]["budget_tokens"]
+
+
+def test_the_smallest_budget_the_docs_allow_still_leaves_an_answer_budget(stub_server):
+    stub = stub_server(messages=answer())
+    client = client_for(stub, reasoning=ReasoningConfig(mode="native", budget_tokens=1024))
+
+    ask(client)
+
+    sent = body_sent(stub)
+    assert sent["max_tokens"] == DEFAULT_MAX_TOKENS + 1024
+
+
+def test_a_caller_max_tokens_still_wins_over_the_grown_default(stub_server):
+    stub = stub_server(messages=answer())
+    client = client_for(
+        stub, reasoning=ReasoningConfig(mode="native", budget_tokens=2048), extra_body={"max_tokens": 4096}
+    )
+
+    ask(client)
+
+    assert body_sent(stub)["max_tokens"] == 4096
+
+
+def test_the_budget_does_not_grow_once_the_server_refused_the_thinking_field(stub_server):
+    """The growth exists to make room for a thinking block the server is going to produce."""
+    def script(body):
+        if "thinking" in body:
+            return 400, {"error": {"message": "thinking: Extra inputs are not permitted"}}
+        return 200, messages_body(text=JSON_ANSWER)
+
+    stub = stub_server(messages=script)
+    client = client_for(stub, reasoning=ReasoningConfig(mode="native", budget_tokens=2048))
+
+    response = ask(client)
+
+    assert response.answers["q"].choice == "billing"
+    assert response.debug["server_limits"]["thinking"] is False
+    assert [body["max_tokens"] for body in stub.requests] == [
+        DEFAULT_MAX_TOKENS + 2048,
+        DEFAULT_MAX_TOKENS,
+    ]
+
+
+def test_a_thinking_budget_refused_for_its_value_is_not_dropped(stub_server):
+    """A budget the server will not take is not a missing capability: the field exists.
+
+    Dropping it would answer the question with the caller's reasoning quietly switched off — and
+    remember that as this server's limit, for a configuration the caller never repeated.
+    """
+    def script(body):
+        if "thinking" in body:
+            return 400, {
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "thinking.budget_tokens: must be at least 1024",
+                }
+            }
+        return 200, messages_body(text=JSON_ANSWER)
+
+    stub = stub_server(messages=script)
+    client = client_for(stub, reasoning=ReasoningConfig(mode="native", budget_tokens=512))
+
+    with pytest.raises(ProviderError) as error:
+        ask(client)
+
+    assert "must be at least 1024" in str(error.value)
+    assert len(stub.requests) == 1  # no re-ask without the field
+    assert "thinking" in stub.requests[0]
+
+    # A later call with a budget the server does take still sends it: nothing was written off.
+    stub.messages = lambda _: (200, messages_body(text=JSON_ANSWER))
+    ask(client, reasoning=ReasoningConfig(mode="native", budget_tokens=2048))
+    assert stub.requests[-1]["thinking"]["budget_tokens"] == 2048
+
+
+def test_a_truncated_messages_answer_names_the_budget(stub_server):
+    """This API reports a spent output budget as ``max_tokens``, not as Chat Completions' ``length``."""
+    stub = stub_server(messages=lambda _: (200, messages_body(text="", stop_reason="max_tokens")))
+    client = client_for(stub, n_retry_malformed=0)
+
+    with pytest.raises(MalformedAnswerError) as error:
+        ask(client)
+
+    assert "ran out of output tokens" in str(error.value)
+    assert "max_tokens" in str(error.value)
+
+
+def test_a_refused_messages_answer_says_the_model_refused(stub_server):
+    """``stop_reason: "refusal"`` is a 200 with no answer, and reads as a parsing bug without this."""
+    stub = stub_server(messages=lambda _: (200, messages_body(text="", stop_reason="refusal")))
+    client = client_for(stub, n_retry_malformed=0)
+
+    with pytest.raises(MalformedAnswerError) as error:
+        ask(client)
+
+    assert "refused to answer" in str(error.value)
+
+
+def test_a_messages_discrete_answer_is_read(stub_server):
+    """The one-label method needs no distribution, which is the only thing this surface cannot carry."""
+    stub = stub_server(messages=lambda _: (200, messages_body(text='{"choice": "B"}')))
+    client = client_for(stub, method="discrete")
+
+    response = ask(client)
+
+    assert response.answers["q"].choice == "technical"
+    assert response.answers["q"].probabilities == {"billing": 0.0, "technical": 1.0, "sales": 0.0}
+    assert response.debug["api"] == "messages"
+
+
+def test_a_budget_resolves_to_the_thinking_field_under_mode_auto(stub_server):
+    """The budget is the only reason to ask for this surface's own thinking, so it selects it.
+
+    Under ``mode="auto"`` the Messages surface would otherwise resolve to the two-step path, which sends
+    no ``thinking`` field at all — leaving the documented budget silently unused.
+    """
+    stub = stub_server(messages=answer())
+    client = client_for(stub, reasoning=ReasoningConfig(budget_tokens=1024))
+
+    response = ask(client)
+
+    sent = body_sent(stub)
+    assert sent["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+    assert sent["max_tokens"] == DEFAULT_MAX_TOKENS + 1024
+    assert response.debug["reasoning_mode"] == "native"
+    assert response.answers["q"].choice == "billing"

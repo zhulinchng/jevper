@@ -23,8 +23,9 @@ JSON_SCHEMA_FORMAT = "json_schema"
 # request without one — while jevper's other two surfaces leave the budget to the server. A
 # classification answer is a label or a small object, so this is generous for the answer and small
 # enough that a model which ignores the prompt cannot run away; ``extra_body={"max_tokens": n}``
-# overrides it. A caller who also sets ``ReasoningConfig(budget_tokens=n)`` has to keep that budget
-# under this one — Anthropic requires it, and answers 400 when it is not.
+# overrides it. A caller who also sets ``ReasoningConfig(budget_tokens=n)`` gets this much *plus* the
+# budget, because Anthropic requires the budget to be strictly below ``max_tokens`` and answers 400
+# when it is not — a fixed 1024 would refuse the 1024 the docs call the floor.
 DEFAULT_MAX_TOKENS = 1024
 
 
@@ -70,6 +71,10 @@ class CallResult:
     Responses surface. A reasoning model can spend the whole budget thinking — vLLM and SGLang then
     report ``status: "incomplete"`` with an empty answer — and the caller deserves to be told that
     rather than left with "no non-whitespace token in the response"."""
+    refusal: str | None = None
+    """The model's own refusal, when the provider reports one instead of an answer. OpenAI puts a safety
+    refusal in a ``refusal`` sibling of ``content`` and leaves ``content`` null, so without this the
+    answer reads as "no JSON object in the answer" — true, and useless."""
 
 
 @dataclass(frozen=True)
@@ -120,6 +125,34 @@ def _schema_in_prompt(messages: list[dict[str, str]], spec: CallSpec) -> list[di
     return [{**first, "content": f"{first.get('content') or ''}\n\n{instruction}"}, *rest]
 
 
+def _caller_body(extra_body: Mapping[str, Any] | None, limits: Limits) -> dict[str, Any]:
+    """The caller's own request fields, minus the capability fields this server has refused.
+
+    The SDK merges ``extra_body`` into the request *after* the typed parameters, so a key the caller
+    names there is the value that reaches the wire — including a key jevper would otherwise set. The
+    builders therefore leave those fields alone and read the caller's value as the effective one, which
+    is also why a capability field the server has refused is removed here: without that, the "re-ask
+    without it" the ladder promises would send the same bytes a second time.
+    """
+    body = dict(extra_body or {})
+    if limits.structured != "schema":
+        # The server refused the schema field once, so the caller's format field goes too — whatever it
+        # holds, jevper can no longer promise it reaches a server that just rejected the field. The
+        # schema itself is not lost: it travels in the prompt from that point on.
+        body.pop("response_format", None)
+        body.pop("text", None)
+    if not limits.reasoning:
+        body.pop("reasoning_effort", None)
+        body.pop("reasoning", None)
+    if not limits.include:
+        body.pop("include", None)
+    if not limits.cache_key:
+        body.pop("prompt_cache_key", None)
+    if not limits.thinking:
+        body.pop("thinking", None)
+    return body
+
+
 def build_chat_kwargs(
     spec: CallSpec,
     *,
@@ -130,13 +163,18 @@ def build_chat_kwargs(
     limits: Limits | None = None,
 ) -> dict[str, Any]:
     limits = limits or Limits()
+    body = _caller_body(extra_body, limits)
     kwargs: dict[str, Any] = {"model": model, "messages": spec.messages}
-    if spec.logprobs:
+    if spec.logprobs and "logprobs" not in body:
         kwargs["logprobs"] = True
         kwargs["top_logprobs"] = spec.top_logprobs
     schema_sent = False
     if spec.json_schema is not None:
-        if structured_outputs and limits.structured == "schema":
+        if "response_format" in body:
+            # The caller named the format, so theirs is the value on the wire and the schema is not in
+            # the request at all — which is exactly when it has to travel in the prompt.
+            schema_sent = False
+        elif structured_outputs and limits.structured == "schema":
             kwargs["response_format"] = {
                 "type": JSON_SCHEMA_FORMAT,
                 "json_schema": {"name": spec.schema_name, "schema": spec.json_schema, "strict": True},
@@ -147,14 +185,18 @@ def build_chat_kwargs(
     if spec.json_schema is not None and not schema_sent:
         # ``json_object`` constrains the answer to be *an* object, not to be *this* object.
         kwargs["messages"] = _schema_in_prompt(spec.messages, spec)
-    if spec.reasoning is not None and spec.reasoning.effort is not None and limits.reasoning:
+    if (
+        spec.reasoning is not None
+        and spec.reasoning.effort is not None
+        and limits.reasoning
+        and "reasoning_effort" not in body
+    ):
         kwargs["reasoning_effort"] = spec.reasoning.effort
-    if spec.prompt_cache_key is not None and limits.cache_key:
+    if spec.prompt_cache_key is not None and limits.cache_key and "prompt_cache_key" not in body:
         kwargs["prompt_cache_key"] = spec.prompt_cache_key
-    if spec.temperature is not None:
+    if spec.temperature is not None and "temperature" not in body:
         kwargs["temperature"] = spec.temperature
-    body = dict(extra_body or {})
-    if spec.grammar is not None:
+    if spec.grammar is not None and "grammar" not in body:
         body["grammar"] = spec.grammar
     if body:
         kwargs["extra_body"] = body
@@ -173,6 +215,7 @@ def build_responses_kwargs(
     limits: Limits | None = None,
 ) -> dict[str, Any]:
     limits = limits or Limits()
+    body = _caller_body(extra_body, limits)
     kwargs: dict[str, Any] = {"model": model, "input": spec.messages, "store": False}
     if spec.logprobs:
         kwargs["top_logprobs"] = spec.top_logprobs
@@ -181,9 +224,9 @@ def build_responses_kwargs(
         include.append("message.output_text.logprobs")
     if spec.reasoning is not None and limits.include:
         include.append("reasoning.encrypted_content")
-    if include:
+    if include and "include" not in body:
         kwargs["include"] = include
-    if spec.reasoning is not None and limits.reasoning:
+    if spec.reasoning is not None and limits.reasoning and "reasoning" not in body:
         reasoning = {
             name: value
             for name, value in (
@@ -197,7 +240,10 @@ def build_responses_kwargs(
             kwargs["reasoning"] = reasoning
     schema_sent = False
     if spec.json_schema is not None:
-        if structured_outputs and limits.structured == "schema":
+        if "text" in body:
+            # The caller named the format, so theirs is the value on the wire.
+            schema_sent = False
+        elif structured_outputs and limits.structured == "schema":
             kwargs["text"] = {
                 "format": {
                     "type": JSON_SCHEMA_FORMAT,
@@ -211,12 +257,12 @@ def build_responses_kwargs(
             kwargs["text"] = {"format": {"type": "json_object"}}
     if spec.json_schema is not None and not schema_sent:
         kwargs["input"] = _schema_in_prompt(spec.messages, spec)
-    if spec.prompt_cache_key is not None and limits.cache_key:
+    if spec.prompt_cache_key is not None and limits.cache_key and "prompt_cache_key" not in body:
         kwargs["prompt_cache_key"] = spec.prompt_cache_key
-    if spec.temperature is not None:
+    if spec.temperature is not None and "temperature" not in body:
         kwargs["temperature"] = spec.temperature
-    if extra_body:
-        kwargs["extra_body"] = dict(extra_body)
+    if body:
+        kwargs["extra_body"] = body
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
     return kwargs
@@ -237,12 +283,41 @@ def _as_mapping(obj: Any) -> dict[str, Any]:
         return dict(obj)
     dump = getattr(obj, "model_dump", None)
     if callable(dump):
-        return dump()
+        # A ``model_dump`` that answers with something that is not a mapping is one of the unreadable
+        # objects this promises to map to nothing: returning it would fail later, in a ``.get`` far from
+        # here, and take an otherwise readable answer down with it.
+        dumped = dump()
+        return dict(dumped) if isinstance(dumped, Mapping) else {}
     try:
         return dict(vars(obj))
     except TypeError:
         # Objects with __slots__ and plain scalars have no __dict__.
         return {}
+
+
+def _usable_choice(choice: Any) -> bool:
+    """Whether anything at all can be read from a choice.
+
+    A body whose first choice is null, or an empty object, carries no answer — the provider answered
+    ``200`` with a shape it did not fill in. Reading that as a blank answer would hide an embedded
+    provider error, which is how OpenRouter reports an overloaded upstream, and would turn a retryable
+    failure into a malformed answer after the corrective retries were spent.
+    """
+    payload = _as_mapping(choice)
+    return bool(payload) and any(name in payload for name in ("message", "text", "delta"))
+
+
+def _chat_reasoning_tokens(usage: Any, details: Any) -> Any:
+    """The reasoning-token count, from the nested detail object or the top level of ``usage``.
+
+    OpenAI nests it under ``completion_tokens_details``; SGLang's Chat surface reports it at the top
+    level — the recorded body in this repo's fixtures does exactly that — and the count is real either
+    way, so a nested absence falls back to the top level instead of reporting "not reported".
+    """
+    nested = _get(details, "reasoning_tokens")
+    if nested is not None:
+        return nested
+    return _get(usage, "reasoning_tokens")
 
 
 def _reasoning_part(obj: Any) -> ReasoningContentPart | None:
@@ -314,6 +389,19 @@ def _content_text(content: Any) -> str:
     return ""
 
 
+def _chat_refusal(message: Any) -> str | None:
+    """The model's own refusal, when the provider reports one instead of an answer.
+
+    ``refusal`` is a sibling of ``content`` on an assistant message, and a refusal leaves ``content``
+    null. The SDK types it as ``Optional[str]``; a provider that sends something else is ignored, since
+    a refusal is a diagnostic and not worth failing a readable answer over.
+    """
+    refusal = _get(message, "refusal")
+    if isinstance(refusal, str) and refusal.strip():
+        return refusal.strip()
+    return None
+
+
 def _chat_reasoning(message: Any) -> tuple[ReasoningContentPart, ...]:
     for name in ("reasoning_content", "thinking", "reasoning"):
         value = _get(message, name)
@@ -349,9 +437,9 @@ def _embedded_error(response: Any) -> ProviderError | None:
 
 def _chat_result(response: Any, request: dict[str, Any]) -> CallResult:
     choices = _get(response, "choices") or []
-    if not choices:
+    choice = choices[0] if choices else None
+    if not _usable_choice(choice):
         raise _embedded_error(response) or ClientCapabilityError("provider returned no choices")
-    choice = choices[0]
     message = _get(choice, "message")
     usage = _get(response, "usage")
     details = _get(usage, "completion_tokens_details")
@@ -365,9 +453,10 @@ def _chat_result(response: Any, request: dict[str, Any]) -> CallResult:
         response=response,
         input_tokens=_get(usage, "prompt_tokens"),
         output_tokens=_get(usage, "completion_tokens"),
-        reasoning_tokens=_get(details, "reasoning_tokens"),
+        reasoning_tokens=_chat_reasoning_tokens(usage, details),
         cached_tokens=_get(prompt_details, "cached_tokens"),
         stop=_get(choice, "finish_reason"),
+        refusal=_chat_refusal(message),
     )
 
 
@@ -473,17 +562,26 @@ def build_messages_kwargs(
         # prompt — the only place a request on this surface can state the answer's format.
         instruction = _schema_instruction(spec)
         system = f"{system}\n\n{instruction}" if system else instruction
-    body = dict(extra_body or {})
+    body = _caller_body(extra_body, limits)
+    budget = spec.reasoning.budget_tokens if spec.reasoning is not None else None
+    thinking = budget is not None and limits.thinking and "thinking" not in body
+    if thinking:
+        # Anthropic requires the budget to be strictly below ``max_tokens`` and answers 400 otherwise,
+        # and jevper owns this default: a fixed 1024 would refuse the 1024 the docs call the floor. The
+        # answer keeps the whole default and the thinking is paid for out of the extra.
+        default_max_tokens = DEFAULT_MAX_TOKENS + (budget or 0)
+    else:
+        default_max_tokens = DEFAULT_MAX_TOKENS
     kwargs: dict[str, Any] = {
         "model": model,
         # Required by this API, with no server-side default anywhere that implements it.
-        "max_tokens": body.pop("max_tokens", DEFAULT_MAX_TOKENS),
+        "max_tokens": body.pop("max_tokens", default_max_tokens),
         "messages": turns,
     }
     if system:
         kwargs["system"] = system
-    if spec.reasoning is not None and limits.thinking and spec.reasoning.budget_tokens is not None:
-        kwargs["thinking"] = {"type": "enabled", "budget_tokens": spec.reasoning.budget_tokens}
+    if thinking:
+        kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
     if spec.temperature is not None:
         # Not a typed parameter of the SDK's ``messages.create`` — the newest Claude models refuse a
         # non-default temperature, so the client stopped naming it — but the API itself still accepts
