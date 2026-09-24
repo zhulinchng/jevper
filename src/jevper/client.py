@@ -830,8 +830,15 @@ class _BaseClient:
         # The surface is picked for the method auto tries first; the fallback runs on either surface.
         surface = select_surface(self.client, effective_api, AUTO_METHOD if auto else requested)
         if api_auto and self._surface_missing(surface):
-            # This server answered 404 for the route before: do not pay for the discovery again.
-            surface = "chat_completions" if surface == "responses" else "responses"
+            # This server answered 404 for the route before: do not pay for the discovery again. The
+            # flip is only worth making if the client can speak the other surface — a messages-only
+            # client has no ``responses`` to move to, and moving anyway turned the provider's 404 into
+            # an AttributeError for an attribute the caller never had. Staying put re-asks the surface
+            # that is known to 404, and the in-call handler reports that 404, exactly as it did on the
+            # call that learned it.
+            other: Surface = "chat_completions" if surface == "responses" else "responses"
+            if _has_attribute(self.client, f"{SURFACES[other][2]}.create"):
+                surface = other
         elif api_auto and auto and self._logprobs_absent_here(effective_model, surface):
             alternative = self._logprob_surface_alternative(surface, effective_reasoning)
             if alternative is not None and not self._logprobs_absent_here(

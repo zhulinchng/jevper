@@ -12,15 +12,23 @@ Each case is pushed through a real ``openai`` client, so the SDK's parsing is ex
 
 from __future__ import annotations
 
+import asyncio
 import json
 from functools import cache
 from pathlib import Path
 from typing import Any
 
 import pytest
-from fakes import StubServer, chat_body, openai_client
+from fakes import (
+    StubServer,
+    anthropic_client,
+    async_anthropic_client,
+    chat_body,
+    openai_client,
+)
 
 from jevper import (
+    AsyncSystemOneClient,
     Choice,
     LabelReadoutError,
     ProviderError,
@@ -190,6 +198,94 @@ def test_a_route_404_that_does_not_name_the_model_falls_back(stub_server, server
     assert response.debug["api"] == "chat_completions"
     assert response.answers["intent"].choice == "billing"
     assert any("no 'responses' route" in reason for reason in response.debug["retry_reasons"])
+
+
+@pytest.mark.parametrize("server", ("ollama", "vllm", "sglang"))
+class MessagesOnly:
+    """A client that can speak nothing but the Messages API: no ``responses``, no ``chat.completions``."""
+
+    def __init__(self, client: Any) -> None:
+        self.messages = client.messages
+
+
+def test_a_messages_only_client_keeps_reporting_the_missing_route(stub_server):
+    """When the only surface the client can speak has no route, every call must say so.
+
+    The first call learns the route is missing and raises the provider's 404. The second must not flip
+    to a surface the client cannot speak — that answered with an ``AttributeError`` for ``responses``
+    instead of the same 404.
+    """
+    stub = stub_server()  # no messages script: the stub answers 404 for /v1/messages
+    client = SystemOneClient(MessagesOnly(anthropic_client(stub)), model="stub", api="auto")
+
+    for attempt in (1, 2):
+        with pytest.raises(ProviderError) as caught:
+            client.system_one(state=STATE, questions=QUESTIONS)
+        assert caught.value.status_code == 404, f"attempt {attempt}: {caught.value}"
+        assert "no 'messages' route" in str(caught.value), f"attempt {attempt}: {caught.value}"
+
+
+def test_an_explicit_messages_surface_reports_the_underlying_404(stub_server):
+    """The explicit surface is the reference: an explicit choice gets the provider's own error."""
+    stub = stub_server()
+    client = SystemOneClient(MessagesOnly(anthropic_client(stub)), model="stub", api="messages")
+
+    with pytest.raises(ProviderError) as caught:
+        client.system_one(state=STATE, questions=QUESTIONS)
+
+    assert caught.value.status_code == 404
+    assert "404" in str(caught.value)
+
+
+class ChatOnly:
+    """A client that can speak only chat completions: no ``responses``, no ``messages``."""
+
+    def __init__(self, client: Any) -> None:
+        self.chat = client.chat
+
+
+def test_a_chat_only_client_keeps_reporting_the_missing_route(stub_server):
+    """The same rule on the OpenAI side: no chat route, and nothing to flip to."""
+    stub = stub_server()  # no chat script: the stub answers 404 for /chat/completions
+    client = SystemOneClient(ChatOnly(openai_client(stub)), model="stub", api="auto")
+
+    for attempt in (1, 2):
+        with pytest.raises(ProviderError) as caught:
+            client.system_one(state=STATE, questions=QUESTIONS)
+        assert caught.value.status_code == 404, f"attempt {attempt}: {caught.value}"
+        assert "no 'chat_completions' route" in str(caught.value), f"attempt {attempt}: {caught.value}"
+
+
+def test_a_messages_only_client_reports_the_missing_route_when_async(stub_server):
+    """The async driver shares the same surface selection, so it shares the same rule."""
+    stub = stub_server()
+    client = AsyncSystemOneClient(MessagesOnly(async_anthropic_client(stub)), model="stub", api="auto")
+
+    for attempt in (1, 2):
+        with pytest.raises(ProviderError) as caught:
+            asyncio.run(client.system_one(state=STATE, questions=QUESTIONS))
+        assert caught.value.status_code == 404, f"attempt {attempt}: {caught.value}"
+        assert "no 'messages' route" in str(caught.value), f"attempt {attempt}: {caught.value}"
+
+
+def test_the_flip_still_happens_when_the_client_can_speak_the_other_surface(stub_server):
+    """The remembered 404 is still an optimisation: a client with both surfaces skips the dead route."""
+    distribution = [("A", -0.12), ("B", -2.47), ("C", -3.48)]
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=distribution)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="auto", method="logprobs", retry=NO_RETRIES
+    )
+
+    first = client.system_one(state=STATE, questions=QUESTIONS)
+    assert first.debug["api"] == "chat_completions"
+    responses_calls = len([path for path in stub.paths if path.endswith("/responses")])
+    assert responses_calls == 1, "the first call is the one that discovers the missing route"
+
+    second = client.system_one(state=STATE, questions=QUESTIONS)
+
+    assert second.debug["api"] == "chat_completions"
+    assert second.answers["intent"].choice == "billing"
+    assert len([path for path in stub.paths if path.endswith("/responses")]) == responses_calls
 
 
 @pytest.mark.parametrize("server", ("ollama", "vllm", "sglang"))

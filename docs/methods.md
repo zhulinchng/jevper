@@ -126,6 +126,11 @@ that 404 is read as "no Responses surface here" — unless the error names the m
 way on either surface — and the call is re-issued on `chat_completions` and remembered for the rest of the
 client's life. An explicit `api="responses"` is a decision, not a preference: its 404 reaches you unchanged.
 
+The remembered verdict only ever *skips* a route, so it moves the call only when the client can speak the
+other surface. A client whose only surface is `messages` stays on it, pays the 404 again, and reports it —
+the same error the call that learned the verdict raised, rather than an `AttributeError` for an attribute the
+client never had.
+
 The preference has one exception, and it is about the readout rather than the surface. A server can implement
 the Responses route and still not carry logprobs through it: ollama answers it with an empty logprob list,
 llama.cpp refuses the logprob fields there outright (`400 top_logprobs requires logprobs to be set to true`),
