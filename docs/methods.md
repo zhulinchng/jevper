@@ -40,10 +40,16 @@ Three things count as *this provider cannot do logprobs*:
 
 | Evidence | Response |
 | --- | --- |
-| The provider rejects the logprob fields with a 4xx that names them — Gemini's OpenAI-compatibility layer answers `Unknown name "logprobs": Cannot find field.`, a reasoning model behind an OpenAI-shaped gateway answers `logprobs are not supported with reasoning models.` | Re-ask the question with `structured`, and remember the verdict |
+| The provider rejects the logprob fields with a 4xx that names them — Gemini's OpenAI-compatibility layer answers `Unknown name "logprobs": Cannot find field.`, a reasoning model behind an OpenAI-shaped gateway answers `logprobs are not supported with reasoning models.` | Under `api="auto"`, ask on the surface that carries the readout — and remember the verdict, so later calls start there |
 | The provider refuses the `include` entry a Responses request carries them in — OpenRouter answers `400 Invalid option: expected one of …` for `path: ["include", 0]`, without ever writing the word "logprob" | same |
-| The answer carries no logprobs at all (`logprobs: null`, or a compatibility layer that drops the field) | Re-ask the question with `structured`, and remember the verdict once a second response confirms it |
+| The answer carries no logprobs at all (`logprobs: null`, or a compatibility layer that drops the field) | same, once a second response confirms it |
 | The answer token's logprobs carry no alternatives — `top_logprobs` empty, or nothing but the sampled token — so there is no distribution to read | same |
+
+With no surface left to move to — a client that speaks only one, a route already known to be missing, a
+`grammar` request (a Chat Completions convention with no counterpart), or `reasoning="native"` — the readout
+falls back to `structured` and the verdict is remembered. A `method="logprobs"` asked for explicitly moves
+surfaces the same way, because the surface that refuses the readout is not the method the caller chose; it is
+never *swapped* for another readout, though — with nowhere to move it reports the provider's refusal.
 
 A server error (5xx) that survives the transient retries also falls back for that question, because a request
 carrying `top_logprobs` is what some OpenAI models fail on; unlike the two rejections above it is *not*
@@ -90,7 +96,7 @@ Provider support, as of this release — check your provider's docs, since this 
 | vLLM | yes | caps `top_logprobs` at its own `--max-logprobs` (20 by default); `/v1/responses` carries them through `include` |
 | SGLang | yes | its `/v1/responses` needs `top_logprobs` sent explicitly (it defaults to 0) — jevper always sends it |
 | Ollama | partial | local builds since Nov 2025 return logprobs on Chat Completions; its `/v1/responses` returns an empty logprob list, so `auto` re-asks on Chat Completions. Ollama Cloud and older builds report none at all |
-| OpenRouter | per model | it routes by price and, by default, sends your request to an endpoint that may ignore `logprobs` — the answer comes back with none, which `auto` reads as "no logprobs" and falls back on. Add `extra_body={"provider": {"require_parameters": True}}` to route only to endpoints that support every field you send. Its Responses API rejects the logprob includable outright (`400 Invalid option: expected one of …` at `path: ["include", 0]`), so `api="auto"` there always resolves to `structured` |
+| OpenRouter | per model | it routes by price and, by default, sends your request to an endpoint that may ignore `logprobs` — the answer comes back with none, which `auto` reads as "no logprobs" and falls back on. Add `extra_body={"provider": {"require_parameters": True}}` to route only to endpoints that support every field you send. Its Responses API rejects the logprob includable outright (`400 Invalid option: expected one of …` at `path: ["include", 0]`), so an `auto` readout moves to Chat Completions, where the distribution arrives — verified live, with an explicit `method="logprobs"` as much as with `auto` |
 | everything else | unknown | reasoning models and thin compatibility layers are the ones that say no |
 
 With `auto` you do not have to know this table.
@@ -137,9 +143,10 @@ llama.cpp refuses the logprob fields there outright (`400 top_logprobs requires 
 and OpenAI's Responses logprobs hold the sampled token with no alternatives. When the label readout cannot
 produce a distribution on the chosen surface — for any reason other than a provider failure that survived its
 retries — `auto` re-asks on the other surface, marks the one that failed so later calls start where the
-distribution is, and keeps that mark for the model. Two things stop the move: `reasoning="native"`, because
-native reasoning is the reason to prefer Responses and switching would silently turn it into a two-step pass,
-and a server whose other route is missing or already known to be missing. A distribution arriving later on a
+distribution is, and keeps that mark for the model. Three things stop the move: `reasoning="native"`, because
+native reasoning is the reason to prefer Responses and switching would silently turn it into a two-step pass;
+a `grammar` request, which is a Chat Completions convention the other surface cannot carry; and a server whose
+other route is missing or already known to be missing. A distribution arriving later on a
 marked surface clears the mark: the verdict moves the readout, it does not condemn the surface.
 
 For the four servers this was checked against — what to pass, how to turn thinking off, and what fits a 12 GB

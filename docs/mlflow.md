@@ -3,8 +3,8 @@
 jevper is a plain library that drives a caller-supplied client, so integrating it with MLflow means two
 different things: MLflow's *tracing* sees the calls jevper makes, and MLflow's *hosting* surfaces can wrap
 jevper as a model. Both are covered here, verified against **MLflow 3.16.1** (2026-09-16), `openai` 3.19.2,
-`anthropic` 1.8.0 and jevper 0.5.1 — offline against a stub server, and live against a local ollama server
-on the probe box.
+`anthropic` 1.8.0 — offline against a stub server, and live against a local LM Studio server on the probe
+box, which is the only local server that answers all three surfaces jevper drives.
 
 Nothing in jevper imports MLflow, and MLflow is not a dependency. The integration suite is in
 `tests/test_mlflow.py` and skips unless MLflow is installed:
@@ -74,7 +74,7 @@ What lands on a span, all observed on real calls:
 | `mlflow.message.format` | `openai` or `anthropic` |
 | `mlflow.chat.tokenUsage` | `{"input_tokens", "output_tokens", "total_tokens"}`, plus `cache_read_input_tokens` on the Responses route; all three are `null` when the provider sent no usage |
 | `mlflow.spanInputs` / `mlflow.spanOutputs` | The request kwargs jevper built, and the raw provider response |
-| `mlflow.spanLogLevel` | `20` on success, `40` on a failed call |
+| `mlflow.spanLogLevel` | `20` on a successful SDK call, `40` on a failed one; a plain `@mlflow.trace` span of your own is `10` |
 | request fields | `mlflow.spanInputs` always holds every keyword jevper sent. MLflow *also* promotes some of them to attributes, and which ones depends on the route: `logprobs`, `top_logprobs`, `prompt_cache_key`, `model` on chat; `include`, `store`, `top_logprobs`, `model` on responses; none on the Messages route, where `max_tokens` lives in `span.inputs` |
 
 The request fields are what make the fallback ladder auditable: a server that refuses `response_format`
@@ -241,7 +241,7 @@ Three things the suite pins, because they change how you write the wrapper:
   without one MLflow drops the scorer with a warning and no metric appears.
 
 A judge is an OpenAI-compatible caller like any other, so it can be pointed at a local server: `model="openai:/<name>"`
-plus `OPENAI_API_KEY` and `OPENAI_API_BASE` (verified against a stub and against ollama on the probe box), or
+plus `OPENAI_API_KEY` and `OPENAI_API_BASE` (verified against a stub and, live, against LM Studio on the probe box), or
 `model="ollama:/<name>"`. The `gateway:/<route>` form resolves through `MLFLOW_GATEWAY_URI` (or an HTTP
 tracking URI) to the server-hosted gateway's passthrough path, so it does not reach the standalone gateway.
 

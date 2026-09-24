@@ -40,8 +40,9 @@ response.answers["intent"].probabilities  # a real distribution, read from the s
 | llama.cpp | `http://127.0.0.1:8080/v1` | the `--alias` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--jinja` for the model's own template; `grammar` is llama.cpp-only |
 | vLLM | `http://127.0.0.1:8000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; `top_logprobs` is capped by `--max-logprobs` (20) |
 | SGLang | `http://127.0.0.1:30000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; its Responses route needs `top_logprobs` sent explicitly, which jevper always does |
+| LM Studio | `http://127.0.0.1:1234/v1` | the id `lms ls` prints, e.g. `qwen3-4b-instruct-2507` | nothing does — load a non-thinking model | the only server here answering **all three** surfaces, so `auto` finds Responses, Chat Completions and Messages on one box; `logprobs` arrives on both OpenAI surfaces; its Responses route accepts `text.format` and ignores it, so structured answers belong on Chat Completions |
 
-`api="auto"` (the default) works against all four: it prefers the Responses surface, and when that route is
+`api="auto"` (the default) works against all five: it prefers the Responses surface, and when that route is
 missing — or answers without carrying logprobs through — it re-asks on Chat Completions and remembers the
 verdict. Passing `api="chat_completions"` skips the discovery entirely.
 
@@ -58,6 +59,7 @@ off for classification work — it costs a whole reasoning pass to choose one le
 | llama.cpp | `chat_template_kwargs: {"enable_thinking": false}` | `reasoning_effort: "none"` works too, since `--jinja` runs the model's own template; `reasoning_budget: 0`; `--reasoning-format deepseek` splits the trace into `reasoning_content` |
 | vLLM | `chat_template_kwargs: {"enable_thinking": false}` | `reasoning_effort` — but only with the values its parser accepts |
 | SGLang | `chat_template_kwargs: {"enable_thinking": false}` | `reasoning_effort` — but only with the values its parser accepts |
+| LM Studio | none reliably: omitting the field leaves the model's own template in charge, and `reasoning_effort: "none"` is ignored on its chat route (bug-tracker #2413; seen here — the trace still arrived, 1016 characters of it) | load an instruct model instead — `qwen3-4b-instruct-2507` answers without a reasoning trace |
 
 If you keep thinking on, `structured` and `discrete` are unaffected — they read the answer text, and the
 trace lands in `response.reasoning` (`message.reasoning` on ollama, `reasoning_content` on the others;
@@ -69,7 +71,7 @@ up to two trailing tokens that cannot be part of the answer are dropped before t
 
 ## What each server ignores, and what it rejects
 
-Unknown fields are accepted and dropped by all four, so a field that does not apply is not an error:
+Unknown fields are accepted and dropped by all five, so a field that does not apply is not an error:
 
 - `grammar` (jevper's `method="grammar"`) is a llama.cpp convention. ollama, vLLM and SGLang ignore it, so
   the model answers unconstrained and the label readout reports a non-label first token instead of a grammar
@@ -83,6 +85,24 @@ Unknown fields are accepted and dropped by all four, so a field that does not ap
   return two choices where jevper reads the first.
 - A `developer` message is a `400` (`Unexpected message role.`) on SGLang, so keep `state` to
   `system`/`user`/`assistant` roles. jevper's own turns never use another role.
+- LM Studio's Responses route accepts `text.format` with a strict `json_schema` and **ignores it** — structured
+  output is a Chat Completions feature there (bug-tracker #2403, #1396). Verified here with a schema whose keys
+  the prompt never named: the Responses route answered in the prompt's own shape, the Chat Completions route in
+  the schema's. jevper sends the schema in the request and, since it was accepted, does not repeat it in the
+  prompt, so `method="structured"` on that surface reads whatever the model invents. Use
+  `api="chat_completions"`, or `method="logprobs"`, for structured work there.
+- An unknown path is not a `404` on LM Studio: it answers `200` with
+  `{"error": "Unexpected endpoint or method. (POST /…)"}` (bug-tracker #618; confirmed here — `POST /v1/nope` and
+  `POST /v1/messages/count_tokens` both answer `200` with that body), which jevper reads as an embedded
+  provider error rather than a missing route — right for a real endpoint failing, so do not rely on route
+  discovery to catch a typo'd path there.
+- Usage accounting differs by route: Chat Completions reports no cached-token count at all, Responses reports
+  `input_tokens_details.cached_tokens`, and Messages reports `cache_read_input_tokens` — all three observed here
+  on the same server.
+- `reasoning_effort` is honoured on LM Studio's `/v1/responses` and ignored on `/v1/chat/completions`
+  (#2413), so the two OpenAI surfaces disagree about it; `/v1/responses` also ignores `instructions` (#1154).
+  The Messages route returns Anthropic-shaped `thinking` blocks when asked with an explicit
+  `budget_tokens` (1542 characters of it here), and reports `cache_read_input_tokens`.
 
 ## What each server actually answers
 
@@ -119,7 +139,7 @@ Three of these decide behaviour jevper implements rather than documents:
 ## Prompt caching
 
 Every one of these servers caches the prefix of a prompt and reuses it for the next request that starts the
-same way. None of them needs to be asked: prefix caching is on by default on all four (llama.cpp's
+same way. None of them needs to be asked: prefix caching is on by default on all five (llama.cpp's
 `--cache-prompt`, vLLM's `enable_prefix_caching`, SGLang's RadixAttention, ollama's runner cache), and the
 request fields the hosted APIs use to steer it — `prompt_cache_key`, `prompt_cache_retention`, `cache_salt`,
 `session_id`, `prompt_cache_options`, `prompt_cache_breakpoint` — are accepted with `200` and ignored by all

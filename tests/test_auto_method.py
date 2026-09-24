@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 from fakes import async_openai_client, chat_body, openai_client, responses_body
@@ -804,3 +805,84 @@ def test_async_auto_switches_surface_too(stub_server):
     assert stub.paths == ["/v1/responses", "/v1/chat/completions"]
     assert response.debug["api"] == "chat_completions"
     assert response.answers["q"].choice == "billing"
+
+
+def test_an_explicit_logprobs_moves_to_the_surface_that_carries_it(stub_server):
+    """OpenRouter: its Responses API refuses the logprob includable; Chat Completions carries them.
+
+    An explicit ``method="logprobs"`` asks for a distribution, not for one particular surface to
+    produce it, so the readout moves there and the caller's method is kept.
+    """
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)),
+        responses=lambda body: (400, INCLUDE_REJECTION) if body.get("include") else (200, responses_body(text="A")),
+    )
+    client = SystemOneClient(openai_client(stub), model="stub", method="logprobs")
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.debug["api"] == "chat_completions"
+    assert response.debug["method"] == "logprobs"
+    assert response.answers["q"].choice == "billing"
+    assert response.answers["q"].probabilities["billing"] == pytest.approx(0.884873983, abs=1e-9)
+    assert stub.paths == ["/v1/responses", "/v1/chat/completions"]
+
+
+def test_an_explicit_logprobs_starts_where_the_distribution_is_next_time(stub_server):
+    """The move is remembered, so the refusal is paid for once rather than on every call."""
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)),
+        responses=lambda body: (400, INCLUDE_REJECTION) if body.get("include") else (200, responses_body(text="A")),
+    )
+    client = SystemOneClient(openai_client(stub), model="stub", method="logprobs")
+
+    for _ in range(2):
+        response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.debug["api"] == "chat_completions"
+    assert stub.paths.count("/v1/responses") == 1  # the discovery, paid once
+    assert stub.paths.count("/v1/chat/completions") == 2
+
+
+def test_an_explicit_logprobs_is_not_swapped_for_another_readout(stub_server):
+    """With nowhere to move, the refusal is reported — the readout is not silently replaced."""
+    stub = stub_server(responses=lambda body: (400, INCLUDE_REJECTION) if body.get("include") else (200, responses_body(text=STRUCTURED)))
+    client = SystemOneClient(SimpleNamespace(responses=openai_client(stub).responses), model="stub", method="logprobs")
+
+    with pytest.raises(LabelReadoutError) as caught:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "rejected the logprob request" in str(caught.value)
+    assert stub.paths == ["/v1/responses"]  # never re-asked in JSON
+    assert stub.bodies("/responses")[0]["include"] == ["message.output_text.logprobs"]
+
+
+def test_an_explicit_surface_keeps_the_providers_refusal(stub_server):
+    """`api="responses"` is a decision: its refusal reaches the caller, not a fallback."""
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)),
+        responses=lambda body: (400, INCLUDE_REJECTION) if body.get("include") else (200, responses_body(text="A")),
+    )
+    client = SystemOneClient(openai_client(stub), model="stub", api="responses", method="logprobs")
+
+    with pytest.raises(ProviderError) as caught:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert caught.value.status_code == 400
+    assert stub.paths == ["/v1/responses"]
+
+
+def test_async_explicit_logprobs_moves_surface_too(stub_server):
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)),
+        responses=lambda body: (400, INCLUDE_REJECTION) if body.get("include") else (200, responses_body(text="A")),
+    )
+    client = AsyncSystemOneClient(async_openai_client(stub), model="stub", method="logprobs")
+
+    response = asyncio.run(client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}))
+
+    assert response.debug["api"] == "chat_completions"
+    assert response.debug["method"] == "logprobs"
+    assert stub.paths == ["/v1/responses", "/v1/chat/completions"]
+
+

@@ -675,20 +675,25 @@ class _BaseClient:
         return None
 
     def _logprob_surface_alternative(
-        self, surface: Surface, reasoning: ReasoningConfig | None
+        self, surface: Surface, reasoning: ReasoningConfig | None, method: Method | None = None
     ) -> Surface | None:
         """The other surface to try for a label readout, when the move is free of side effects.
 
         ``native`` reasoning exists only on the Responses surface, so a caller who asked for it — or
-        whose ``mode="auto"`` resolved to it — keeps the surface that choice implies. Otherwise the
-        move costs nothing but a request, and it is worth one: a server can implement a surface
-        without carrying logprobs through it — ollama answers the Responses route with an empty
-        logprob list, llama.cpp rejects the logprob fields there outright, and OpenAI's Responses
-        logprobs hold the sampled token and no alternatives — while Chat Completions on the same
-        server carries a full distribution.
+        whose ``mode="auto"`` resolved to it — keeps the surface that choice implies, and ``grammar``
+        is a Chat Completions convention with no counterpart anywhere, so a request that carries one
+        has nowhere to go. Otherwise the move costs nothing but a request, and it is worth one: a
+        server can implement a surface without carrying logprobs through it — ollama answers the
+        Responses route with an empty logprob list, llama.cpp rejects the logprob fields there
+        outright, and OpenAI's Responses logprobs hold the sampled token and no alternatives — while
+        Chat Completions on the same server carries a full distribution.
         """
         other: Surface = "chat_completions" if surface == "responses" else "responses"
-        if self._surface_missing(other) or resolve_reasoning_mode(reasoning, surface) == "native":
+        if (
+            method == "grammar"
+            or self._surface_missing(other)
+            or resolve_reasoning_mode(reasoning, surface) == "native"
+        ):
             return None
         return other if _has_attribute(self.client, f"{SURFACES[other][2]}.create") else None
 
@@ -744,7 +749,7 @@ class _BaseClient:
         remembered; one that only complains about the value it was sent is answered in JSON without
         being remembered. A server error that survived every retry is only a bad minute, so it is not.
         """
-        if context.auto and spec.logprobs:
+        if (context.auto or context.api_auto) and spec.logprobs:
             failure = f"{type(exc).__name__}: {exc}"
             if _logprobs_rejected(exc, spec):
                 capability = _logprobs_unsupported(exc, spec)
@@ -839,8 +844,14 @@ class _BaseClient:
             other: Surface = "chat_completions" if surface == "responses" else "responses"
             if _has_attribute(self.client, f"{SURFACES[other][2]}.create"):
                 surface = other
-        elif api_auto and auto and self._logprobs_absent_here(effective_model, surface):
-            alternative = self._logprob_surface_alternative(surface, effective_reasoning)
+        elif (
+            api_auto
+            and (auto or requested == "logprobs")
+            and self._logprobs_absent_here(effective_model, surface)
+        ):
+            alternative = self._logprob_surface_alternative(
+                surface, effective_reasoning, AUTO_METHOD if auto else requested
+            )
             if alternative is not None and not self._logprobs_absent_here(
                 effective_model, alternative
             ):
@@ -929,26 +940,33 @@ class _BaseClient:
                     yield from self._answer_steps(question_id, question, context, log, retry_reasons)
                 )
             except _LogprobsUnavailable as exc:
-                if not context.auto or fell_back:
+                if fell_back or not (context.auto or context.api_auto):
                     raise
                 # The surface that produced the verdict, which is not necessarily the one the shared
                 # context holds now: another question's worker may have moved it while this call was
                 # in flight.
                 surface = exc.surface or context.transport.surface
                 if exc.capability and exc.evidence != "transient" and context.api_auto:
-                    alternative = self._logprob_surface_alternative(surface, context.reasoning)
+                    alternative = self._logprob_surface_alternative(surface, context.reasoning, context.method)
                     if alternative is not None and not self._logprobs_absent_here(
                         context.model, alternative
                     ):
                         # The verdict is about this surface — it answered without logprobs, or refused
                         # the fields outright, as llama.cpp's Responses shim does. Mark it, so later
-                        # calls start where the distribution is, and answer this question there.
+                        # calls start where the distribution is, and answer this question there. The
+                        # move keeps the caller's method, so it is made even for an explicit
+                        # ``method="logprobs"``: that method asked for a distribution, not for a
+                        # particular surface to produce it.
                         self._remember_logprobs_unavailable(context.model, surface)
                         retry_reasons.append(
                             f"{exc} — retrying the label readout on api={alternative!r}"
                         )
                         self._switch_surface(context, alternative)
                         continue
+                if not context.auto:
+                    # An explicit method keeps its own contract: where no surface is left to carry it,
+                    # it reports the provider's refusal rather than being swapped for another readout.
+                    raise
                 fell_back = True
                 retry_reasons.append(f"{exc} — answering with method={FALLBACK_METHOD!r}")
                 self._note_surface_absence(context.model, surface, exc)
