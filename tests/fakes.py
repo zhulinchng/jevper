@@ -104,12 +104,11 @@ def responses_body(
 ) -> dict[str, Any]:
     """A ``response`` body with one assistant message and any reasoning items."""
     output_text: dict[str, Any] = {"type": "output_text", "text": text, "annotations": []}
-    content: list[dict[str, Any]] = []
     if refusal is not None:
         # This surface's refusal shape: a content part of its own type, and no output_text at all.
-        content.append({"type": "refusal", "refusal": refusal})
+        content: list[dict[str, Any]] = [{"type": "refusal", "refusal": refusal}]
     else:
-        content.append(output_text)
+        content = [output_text]
     if logprobs is not None:
         output_text["logprobs"] = [
             {
