@@ -105,6 +105,11 @@ Unknown fields are accepted and dropped by all five, so a field that does not ap
   the output with `extra_body={"max_tokens": n}` when a server is serving a small-context model. The
   Messages route is the exception — that API has no default at all, so jevper sends one (1024, plus any
   thinking budget) and refuses a caller's `max_tokens` that cannot hold the budget it asked for.
+- vLLM's `/v1/messages` answers 200 with a `thinking` block and no text at all for these probes — a
+  three-character trace, `stop_reason: "end_turn"`, `output_tokens: 2` — while the same server answers
+  its Chat Completions and Responses routes normally. jevper reports that as an empty answer naming the
+  stop reason, which is what happened; the cause is on the server side, so a Messages request there
+  wants a model whose template emits text on that route.
 - An unknown path is not a `404` on LM Studio: it answers `200` with
   `{"error": "Unexpected endpoint or method. (POST /…)"}` (bug-tracker #618; confirmed here — `POST /v1/nope` and
   `POST /v1/messages/count_tokens` both answer `200` with that body), which jevper reads as an embedded
