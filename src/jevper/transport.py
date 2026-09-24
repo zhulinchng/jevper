@@ -6,6 +6,7 @@ gets, and the normalizers turn either provider response object into one ``CallRe
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -14,9 +15,17 @@ from .errors import ClientCapabilityError, ProviderError
 from .reasoning import ReasoningConfig, ReasoningContentPart, ReasoningTextPart
 from .types import Method
 
-Surface = Literal["chat_completions", "responses"]
+Surface = Literal["chat_completions", "responses", "messages"]
 
 JSON_SCHEMA_FORMAT = "json_schema"
+
+# The Messages API has no default for ``max_tokens`` — Anthropic, vLLM and SGLang all refuse a
+# request without one — while jevper's other two surfaces leave the budget to the server. A
+# classification answer is a label or a small object, so this is generous for the answer and small
+# enough that a model which ignores the prompt cannot run away; ``extra_body={"max_tokens": n}``
+# overrides it. A caller who also sets ``ReasoningConfig(budget_tokens=n)`` has to keep that budget
+# under this one — Anthropic requires it, and answers 400 when it is not.
+DEFAULT_MAX_TOKENS = 1024
 
 
 @dataclass(frozen=True)
@@ -80,6 +89,35 @@ class Limits:
     include: bool = True
     cache_key: bool = True
     """Whether the server accepts ``prompt_cache_key``. Like the others, a field jevper may drop."""
+    thinking: bool = True
+    """Whether the server accepts the Messages API's ``thinking`` field. vLLM's protocol has no such
+    field at all, so a request carrying one is refused there and re-asked without it."""
+
+
+def _schema_instruction(spec: CallSpec) -> str:
+    schema = json.dumps(spec.json_schema, sort_keys=True, separators=(",", ":"))
+    return f"Reply with a single JSON object that validates against this JSON Schema:\n{schema}"
+
+
+def _schema_in_prompt(messages: list[dict[str, str]], spec: CallSpec) -> list[dict[str, str]]:
+    """The schema in the prompt, for a surface or a server that cannot carry one in the request.
+
+    Both OpenAI surfaces can constrain an answer with a schema field, and jevper sends one wherever the
+    server accepts it. Where it cannot — the Messages API has no such field at all, and a server that
+    refuses the strict schema is answered with a plain JSON object — the prompt is the only place left.
+    Without this the structured system prompt's "matches the provided schema exactly" would refer to
+    nothing that was ever provided, which is what a 4B model answers ``{"intent": "A"}`` to.
+
+    The schema joins the leading system message rather than becoming a turn of its own, so the
+    instruction stays where the other instructions are and the question block keeps its place.
+    """
+    if spec.json_schema is None:
+        return messages
+    instruction = _schema_instruction(spec)
+    if not messages or messages[0].get("role") != "system":
+        return [{"role": "system", "content": instruction}, *messages]
+    first, rest = messages[0], messages[1:]
+    return [{**first, "content": f"{first.get('content') or ''}\n\n{instruction}"}, *rest]
 
 
 def build_chat_kwargs(
@@ -96,14 +134,19 @@ def build_chat_kwargs(
     if spec.logprobs:
         kwargs["logprobs"] = True
         kwargs["top_logprobs"] = spec.top_logprobs
+    schema_sent = False
     if spec.json_schema is not None:
         if structured_outputs and limits.structured == "schema":
             kwargs["response_format"] = {
                 "type": JSON_SCHEMA_FORMAT,
                 "json_schema": {"name": spec.schema_name, "schema": spec.json_schema, "strict": True},
             }
+            schema_sent = True
         elif limits.structured != "none":
             kwargs["response_format"] = {"type": "json_object"}
+    if spec.json_schema is not None and not schema_sent:
+        # ``json_object`` constrains the answer to be *an* object, not to be *this* object.
+        kwargs["messages"] = _schema_in_prompt(spec.messages, spec)
     if spec.reasoning is not None and spec.reasoning.effort is not None and limits.reasoning:
         kwargs["reasoning_effort"] = spec.reasoning.effort
     if spec.prompt_cache_key is not None and limits.cache_key:
@@ -152,6 +195,7 @@ def build_responses_kwargs(
         }
         if reasoning:
             kwargs["reasoning"] = reasoning
+    schema_sent = False
     if spec.json_schema is not None:
         if structured_outputs and limits.structured == "schema":
             kwargs["text"] = {
@@ -162,8 +206,11 @@ def build_responses_kwargs(
                     "strict": True,
                 }
             }
+            schema_sent = True
         elif limits.structured != "none":
             kwargs["text"] = {"format": {"type": "json_object"}}
+    if spec.json_schema is not None and not schema_sent:
+        kwargs["input"] = _schema_in_prompt(spec.messages, spec)
     if spec.prompt_cache_key is not None and limits.cache_key:
         kwargs["prompt_cache_key"] = spec.prompt_cache_key
     if spec.temperature is not None:
@@ -382,6 +429,133 @@ def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
     )
 
 
+def _split_system(messages: list[dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
+    """The Messages API's top-level ``system``, and the turns that go in ``messages``.
+
+    Anthropic has no ``system`` role inside ``messages``: a server that accepts one renders it
+    positionally into the chat template, which llama.cpp's Qwen template refuses outright and vLLM
+    and SGLang answer 400 for. jevper's own prompt is always the first turn, and
+    ``prompts.hoist_instructions`` folds a state's instruction turns into it, so in practice there is
+    exactly one — anything else that calls itself ``system`` is joined to it rather than dropped.
+    """
+    system: list[str] = []
+    turns: list[dict[str, str]] = []
+    for message in messages:
+        if message.get("role") == "system":
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                system.append(content)
+            continue
+        turns.append(message)
+    return "\n\n".join(system), turns
+
+
+def build_messages_kwargs(
+    spec: CallSpec,
+    *,
+    model: str,
+    structured_outputs: bool = True,
+    extra_body: Mapping[str, Any] | None = None,
+    extra_headers: Mapping[str, str] | None = None,
+    limits: Limits | None = None,
+) -> dict[str, Any]:
+    """The Anthropic Messages request.
+
+    Two fields of the other surfaces have no equivalent here, so neither is ever sent: there is no
+    logprob carrier at all, and no schema field — so the JSON Schema travels in the system prompt
+    instead, which is the only place this request can state the answer's shape. ``structured_outputs``
+    is therefore accepted and unused, so that every surface builder keeps one signature.
+    """
+    limits = limits or Limits()
+    system, turns = _split_system(spec.messages)
+    if spec.json_schema is not None:
+        # This API has no schema field at all, so the shape has to travel in the top-level system
+        # prompt — the only place a request on this surface can state the answer's format.
+        instruction = _schema_instruction(spec)
+        system = f"{system}\n\n{instruction}" if system else instruction
+    body = dict(extra_body or {})
+    kwargs: dict[str, Any] = {
+        "model": model,
+        # Required by this API, with no server-side default anywhere that implements it.
+        "max_tokens": body.pop("max_tokens", DEFAULT_MAX_TOKENS),
+        "messages": turns,
+    }
+    if system:
+        kwargs["system"] = system
+    if spec.reasoning is not None and limits.thinking and spec.reasoning.budget_tokens is not None:
+        kwargs["thinking"] = {"type": "enabled", "budget_tokens": spec.reasoning.budget_tokens}
+    if spec.temperature is not None:
+        # Not a typed parameter of the SDK's ``messages.create`` — the newest Claude models refuse a
+        # non-default temperature, so the client stopped naming it — but the API itself still accepts
+        # one, and every local server implementing this API reads it. The caller's own body wins.
+        body.setdefault("temperature", spec.temperature)
+    if body:
+        kwargs["extra_body"] = body
+    if extra_headers:
+        kwargs["extra_headers"] = dict(extra_headers)
+    return kwargs
+
+
+def _messages_text(response: Any) -> str:
+    return "".join(
+        str(_get(block, "text") or "")
+        for block in _get(response, "content") or ()
+        if _get(block, "type") == "text"
+    )
+
+
+def _messages_reasoning(response: Any) -> tuple[ReasoningContentPart, ...]:
+    """The response's thinking blocks, in the shape the other surfaces' reasoning arrives in.
+
+    ``signature`` and anything else the provider sent is kept in the part's extra fields, so a caller
+    replaying a turn into a later request does not lose what the provider wants back. An empty
+    ``thinking`` string is not a trace: Anthropic answers that way when the block is deliberately
+    omitted, and a part with no text would make ``reasoning_text`` return an empty line.
+    """
+    parts: list[ReasoningContentPart] = []
+    for block in _get(response, "content") or ():
+        if _get(block, "type") != "thinking":
+            continue
+        text = _get(block, "thinking")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        payload = {
+            name: value
+            for name, value in _as_mapping(block).items()
+            if name not in ("type", "thinking")
+        }
+        payload["type"] = "reasoning"
+        payload["content"] = [{"type": "reasoning_text", "text": text}]
+        try:
+            parts.append(ReasoningContentPart.model_validate(payload))
+        except ValueError:
+            continue
+    return tuple(parts)
+
+
+def _messages_result(response: Any, request: dict[str, Any]) -> CallResult:
+    if _get(response, "type") == "error":
+        raise _embedded_error(response) or ClientCapabilityError("provider reported an error")
+    usage = _get(response, "usage")
+    details = _get(usage, "output_tokens_details")
+    return CallResult(
+        text=_messages_text(response),
+        # No server that implements this API returns logprobs through it.
+        token_logprobs=(),
+        reasoning=_messages_reasoning(response),
+        surface="messages",
+        request=request,
+        response=response,
+        input_tokens=_get(usage, "input_tokens"),
+        output_tokens=_get(usage, "output_tokens"),
+        reasoning_tokens=_get(details, "thinking_tokens"),
+        # Anthropic reports what it read from its cache under this name; a server without prompt
+        # caching reports nothing at all, which stays ``None`` rather than becoming a zero.
+        cached_tokens=_get(usage, "cache_read_input_tokens"),
+        stop=_get(response, "stop_reason"),
+    )
+
+
 SurfaceBuilder = Callable[..., dict[str, Any]]
 SurfaceNormalizer = Callable[[Any, dict[str, Any]], CallResult]
 
@@ -389,6 +563,7 @@ SurfaceNormalizer = Callable[[Any, dict[str, Any]], CallResult]
 SURFACES: dict[Surface, tuple[SurfaceBuilder, SurfaceNormalizer, str]] = {
     "chat_completions": (build_chat_kwargs, _chat_result, "chat.completions"),
     "responses": (build_responses_kwargs, _responses_result, "responses"),
+    "messages": (build_messages_kwargs, _messages_result, "messages"),
 }
 
 
@@ -454,6 +629,7 @@ def _has_attribute(client: Any, path: str) -> bool:
 def select_surface(client: Any, api: str, method: Method) -> Surface:
     has_chat = _has_attribute(client, "chat.completions.create")
     has_responses = _has_attribute(client, "responses.create")
+    has_messages = _has_attribute(client, "messages.create")
     if api == "responses":
         if not has_responses:
             raise ClientCapabilityError("client has no responses.create; pass api='chat_completions'")
@@ -462,6 +638,13 @@ def select_surface(client: Any, api: str, method: Method) -> Surface:
         if not has_chat:
             raise ClientCapabilityError("client has no chat.completions.create; pass api='responses'")
         return "chat_completions"
+    if api == "messages":
+        if not has_messages:
+            raise ClientCapabilityError(
+                "client has no messages.create; pass an Anthropic-compatible client, or "
+                "api='chat_completions'/'responses' for an OpenAI-compatible one"
+            )
+        return "messages"
     if method == "grammar":
         if not has_chat:
             raise ClientCapabilityError(
@@ -473,7 +656,14 @@ def select_surface(client: Any, api: str, method: Method) -> Surface:
         return "responses"
     if has_chat:
         return "chat_completions"
-    raise ClientCapabilityError("client exposes neither responses.create nor chat.completions.create")
+    if has_messages:
+        # The only surface this client has. No label readout exists on it, which is the caller's
+        # method resolution to handle: ``auto`` answers in JSON there, an explicit ``logprobs`` is
+        # refused before any request is sent.
+        return "messages"
+    raise ClientCapabilityError(
+        "client exposes none of responses.create, chat.completions.create or messages.create"
+    )
 
 
 def make_transport(

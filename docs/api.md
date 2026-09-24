@@ -19,15 +19,16 @@ from jevper import SystemOneClient, AsyncSystemOneClient, Choice, Noul, Score, E
 SystemOneClient(client, **options)
 ```
 
-`client` is any object exposing `responses.create` and/or `chat.completions.create`; it stays owned by the
-caller (`close()` only shuts down jevper's own thread pool).
+`client` is any object exposing `responses.create`, `chat.completions.create` and/or `messages.create` (the
+Anthropic SDK's, pointed at any server that implements the Messages API); it stays owned by the caller
+(`close()` only shuts down jevper's own thread pool).
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `model` | required | Model id sent with every call; overridable per `system_one` call |
 | `method` | `"auto"` | `"auto"`, `"logprobs"`, `"grammar"`, `"structured"` or `"discrete"`; `"auto"` resolves per model and surface — see [methods.md](methods.md#auto) |
-| `api` | `"auto"` | `"auto"`, `"chat_completions"` or `"responses"`; `"auto"` prefers `responses` and falls back to `chat_completions` when the server answers 404 for that route — see [methods.md](methods.md#auto) |
-| `reasoning` | `None` | A `ReasoningConfig`; `None` disables reasoning entirely |
+| `api` | `"auto"` | `"auto"`, `"chat_completions"`, `"responses"` or `"messages"` (the Anthropic Messages API); `"auto"` prefers `responses`, then `chat_completions`, then `messages`, falling back when the server answers 404 for a route — see [methods.md](methods.md#auto) |
+| `reasoning` | `None` | A `ReasoningConfig`; `None` disables reasoning entirely. `mode="auto"` resolves to `native` on the Responses surface and `two_step` elsewhere, and `budget_tokens` is what the Messages surface sends as its `thinking` field — see [reasoning.md](reasoning.md) |
 | `examples` | `()` | Default few-shot examples: a sequence for all questions, or a mapping keyed by question id |
 | `structured_outputs` | `True` | Send a strict `json_schema` response format; `False` falls back to `{"type": "json_object"}` with the schema left in the prompt. A server that refuses the strict schema gets the same fallback automatically |
 | `normalize_probabilities` | `True` | Rescale `structured` distributions that are off by more than `1e-6`; `False` returns the model's numbers verbatim |
@@ -37,7 +38,7 @@ caller (`close()` only shuts down jevper's own thread pool).
 | `retry` | `None` | Transient-failure retries; `RetryPolicy()` (2 retries, 0.5s base, 8s cap) when unset |
 | `temperature` | `None` | Not sent unless set. `0.0` is recommended for `structured`/`discrete`; `logprobs` needs no setting |
 | `prompt_cache_key` | `None` | The provider's cache-routing key. Unset, jevper derives one per question from the parts of the prompt that do not change between calls, so a rubric's requests are routed together; set it to group (or account for) requests your own way |
-| `extra_body` | `None` | Merged into every request body (the grammar field is merged here too) |
+| `extra_body` | `None` | Merged into every request body (the grammar field is merged here too). On the Messages surface, `max_tokens` comes from here — jevper always sends one there, defaulting to `DEFAULT_MAX_TOKENS` (1024) |
 | `extra_headers` | `None` | Sent with every request |
 
 Constructor validation is eager: an unknown `method`/`api`, `top_logprobs` outside `[0, 20]` or below 2 with a
@@ -197,7 +198,7 @@ SGLang's `--enable-cache-report` for its Chat Completions route. See
 | --- | --- |
 | `method` | The call-level method: what `method="auto"` resolved to for this call, or the method you pinned. A question that skips the probe — a `Choice` past 26 options is answered in JSON without ever asking for logprobs — reports its own method in `methods`, so read that when they can differ |
 | `methods` | `{question_id: method}` — only for `method="auto"`, since the method is then chosen per question |
-| `api` | Surface actually used (`"chat_completions"` or `"responses"`) |
+| `api` | Surface actually used (`"chat_completions"`, `"responses"` or `"messages"`) |
 | `reasoning_mode` | `"off"`, `"native"` or `"two_step"` |
 | `llm_attempts` | One record per provider call: `question_id`, `surface`, `request`, `response`, `error`, `readout` |
 | `retry_reasons` | Corrective-retry messages, in order |

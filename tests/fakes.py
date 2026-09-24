@@ -142,12 +142,59 @@ def responses_body(
     }
 
 
+def messages_body(
+    *,
+    text: str,
+    thinking: str | None = None,
+    signature: str | None = None,
+    stop_reason: str | None = "end_turn",
+    input_tokens: int | None = 10,
+    output_tokens: int | None = 3,
+    thinking_tokens: int | None = None,
+    cached_tokens: int | None = None,
+) -> dict[str, Any]:
+    """An Anthropic ``message`` body: a content-block list, thinking before the answer text."""
+    content: list[dict[str, Any]] = []
+    if thinking is not None:
+        block: dict[str, Any] = {"type": "thinking", "thinking": thinking}
+        if signature is not None:
+            block["signature"] = signature
+        content.append(block)
+    content.append({"type": "text", "text": text})
+    usage: dict[str, Any] = {}
+    if input_tokens is not None:
+        usage["input_tokens"] = input_tokens
+    if output_tokens is not None:
+        usage["output_tokens"] = output_tokens
+    if thinking_tokens is not None:
+        usage["output_tokens_details"] = {"thinking_tokens": thinking_tokens}
+    if cached_tokens is not None:
+        usage["cache_read_input_tokens"] = cached_tokens
+    return {
+        "id": "msg_stub",
+        "type": "message",
+        "role": "assistant",
+        "model": "stub",
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": usage,
+    }
+
+
 class StubServer:
     """Threaded HTTP server recording every request body it receives."""
 
-    def __init__(self, *, chat: Script | None = None, responses: Script | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        chat: Script | None = None,
+        responses: Script | None = None,
+        messages: Script | None = None,
+    ) -> None:
         self.chat = chat
         self.responses = responses
+        self.messages = messages
         self.requests: list[dict[str, Any]] = []
         self.paths: list[str] = []
         stub = self
@@ -161,7 +208,12 @@ class StubServer:
                 body = json.loads(raw or b"{}")
                 stub.requests.append(body)
                 stub.paths.append(self.path)
-                script = stub.responses if self.path.endswith("/responses") else stub.chat
+                if self.path.endswith("/responses"):
+                    script = stub.responses
+                elif self.path.endswith("/messages"):
+                    script = stub.messages
+                else:
+                    script = stub.chat
                 if script is None:
                     status, payload = 404, {"error": {"message": f"no stub script for {self.path}"}}
                 else:
@@ -247,3 +299,16 @@ def async_openai_client(stub: StubServer) -> Any:
     from openai import AsyncOpenAI
 
     return AsyncOpenAI(base_url=stub.base_url, api_key="test", max_retries=0, timeout=10)
+
+
+def anthropic_client(stub: StubServer) -> Any:
+    """The real SDK, pointed at the stub: it appends ``/v1/messages`` to the base URL itself."""
+    from anthropic import Anthropic
+
+    return Anthropic(base_url=stub.base_url, api_key="test", max_retries=0, timeout=10)
+
+
+def async_anthropic_client(stub: StubServer) -> Any:
+    from anthropic import AsyncAnthropic
+
+    return AsyncAnthropic(base_url=stub.base_url, api_key="test", max_retries=0, timeout=10)

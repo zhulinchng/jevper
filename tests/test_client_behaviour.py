@@ -860,6 +860,12 @@ def test_a_refused_json_schema_is_answered_with_json_object(stub_server):
         body["response_format"]["type"] for body in stub.bodies("/chat/completions")
     ] == ["json_schema", "json_object", "json_object"]
     assert first.debug["server_limits"]["structured"] == "object"
+    # The strict request carried the schema in the request itself; the two that fell back carry it in
+    # the prompt, because a plain JSON object is not this JSON object.
+    assert [
+        '"probabilities"' in body["messages"][0]["content"]
+        for body in stub.bodies("/chat/completions")
+    ] == [False, True, True]
 
 
 def test_a_refused_json_object_is_answered_without_a_response_format(stub_server):

@@ -169,7 +169,12 @@ def test_structured_without_strict_outputs_falls_back_to_json_object(stub_server
 
     client.system_one(state="s", questions={"q": Choice(criteria={"billing": None, "sales": None})})
 
-    assert stub.bodies("/chat/completions")[0]["response_format"] == {"type": "json_object"}
+    body = stub.bodies("/chat/completions")[0]
+    assert body["response_format"] == {"type": "json_object"}
+    # ``json_object`` constrains the answer to be *an* object, not to be *this* object, so the schema
+    # itself has to travel in the prompt — otherwise the structured system prompt's "matches the
+    # provided schema exactly" refers to nothing that was provided.
+    assert '"probabilities"' in body["messages"][0]["content"]
 
 
 def test_structured_noul_and_score_shapes(stub_server):

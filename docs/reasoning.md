@@ -13,15 +13,18 @@ ReasoningConfig(effort="medium", summary="auto", mode="auto")
 - `summary` — `auto`, `concise`, `detailed`
 - `context` — `auto`, `current_turn`, `all_turns`
 - `mode` — `auto`, `native`, `two_step`
+- `budget_tokens` — the thinking budget for the Messages surface's `thinking` field; unset sends no
+  `thinking` at all, and `effort` is never translated into a budget, because the mapping between a name and
+  a token count is the caller's. Anthropic requires at least 1024 and strictly less than `max_tokens`
 
 ## Mode resolution
 
-| `mode` | Responses surface | Chat Completions surface |
-| --- | --- | --- |
-| `auto` (default) | `native` | `two_step` |
-| `native` | provider reasoning on the answer call | `reasoning_effort` on the answer call |
-| `two_step` | analysis call, then answer call | analysis call, then answer call |
-| reasoning not configured | off | off |
+| `mode` | Responses surface | Chat Completions surface | Messages surface |
+| --- | --- | --- | --- |
+| `auto` (default) | `native` | `two_step` | `two_step` |
+| `native` | provider reasoning on the answer call | `reasoning_effort` on the answer call | `thinking` on the answer call, when `budget_tokens` is set |
+| `two_step` | analysis call, then answer call | analysis call, then answer call | analysis call, then answer call |
+| reasoning not configured | off | off | off |
 
 `response.debug["reasoning_mode"]` reports what was actually used.
 
@@ -86,6 +89,16 @@ One asymmetry to know about: the analysis call only receives reasoning parameter
 Responses API. On Chat Completions a two-step call sends no `reasoning_effort` at all — the analysis prompt
 *is* the reasoning step. If you want the provider's own reasoning on the chat surface, use
 `mode="native"`.
+
+## Models that always think
+
+Some templates cannot turn thinking off — the Qwen3 2507 *Thinking* releases are the example: their chat
+template primes the assistant turn with ` thinking` and exposes no toggle, so a request that asks for no
+reasoning still gets a reasoning span. That costs the label readout. `logprobs` and `grammar` read the first
+non-whitespace token of the *answer*, and a model that thinks first and then answers in prose raises
+`LabelReadoutError` carrying whatever it wrote — `Okay`, on `Qwen3-4B-Thinking-2507` served by ollama.
+`structured` and `discrete` are unaffected: they parse the JSON object out of the answer text, wherever the
+reasoning went. Use one of those for an always-thinking model, or a model that can be asked not to think.
 
 ## Reading the trace
 

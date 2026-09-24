@@ -25,6 +25,7 @@ from .errors import (
     LabelReadoutError,
     MalformedAnswerError,
     ProviderError,
+    UnsupportedMethodError,
     _LogprobsUnavailable,
     _SurfaceUnavailable,
 )
@@ -128,6 +129,9 @@ _INCLUDE_REJECTION_MARKERS = ("invalid option", "invalid_value", "expected one o
 # so either way — vLLM's request models reject unknown fields outright — and the key is optional, so it
 # is dropped and the call re-asked like the other capability fields.
 _CACHE_KEY_MARKERS = ("prompt_cache_key", "prompt cache key", "cache key")
+# Text that names the Messages API's thinking budget rather than a bad value. vLLM's protocol has no
+# ``thinking`` field at all, so a request carrying one is refused there and re-asked without it.
+_THINKING_MARKERS = ("thinking", "budget_tokens")
 # A 404 that names the model *and* talks about a model is about the model: the other surface would
 # answer the same way, so switching would only hide the real problem. Both halves are required —
 # an unrelated message can easily contain a short model name, and a server that does not implement
@@ -137,7 +141,7 @@ _TRANSIENT_NAME_MARKERS = ("Connection", "Timeout")
 _TRANSIENT_TRANSPORT_CLASSES = frozenset({"TransportError", "TimeoutException"})
 METHODS: tuple[Method, ...] = ("logprobs", "grammar", "structured", "discrete")
 METHOD_SELECTIONS: tuple[MethodSelection, ...] = ("auto", *METHODS)
-APIS: tuple[Api, ...] = ("auto", "chat_completions", "responses")
+APIS: tuple[Api, ...] = ("auto", "chat_completions", "responses", "messages")
 AUTO_METHOD: Method = "logprobs"  # what method="auto" tries first
 FALLBACK_METHOD: Method = "structured"  # what it answers with when logprobs are unavailable
 # Readout-level absences auto needs before it treats a provider as unable to return logprobs. One
@@ -514,7 +518,13 @@ class _BaseClient:
     # -- method="auto" -----------------------------------------------------------------
 
     def _auto_method(self, model: str, surface: Surface) -> Method:
-        """The method ``auto`` uses here: what this client learned, or the preferred method."""
+        """The method ``auto`` uses here: what this client learned, or the preferred method.
+
+        The Messages API carries no logprobs at all, so a label readout has no first attempt to make
+        there: ``auto`` starts at the JSON answer instead of spending a request to discover this.
+        """
+        if surface == "messages":
+            return FALLBACK_METHOD
         with self._auto_lock:
             return self._auto_methods.get((model, surface), AUTO_METHOD)
 
@@ -595,6 +605,12 @@ class _BaseClient:
             marker in evidence for marker in _CACHE_KEY_MARKERS
         ):
             return replace(limits, cache_key=False)
+        if (
+            spec.reasoning is not None
+            and limits.thinking
+            and any(marker in evidence for marker in _THINKING_MARKERS)
+        ):
+            return replace(limits, thinking=False)
         return None
 
     def _logprob_surface_alternative(
@@ -743,6 +759,13 @@ class _BaseClient:
         if requested == "grammar":
             methods.require_grammar_surface(surface)
         effective_method = self._auto_method(effective_model, surface) if auto else requested
+        if surface == "messages" and effective_method in ("logprobs", "grammar"):
+            # Checked before any request: no server that implements this API returns logprobs through
+            # it, so an explicit label readout there could only ever fail — and would fail late.
+            raise UnsupportedMethodError(
+                "the Messages API returns no logprobs: use method='structured' or 'discrete', or an "
+                "OpenAI-compatible client for a label readout"
+            )
         if not auto:
             # auto never reaches the label-readout cap: a wide Choice is answered in JSON.
             for question_id, question in parsed.items():
@@ -1055,6 +1078,7 @@ class _BaseClient:
                 "reasoning": limits.reasoning,
                 "include": limits.include,
                 "cache_key": limits.cache_key,
+                "thinking": limits.thinking,
             }
         return SystemOneResponse(
             model=context.model,

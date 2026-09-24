@@ -102,16 +102,22 @@ flowchart TD
     A["select_surface(client, api, method)"] --> B{"api"}
     B -->|"responses"| C["require client.responses.create"]
     B -->|"chat_completions"| D["require client.chat.completions.create"]
+    B -->|"messages"| G["require client.messages.create"]
     B -->|"auto"| E{"method == grammar"}
     E -->|"yes"| D
     E -->|"no"| F{"client has responses.create"}
     F -->|"yes"| C
-    F -->|"no"| D
+    F -->|"no"| H{"client has chat.completions.create"}
+    H -->|"yes"| D
+    H -->|"no"| G
     C -->|"404 that does not name the model"| D
 ```
 
 `api="auto"` (the default) prefers the Responses surface because it carries native reasoning and encrypted
-content, except for `grammar`, which only Chat Completions can carry. A missing attribute raises
+content, except for `grammar`, which only Chat Completions can carry. `messages` — the Anthropic-compatible
+API — is the last choice of all: no server returns logprobs through it, because the field does not exist in
+it, so a client whose only surface is `messages` answers with `structured` and an explicit `logprobs` or
+`grammar` raises `UnsupportedMethodError` before any request is sent. A missing attribute raises
 `ClientCapabilityError` naming the surface to pass explicitly.
 
 A client object cannot tell you whether the *server* implements the route: `openai.OpenAI` exposes

@@ -187,6 +187,50 @@ SystemOneClient(client, model="qwen3.5-9b", extra_body={"cache_salt": tenant_id}
 
 vLLM caps the salt at 128 characters and rejects `@`, `/`, `\` and NUL; llama.cpp and ollama ignore the field.
 
+## The Messages route
+
+All five servers here also implement the Anthropic Messages API (`POST /v1/messages`), so jevper's
+`api="messages"` works against each of them — the `anthropic` SDK pointed at the same host and port as the
+OpenAI one. What differs is how much of the protocol each server implements; the versions are the first
+release of each project that ships the route.
+
+| Server | Since | `thinking` field | Thinking blocks back | `usage` cache counts |
+| --- | --- | --- | --- | --- |
+| LM Studio | 0.4.1 | accepted, and the answer is still separated from it | `thinking` blocks when the model thinks | `cache_read_input_tokens`, including a reported `0` on a cold call |
+| llama.cpp | b7187 | accepted | reported | not documented |
+| vLLM | 0.11.1 | **absent from its protocol**, so the request is refused and jevper drops the field and re-asks | `thinking` blocks | yes |
+| SGLang | 0.5.9 | accepted, including `type: enabled/disabled/adaptive` | `thinking` blocks | yes |
+| ollama | 0.14.0 | accepted, but `budget_tokens` is accepted and **not enforced** | `thinking` blocks | no cache fields at all |
+
+No server returns logprobs through this route — the API has no field for one — so `method="structured"` or
+`"discrete"` is how to use it, and `method="auto"` resolves to `structured` there without spending a request
+to find out. `max_tokens` is required by vLLM's and SGLang's implementations and has no default on any of
+them, so jevper always sends one (1024 unless `extra_body={"max_tokens": n}` says otherwise). A `system` role
+*inside* `messages` is not part of the API, so jevper moves it to the top-level `system` field. Measured here,
+ollama, llama.cpp, vLLM and SGLang all answer `200` for one on this route: the `400 System message must be at
+the beginning.` that vLLM and SGLang give belongs to the *OpenAI* surfaces, where a state's own instruction
+turns would otherwise land in the middle of the conversation.
+
+The reasoning parsers matter here too. With thinking left on — vLLM's and SGLang's templates default to it —
+the parser puts the whole generation into a thinking block and returns no text block at all, so there is no
+answer to read and a `structured` call raises `MalformedAnswerError`, whose message now says the response
+carried reasoning only. Disable thinking per call, exactly as on the other surfaces:
+`extra_body={"chat_template_kwargs": {"enable_thinking": False}}` — with that, every scenario on vLLM's
+Messages route answers, on both the non-thinking and the thinking model.
+
+SGLang needs one more decision, on the server side. With `--reasoning-parser qwen3` and a *non-thinking*
+model — whose template has no `enable_thinking` to set, so the parser never sees the closing thinking marker
+it waits for — the whole generation is classified as reasoning and the route answers with a thinking block and
+no text block. `separate_reasoning: false` does not change that; dropping `--reasoning-parser` does, and the
+structured scenarios then answer normally. It is a property of serving a model that never emits the marker
+with a parser that waits for it, not of the client.
+
+One thing the fleet showed that the protocol does not say: no server constrains the *shape* of the answer on
+this route, because there is no schema field in it. jevper therefore puts the JSON Schema in the system
+prompt, and the answer is then only as good as the model's instruction-following. Without that the structured
+system prompt referred to "the provided schema" while nothing provided one, and a 4B model answered
+`{"intent": "A"}` — a real answer in the wrong shape — to every structured question.
+
 ## Sizing a 12 GB card
 
 A 9B model at 4-bit is 5.5-8.5 GB of weights, which leaves room for a small KV cache but not much else. What
@@ -196,7 +240,7 @@ worked here, one server at a time (they cannot share the card):
 | --- | --- | --- |
 | ollama | `qwen3.5:9b` (Q4_K_M, 6.1 GiB) | `OLLAMA_CONTEXT_LENGTH=4096`, `OLLAMA_MAX_LOADED_MODELS=1`, `OLLAMA_NUM_PARALLEL=1` |
 | llama.cpp | Q4_K_M GGUF (5.75 GiB) | `-ngl 99 --ctx-size 4096 -np 1 --jinja` |
-| vLLM | 4-bit compressed-tensors AWQ (8.45 GiB) | `--language-model-only --gpu-memory-utilization 0.80 --max-model-len 1024 --max-num-seqs 1 --enforce-eager` — dropping the vision tower is what makes it fit: without it the engine dies at init, with it the server came up in 43 s and gave 1.88 GiB of KV cache |
+| vLLM | 4-bit compressed-tensors AWQ (8.45 GiB) | `--language-model-only --gpu-memory-utilization 0.80 --max-model-len 1024 --max-num-seqs 1 --enforce-eager` — dropping the vision tower is what makes it fit: without it the engine dies at init, with it the server came up in 43 s and gave 1.88 GiB of KV cache. A **bf16** model (the 4B 2507 pair, 8.1 GiB) needs `VLLM_USE_FLASHINFER_SAMPLER=0`: FlashInfer's top-p/top-k sampler JIT-compiles when the engine starts, and with no CUDA toolkit on the box the engine dies with `Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist` before it serves anything — a path the AWQ checkpoint never reaches. Disabled, it starts and says so: *FlashInfer top-p/top-k sampling disabled* |
 | SGLang | same 8.45 GiB checkpoint | `--mem-fraction-static 0.85 --context-length 4096 --attention-backend triton --sampling-backend pytorch --disable-cuda-graph` — the weights alone exceed 0.80 of the card (SGLang's own guard says so), and FlashInfer's JIT cannot build here, so SGLang's Triton kernels are required; unlike vLLM it has no `--language-model-only` for this architecture, so the vision tower cannot be dropped |
 
 Neither builder sends `max_tokens`, so a chatty model can generate far more than the answer needs. Bound it

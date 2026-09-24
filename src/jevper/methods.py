@@ -234,14 +234,21 @@ def _stop_note(result: CallResult) -> str:
     "length"`` and nothing but reasoning tokens. "No non-whitespace token in the response" is true
     and useless; the budget is the actionable fact.
     """
-    if result.stop is None:
-        return ""
     if result.stop in ("length", "max_output_tokens"):
         return (
             f" — the provider ran out of output tokens before the answer was complete "
             f"({result.stop!r}); raise the limit, for example extra_body={{'max_tokens': 2048}}"
         )
-    return f" — the provider reported {result.stop!r}"
+    note = f" — the provider reported {result.stop!r}" if result.stop is not None else ""
+    if not result.text.strip() and result.reasoning:
+        # A reasoning parser can put the whole generation in the reasoning channel and send no answer
+        # at all: vLLM and SGLang do exactly that whenever thinking is on, which is a deployment
+        # setting rather than something another attempt could fix.
+        note += (
+            " — the answer was empty and the response carried reasoning only: this server separates "
+            "reasoning from the answer, and its thinking may be on"
+        )
+    return note
 
 
 def first_answer_token(result: CallResult, labels: Sequence[str], *, method: Method) -> TokenLogprob:

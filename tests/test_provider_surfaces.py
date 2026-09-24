@@ -2,7 +2,8 @@
 
 The bodies in ``tests/fixtures/providers/`` were recorded with raw HTTP from ollama 0.34.3, llama.cpp
 b11139, vLLM 0.30.1 and SGLang 0.5.20, each serving ``Qwen3.5-9B`` at 4-bit (the recipes are in
-``docs/local-servers.md``). Replaying them keeps the shapes those servers really send in front of every
+``docs/local-servers.md``); the ``messages-*`` cases come from the same servers serving the Qwen3-4B
+2507 pair, through the Anthropic-compatible route. Replaying them keeps the shapes those servers really send in front of every
 future change — an empty logprob array, ``reasoning`` versus ``reasoning_content``, ``{"detail": "Not
 Found"}``, a 404 that names the model, ``status: "incomplete"`` — without needing a GPU.
 
@@ -416,3 +417,55 @@ def test_a_server_that_reports_nothing_is_not_a_reported_zero():
     assert cold.response["usage"]["prompt_tokens_details"] is None
     assert cold.cached_tokens is None
     assert warm.cached_tokens and warm.cached_tokens > 0
+
+
+def messages_servers() -> list[str]:
+    """Every server whose fixtures carry the Messages route.
+
+    LM Studio is the one server recorded for that route alone — its OpenAI-route cases were not captured —
+    so it takes part in these tests and not the others.
+    """
+    return [
+        server
+        for server in (*SERVERS, "lmstudio")
+        if "messages-plain" in recorded(server)
+    ]
+
+
+@pytest.mark.parametrize("server", messages_servers())
+def test_a_recorded_message_answer_is_read(server):
+    """The Messages route is a different wire shape: a content-block list, not a choices list.
+
+    ollama's and llama.cpp's cases come from a non-thinking model and carry a text block. vLLM's and
+    SGLang's come from the thinking model with thinking on, which their reasoning parsers answer with a
+    thinking block and no text block at all — the shape that leaves nothing to parse. Pinned here so the
+    normalizer keeps the two apart: reasoning is never passed off as the answer.
+    """
+    record = recorded(server)["messages-plain"]
+    blocks = [block["type"] for block in record["body"]["content"]]
+    normalize = SURFACES["messages"][1]
+
+    result = normalize(record["body"], {})
+
+    assert record["status"] == 200
+    assert result.stop in ("end_turn", "max_tokens")
+    assert result.input_tokens == record["body"]["usage"]["input_tokens"]
+    assert result.token_logprobs == ()
+    if "text" in blocks:
+        assert result.text.strip()
+    else:
+        assert result.text.strip() == ""
+        assert reasoning_text(result.reasoning).strip()
+
+
+@pytest.mark.parametrize("server", messages_servers())
+def test_a_recorded_message_cache_hit_is_read(server):
+    """``cache_read_input_tokens`` is where this API reports reuse, and both servers reported one."""
+    record = recorded(server)["messages-warm"]
+    reported = record["body"]["usage"].get("cache_read_input_tokens")
+    normalize = SURFACES["messages"][1]
+
+    result = normalize(record["body"], {})
+
+    assert result.cached_tokens == reported
+    assert reported is not None and reported > 0

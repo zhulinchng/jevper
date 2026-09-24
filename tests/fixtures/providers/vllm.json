@@ -2429,6 +2429,237 @@
   },
   {
    "body": {
+    "content": [
+     {
+      "signature": "27789fd58bde46ac9017a40f4b6ef2a5",
+      "thinking": "We are classifying the record by its primary subject. The options are:\n\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014\u2026",
+      "type": "thinking"
+     }
+    ],
+    "model": "qwen3-4b-thinking",
+    "role": "assistant",
+    "stop_reason": "max_tokens",
+    "type": "message",
+    "usage": {
+     "cache_creation_input_tokens": 848,
+     "cache_read_input_tokens": 32,
+     "input_tokens": 7,
+     "output_tokens": 512
+    }
+   },
+   "method": "POST",
+   "name": "messages-plain",
+   "path": "/v1/messages",
+   "request": {
+    "max_tokens": 512,
+    "messages": [
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. \n\nRecord EXA: EXA-0 EXA-1 EXA-2 EXA-3 EXA-4 EXA-5 EXA-6 EXA-7 EXA-8 EXA-9 EXA-10 EXA-11 EXA-12 EXA-13 EXA-14 EXA-15 EXA-16 EXA-17 EXA-18 EXA-19",
+      "role": "user"
+     },
+     {
+      "content": "A",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. \n\nRecord EXB: EXB-0 EXB-1 EXB-2 EXB-3 EXB-4 EXB-5 EXB-6 EXB-7 EXB-8 EXB-9 EXB-10 EXB-11 EXB-12 EXB-13 EXB-14 EXB-15 EXB-16 EXB-17 EXB-18 EXB-19",
+      "role": "user"
+     },
+     {
+      "content": "B",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.",
+      "role": "user"
+     },
+     {
+      "content": "The quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. \n\nRecord S1: S1-0 S1-1 S1-2 S1-3 S1-4 S1-5 S1-6 S1-7 S1-8 S1-9 S1-10 S1-11 S1-12 S1-13 S1-14 S1-15 S1-16 S1-17 S1-18 S1-19 S1-20 S1-21 S1-22 S1-23 S1-24 S1-25 S1-26 S1-27 S1-28 S1-29 S1-30 S1-31 S1-32 S1-33 S1-34 S1-35 S1-36 S1-37 S1-38 S1-39 S1-40 S1-41 S1-42 S1-43 S1-44 S1-45 S1-46 S1-47 S1-48 S1-49 S1-50 S1-51 S1-52 S1-53 S1-54 S1-55 S1-56 S1-57 S1-58 S1-59",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3-4b-thinking",
+    "system": "You are a precise classification engine. Answer the question by returning a JSON object that matches the provided schema exactly. Return JSON only: no explanation, no markdown fences."
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "content": [
+     {
+      "signature": "36554e9807ac46c7bce6c048b10f3c16",
+      "thinking": "We are given a question to classify the record by its primary subject. The options are:\n\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentic\u2026",
+      "type": "thinking"
+     }
+    ],
+    "model": "qwen3-4b-thinking",
+    "role": "assistant",
+    "stop_reason": "max_tokens",
+    "type": "message",
+    "usage": {
+     "cache_creation_input_tokens": 0,
+     "cache_read_input_tokens": 880,
+     "input_tokens": 7,
+     "output_tokens": 128
+    }
+   },
+   "method": "POST",
+   "name": "messages-system-turn",
+   "path": "/v1/messages",
+   "request": {
+    "max_tokens": 128,
+    "messages": [
+     {
+      "content": "You are a precise classification engine. Answer the question by returning a JSON object that matches the provided schema exactly. Return JSON only: no explanation, no markdown fences.",
+      "role": "system"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. \n\nRecord EXA: EXA-0 EXA-1 EXA-2 EXA-3 EXA-4 EXA-5 EXA-6 EXA-7 EXA-8 EXA-9 EXA-10 EXA-11 EXA-12 EXA-13 EXA-14 EXA-15 EXA-16 EXA-17 EXA-18 EXA-19",
+      "role": "user"
+     },
+     {
+      "content": "A",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. \n\nRecord EXB: EXB-0 EXB-1 EXB-2 EXB-3 EXB-4 EXB-5 EXB-6 EXB-7 EXB-8 EXB-9 EXB-10 EXB-11 EXB-12 EXB-13 EXB-14 EXB-15 EXB-16 EXB-17 EXB-18 EXB-19",
+      "role": "user"
+     },
+     {
+      "content": "B",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.",
+      "role": "user"
+     },
+     {
+      "content": "The quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. \n\nRecord S1: S1-0 S1-1 S1-2 S1-3 S1-4 S1-5 S1-6 S1-7 S1-8 S1-9 S1-10 S1-11 S1-12 S1-13 S1-14 S1-15 S1-16 S1-17 S1-18 S1-19 S1-20 S1-21 S1-22 S1-23 S1-24 S1-25 S1-26 S1-27 S1-28 S1-29 S1-30 S1-31 S1-32 S1-33 S1-34 S1-35 S1-36 S1-37 S1-38 S1-39 S1-40 S1-41 S1-42 S1-43 S1-44 S1-45 S1-46 S1-47 S1-48 S1-49 S1-50 S1-51 S1-52 S1-53 S1-54 S1-55 S1-56 S1-57 S1-58 S1-59",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3-4b-thinking"
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "content": [
+     {
+      "signature": "a6007ec7e0484950be81d0a79bb23d9a",
+      "thinking": "We are given a question to classify the record by its primary subject. The options are:\n\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentic\u2026",
+      "type": "thinking"
+     }
+    ],
+    "model": "qwen3-4b-thinking",
+    "role": "assistant",
+    "stop_reason": "max_tokens",
+    "type": "message",
+    "usage": {
+     "cache_creation_input_tokens": 0,
+     "cache_read_input_tokens": 880,
+     "input_tokens": 7,
+     "output_tokens": 2048
+    }
+   },
+   "method": "POST",
+   "name": "messages-thinking",
+   "path": "/v1/messages",
+   "request": {
+    "max_tokens": 2048,
+    "messages": [
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. \n\nRecord EXA: EXA-0 EXA-1 EXA-2 EXA-3 EXA-4 EXA-5 EXA-6 EXA-7 EXA-8 EXA-9 EXA-10 EXA-11 EXA-12 EXA-13 EXA-14 EXA-15 EXA-16 EXA-17 EXA-18 EXA-19",
+      "role": "user"
+     },
+     {
+      "content": "A",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. \n\nRecord EXB: EXB-0 EXB-1 EXB-2 EXB-3 EXB-4 EXB-5 EXB-6 EXB-7 EXB-8 EXB-9 EXB-10 EXB-11 EXB-12 EXB-13 EXB-14 EXB-15 EXB-16 EXB-17 EXB-18 EXB-19",
+      "role": "user"
+     },
+     {
+      "content": "B",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.",
+      "role": "user"
+     },
+     {
+      "content": "The quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. \n\nRecord S1: S1-0 S1-1 S1-2 S1-3 S1-4 S1-5 S1-6 S1-7 S1-8 S1-9 S1-10 S1-11 S1-12 S1-13 S1-14 S1-15 S1-16 S1-17 S1-18 S1-19 S1-20 S1-21 S1-22 S1-23 S1-24 S1-25 S1-26 S1-27 S1-28 S1-29 S1-30 S1-31 S1-32 S1-33 S1-34 S1-35 S1-36 S1-37 S1-38 S1-39 S1-40 S1-41 S1-42 S1-43 S1-44 S1-45 S1-46 S1-47 S1-48 S1-49 S1-50 S1-51 S1-52 S1-53 S1-54 S1-55 S1-56 S1-57 S1-58 S1-59",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3-4b-thinking",
+    "system": "You are a precise classification engine. Answer the question by returning a JSON object that matches the provided schema exactly. Return JSON only: no explanation, no markdown fences.",
+    "thinking": {
+     "budget_tokens": 1024,
+     "type": "enabled"
+    }
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "content": [
+     {
+      "signature": "1753f0c755134a68b854ff98590f5850",
+      "thinking": "We are classifying the record by its primary subject. The record is described as:\n\n\"The quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stay\u2026",
+      "type": "thinking"
+     }
+    ],
+    "model": "qwen3-4b-thinking",
+    "role": "assistant",
+    "stop_reason": "max_tokens",
+    "type": "message",
+    "usage": {
+     "cache_creation_input_tokens": 0,
+     "cache_read_input_tokens": 880,
+     "input_tokens": 7,
+     "output_tokens": 512
+    }
+   },
+   "method": "POST",
+   "name": "messages-warm",
+   "path": "/v1/messages",
+   "request": {
+    "max_tokens": 512,
+    "messages": [
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. \n\nRecord EXA: EXA-0 EXA-1 EXA-2 EXA-3 EXA-4 EXA-5 EXA-6 EXA-7 EXA-8 EXA-9 EXA-10 EXA-11 EXA-12 EXA-13 EXA-14 EXA-15 EXA-16 EXA-17 EXA-18 EXA-19",
+      "role": "user"
+     },
+     {
+      "content": "A",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. \n\nRecord EXB: EXB-0 EXB-1 EXB-2 EXB-3 EXB-4 EXB-5 EXB-6 EXB-7 EXB-8 EXB-9 EXB-10 EXB-11 EXB-12 EXB-13 EXB-14 EXB-15 EXB-16 EXB-17 EXB-18 EXB-19",
+      "role": "user"
+     },
+     {
+      "content": "B",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.",
+      "role": "user"
+     },
+     {
+      "content": "The quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. \n\nRecord S1: S1-0 S1-1 S1-2 S1-3 S1-4 S1-5 S1-6 S1-7 S1-8 S1-9 S1-10 S1-11 S1-12 S1-13 S1-14 S1-15 S1-16 S1-17 S1-18 S1-19 S1-20 S1-21 S1-22 S1-23 S1-24 S1-25 S1-26 S1-27 S1-28 S1-29 S1-30 S1-31 S1-32 S1-33 S1-34 S1-35 S1-36 S1-37 S1-38 S1-39 S1-40 S1-41 S1-42 S1-43 S1-44 S1-45 S1-46 S1-47 S1-48 S1-49 S1-50 S1-51 S1-52 S1-53 S1-54 S1-55 S1-56 S1-57 S1-58 S1-59",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3-4b-thinking",
+    "system": "You are a precise classification engine. Answer the question by returning a JSON object that matches the provided schema exactly. Return JSON only: no explanation, no markdown fences."
+   },
+   "status": 200
+  },
+  {
+   "body": {
     "error": {
      "code": 404,
      "message": "The model `definitely-not-a-model` does not exist.",
@@ -2464,6 +2695,7 @@
       "content": [
        {
         "logprobs": null,
+        "text": "D",
         "type": "output_text"
        }
       ],
@@ -2552,6 +2784,7 @@
       "content": [
        {
         "logprobs": null,
+        "text": "B",
         "type": "output_text"
        }
       ],
@@ -2641,6 +2874,7 @@
      {
       "content": [
        {
+        "text": "Thinking Process:\n1.  **Analyze the Request:** The user wants",
         "type": "reasoning_text"
        }
       ],
@@ -2758,6 +2992,7 @@
           ]
          }
         ],
+        "text": "A",
         "type": "output_text"
        }
       ],

@@ -108,7 +108,7 @@ Question = Noul | Choice | Score
 Method = Literal["logprobs", "grammar", "structured", "discrete"]
 # What you may pass as `method`: a concrete method, or "auto" to resolve one by observation.
 MethodSelection = Literal["auto", "logprobs", "grammar", "structured", "discrete"]
-Api = Literal["auto", "chat_completions", "responses"]
+Api = Literal["auto", "chat_completions", "responses", "messages"]
 
 
 def validate_question(question: Question, question_id: str | None = None) -> None:

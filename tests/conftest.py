@@ -18,8 +18,13 @@ from fakes import StubServer
 def stub_server() -> Any:
     servers: list[StubServer] = []
 
-    def make(*, chat: Callable[..., Any] | None = None, responses: Callable[..., Any] | None = None) -> StubServer:
-        server = StubServer(chat=chat, responses=responses)
+    def make(
+        *,
+        chat: Callable[..., Any] | None = None,
+        responses: Callable[..., Any] | None = None,
+        messages: Callable[..., Any] | None = None,
+    ) -> StubServer:
+        server = StubServer(chat=chat, responses=responses, messages=messages)
         servers.append(server)
         return server
 

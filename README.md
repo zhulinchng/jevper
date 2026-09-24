@@ -210,6 +210,44 @@ tokens went from 40 — the system prompt alone — to 1010 on llama.cpp, 528 on
 state moved to the end. Per-server flags, what each server accepts or ignores, and how to isolate a cache with
 `cache_salt`: [docs/local-servers.md](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md#prompt-caching).
 
+## Anthropic-compatible servers
+
+Every server in the local fleet serves the Anthropic Messages API at `/v1/messages` as well as the OpenAI
+ones. jevper speaks it with `api="messages"`: point the `anthropic` client at the server and pass it in place
+of the OpenAI one.
+
+```python
+from anthropic import Anthropic
+
+from jevper import SystemOneClient
+
+client = SystemOneClient(Anthropic(base_url="http://127.0.0.1:1234"), model="qwen3-4b-instruct")
+
+client.system_one(state=record, questions=rubric, api="messages", method="structured")
+```
+
+Four things differ from the OpenAI surfaces, and all four come from the protocol rather than from any
+server:
+
+- **No logprobs exist in it.** Not withheld by some servers — absent from the API. `method="logprobs"` and
+  `method="grammar"` raise `UnsupportedMethodError` before a request is sent, and `method="auto"` answers in
+  JSON without spending a call to find out. `structured` and `discrete` work exactly as they do elsewhere: the
+  prompt already asks for one JSON object.
+- **There is no schema field either**, so `structured`/`discrete` put the JSON Schema in the system prompt. The
+  answer's shape is then only as good as the model's instruction-following, where the other surfaces constrain
+  it in the request itself.
+- **`max_tokens` has no server-side default.** jevper sends `1024`; override it with
+  `extra_body={"max_tokens": n}`.
+- **Thinking is asked for with a budget, not an effort name.** `ReasoningConfig(mode="native",
+  budget_tokens=2048)` sends `thinking={"type": "enabled", "budget_tokens": 2048}`. Anthropic requires that
+  budget to be at least 1024 and below `max_tokens`; a server whose protocol has no `thinking` field at all
+  (vLLM's) refuses it, and the field is dropped, the call re-asked, and the limit reported in
+  `debug["server_limits"]["thinking"]`.
+
+Thinking blocks come back as ordinary `response.reasoning` parts with the block's `signature` kept, and
+`usage.cached_tokens` is read from `cache_read_input_tokens`. Which servers implement the route, and since
+which version: [docs/local-servers.md](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md#the-messages-route).
+
 ## Failures
 
 Local problems fail before any request is sent: an invalid question, an empty `questions` mapping, an
@@ -218,7 +256,7 @@ unusable `state`, or `grammar` on a surface that cannot carry a grammar.
 | Error | Raised when |
 | --- | --- |
 | `InvalidQuestionError` | question or few-shot example is locally invalid |
-| `UnsupportedMethodError` | `method="grammar"` on the Responses surface |
+| `UnsupportedMethodError` | `method="grammar"` on the Responses surface, or `method="logprobs"`/`"grammar"` on the Messages surface — that API has no logprobs at all |
 | `ClientCapabilityError` | the client lacks the attribute the chosen surface needs, or the response carried no choices and no explanation of why |
 | `LabelReadoutError` | the first answer token is not a label, or the provider returned no logprobs (or no alternatives, or no logprob for that token). The provider-side cases are not corrective-retried, and `method="auto"` answers them with `structured` |
 | `MalformedAnswerError` | the JSON answer had an unusable shape after corrective retries |
