@@ -20,6 +20,7 @@ from fakes import (
     openai_client,
     responses_body,
 )
+from pydantic import ValidationError
 
 from jevper import (
     AsyncSystemOneClient,
@@ -37,6 +38,7 @@ from jevper import (
     SystemOneClient,
     reasoning_text,
 )
+from jevper.types import ChoiceAnswer, ScoreAnswer, Usage
 
 CHOICE_LOGS = [("A", -0.12), ("B", -2.47), ("C", -3.48)]
 CRITERIA = {"billing": None, "technical": None, "sales": None}
@@ -769,6 +771,44 @@ def test_retry_policy_rejects_non_finite_delays():
 
     with pytest.raises(JevperError):
         SystemOneClient(object(), model="m", retry=RetryPolicy(max_delay=float("inf")))
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("top_logprobs", 2.5),
+        ("top_logprobs", "3"),
+        ("max_concurrency", 1.5),
+        ("n_retry_malformed", 0.5),
+    ],
+)
+def test_count_options_must_be_integers(option, value):
+    """A count reaches ``range()``, a thread pool, or a provider field — as an integer or not at all.
+
+    ``0.5`` used to construct cleanly and then raise a bare ``TypeError`` from inside the retry loop;
+    ``"3"`` raised one from the range check itself. The caller gets one line naming the option instead.
+    """
+    with pytest.raises(JevperError) as error:
+        SystemOneClient(object(), model="m", **{option: value})
+    assert f"{option} must be" in str(error.value)
+
+
+@pytest.mark.parametrize("model", [123, "", "   ", None])
+def test_a_model_must_be_a_non_empty_string(model):
+    """The model id is the key every learned verdict and derived cache key hangs on."""
+    with pytest.raises(JevperError) as error:
+        SystemOneClient(object(), model=model)
+    assert "model must be a non-empty string" in str(error.value)
+
+
+def test_a_per_call_model_override_is_checked_too():
+    client = SystemOneClient(
+        RaisingClient(Exception("unused")), model="m", api="chat_completions", method="structured"
+    )
+    with pytest.raises(JevperError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}, model=7)
+    assert "model must be a non-empty string" in str(error.value)
+
 
 
 def test_a_huge_retry_count_does_not_overflow_the_backoff():
@@ -1887,3 +1927,49 @@ def test_a_refused_second_surface_is_remembered_too():
     assert [surface for surface, _ in duck.requests] == ["responses", "chat_completions"]
     assert client._logprobs_absent_here("stub", "responses")
     assert client._logprobs_absent_here("stub", "chat_completions")
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        (
+            ChoiceAnswer,
+            {"choice": "billing", "probabilities": {"billing": -0.1, "sales": 1.1}, "confidence": 0.5},
+        ),
+        (ChoiceAnswer, {"choice": "billing", "probabilities": {"billing": float("nan")}, "confidence": 0.5}),
+        (ChoiceAnswer, {"choice": "billing", "probabilities": {"billing": 1.0}, "confidence": 1.4}),
+        (
+            ScoreAnswer,
+            {
+                "score": 1.0,
+                "legend": {0: "Calm", 1: "Frustrated"},
+                "probabilities": {0: -1.0, 1: 2.0},
+                "confidence": 0.5,
+            },
+        ),
+    ],
+)
+def test_an_answer_cannot_carry_a_share_it_could_not_have_read(model, payload):
+    """A probability is a share and a confidence is a certainty; both live in ``[0, 1]``.
+
+    jevper's own readouts enforce this — the softmax normalises, the confidence formula is bounded —
+    so an answer carrying a negative mass or a confidence above 1 was assembled by hand and is not
+    something any provider could have produced.
+    """
+    with pytest.raises(ValidationError):
+        model.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"n_calls": -1}, {"n_retries": -1}, {"latency": float("inf")}, {"latency": -0.5}],
+)
+def test_usage_cannot_count_backwards_or_take_no_time(payload):
+    with pytest.raises(ValidationError):
+        Usage.model_validate(payload)
+
+
+def test_a_real_answer_survives_the_same_bounds():
+    """The bounds are the readouts' own, so a genuine answer passes them by construction."""
+    assert ChoiceAnswer(choice="billing", probabilities={"billing": 0.9, "sales": 0.1}, confidence=0.8)
+    assert Usage(input_tokens=10, output_tokens=2, n_calls=1, latency=0.4)

@@ -169,7 +169,7 @@ from `model_dump()`, so question dumps keep exactly the Jev wire keys. See
 ## Response
 
 ```python
-response.model                 # the model actually used
+response.model                 # the model id jevper asked for
 response.answers               # {"intent": ChoiceAnswer(...)}
 response.nouls / .choices / .scores   # filtered views
 response.usage                 # input_tokens, output_tokens, reasoning_tokens, cached_tokens, n_calls, n_retries, latency

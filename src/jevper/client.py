@@ -243,6 +243,34 @@ def _require_prompt_cache_key(key: Any) -> None:
         )
 
 
+def _require_count(name: str, value: Any, *, minimum: int | None = None, maximum: int | None = None) -> None:
+    """A count option is an integer, in range, before anything else reads it as one.
+
+    A float here is not a rounding opportunity: it reaches ``range()`` as a loop bound, a thread pool
+    size, or a provider field, and a ``TypeError`` from any of those places is a worse report of a
+    caller's slip than the one line this raises. ``bool`` is an ``int`` in Python and means nothing as
+    a count here, so it is refused with the rest.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise JevperError(f"{name} must be an integer, got {value!r}")
+    if minimum is not None and value < minimum:
+        raise JevperError(f"{name} must be >= {minimum}, got {value!r}")
+    if maximum is not None and value > maximum:
+        raise JevperError(f"{name} must be <= {maximum}, got {value!r}")
+
+
+def _require_model(model: Any) -> None:
+    """A model id is provider-ready text: something to send, and something to key state on.
+
+    The key is the reason this is checked at all. The absence memory, the surface verdicts and the
+    derived prompt-cache key are all indexed by the model string, and a number or an empty string
+    reaches that indexing as an ``AttributeError`` on ``.encode()`` — long after construction, from a
+    frame the caller did not write.
+    """
+    if not isinstance(model, str) or not model.strip():
+        raise JevperError(f"model must be a non-empty string, got {model!r}")
+
+
 def _add_count(current: int | None, value: Any) -> int | None:
     """Add one provider's count to a running total; a count nobody can read counts as unreported.
 
@@ -505,12 +533,10 @@ class _BaseClient:
             raise JevperError(f"method must be one of {METHOD_SELECTIONS!r}, got {method!r}")
         if api not in APIS:
             raise JevperError(f"api must be one of {APIS!r}, got {api!r}")
-        if not 0 <= top_logprobs <= MAX_TOP_LOGPROBS:
-            raise JevperError(f"top_logprobs must be in [0, {MAX_TOP_LOGPROBS}], got {top_logprobs!r}")
-        if max_concurrency < 1:
-            raise JevperError(f"max_concurrency must be >= 1, got {max_concurrency!r}")
-        if n_retry_malformed < 0:
-            raise JevperError(f"n_retry_malformed must be >= 0, got {n_retry_malformed!r}")
+        _require_count("top_logprobs", top_logprobs, maximum=MAX_TOP_LOGPROBS)
+        _require_count("max_concurrency", max_concurrency, minimum=1)
+        _require_count("n_retry_malformed", n_retry_malformed, minimum=0)
+        _require_model(model)
         if reasoning is not None and not isinstance(reasoning, ReasoningConfig):
             raise JevperError(f"reasoning must be a ReasoningConfig, got {type(reasoning).__name__}")
         if retry is not None and not isinstance(retry, RetryPolicy):
@@ -885,6 +911,7 @@ class _BaseClient:
             raise JevperError(f"api must be one of {APIS!r}, got {effective_api!r}")
         api_auto = effective_api == "auto"
         effective_model = self.model if model is None else model
+        _require_model(effective_model)
         effective_reasoning = reasoning if reasoning is not None else self.reasoning
         # The surface is picked for the method auto tries first; the fallback runs on either surface.
         surface = select_surface(self.client, effective_api, AUTO_METHOD if auto else requested)

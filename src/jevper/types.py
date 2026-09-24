@@ -7,6 +7,7 @@ is the compatibility contract with the hosted API.
 from __future__ import annotations
 
 import functools
+import math
 from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal
 
@@ -159,21 +160,41 @@ def parse_question(question_id: str, raw: Question | Mapping[str, Any]) -> Quest
 class NoulAnswer(BaseModel):
     type: Literal["noul"] = "noul"
     noul: float
+    """A regression output, so any real number is a score; only a non-number is not an answer."""
 
 
-class ChoiceAnswer(BaseModel):
+class _Probability(BaseModel):
+    """Shared bounds for the two fields every answer carries: a mass and a confidence.
+
+    A probability is a share of a distribution and a confidence is a share of certainty, so both live
+    in ``[0, 1]`` and neither is a number a provider could have meant. jevper's own readouts already
+    enforce this — the softmax normalises, the confidence formula is bounded — and these bounds are
+    here so that an answer *assembled by a caller* cannot be handed on as one jevper would have read.
+    """
+
+    probabilities: dict[Any, float] = Field(
+        description="Each option's share of the distribution, in [0, 1]."
+    )
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("probabilities")
+    @classmethod
+    def _masses_are_shares(cls, value: dict[Any, float]) -> dict[Any, float]:
+        for key, share in value.items():
+            if not math.isfinite(share) or share < 0.0 or share > 1.0:
+                raise ValueError(f"probability for {key!r} must be a finite share in [0, 1], got {share!r}")
+        return value
+
+
+class ChoiceAnswer(_Probability):
     type: Literal["choice"] = "choice"
     choice: str
-    probabilities: dict[str, float]
-    confidence: float
 
-
-class ScoreAnswer(BaseModel):
+class ScoreAnswer(_Probability):
     type: Literal["score"] = "score"
     score: float
+    """The rubric's own number — a level index, or whatever scale the criteria ask for."""
     legend: dict[int, JSONContent]
-    probabilities: dict[int, float]
-    confidence: float
 
 
 Answer = Annotated[NoulAnswer | ChoiceAnswer | ScoreAnswer, Field(discriminator="type")]
@@ -188,13 +209,13 @@ class Usage(BaseModel):
     input_tokens: int | None = None
     output_tokens: int | None = None
     reasoning_tokens: int | None = None
+    n_calls: int = Field(default=0, ge=0)
+    n_retries: int = Field(default=0, ge=0)
+    latency: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
     cached_tokens: int | None = None
     """Prompt tokens the provider read from its prompt cache. Reported by OpenAI, OpenRouter, vLLM,
     SGLang, llama.cpp and ollama; ``None`` when the provider said nothing, which is not the same as a
     reported ``0`` — that is a provider whose prefix cache is cold or off."""
-    n_calls: int = 0
-    n_retries: int = 0
-    latency: float = 0.0
 
 
 class SystemOneResponse(BaseModel):

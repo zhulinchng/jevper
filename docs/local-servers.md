@@ -51,10 +51,11 @@ verdict. Passing `api="chat_completions"` skips the discovery entirely.
 
 ## Thinking is the one decision you must make
 
-`logprobs`, `grammar` and `discrete` all read a **one-token answer**, and every one of these servers reports
-logprobs for *every* generated token. With thinking on, that is the first token of the reasoning, not the
-label: the readout raises `LabelReadoutError`, spends one corrective retry, and raises again. Turn thinking
-off for classification work — it costs a whole reasoning pass to choose one letter.
+`logprobs` and `grammar` read a **one-token answer**, and every one of these servers reports logprobs for
+*every* generated token. With thinking on, that is the first token of the reasoning, not the label: the
+readout raises `LabelReadoutError`, spends one corrective retry, and raises again. `structured` and
+`discrete` are unaffected — they read answer text, not a token's probability — but thinking still costs
+a whole reasoning pass to produce one JSON object, so turn it off for classification work either way.
 
 | Server | Request field that turns it off | Also available |
 | --- | --- | --- |
