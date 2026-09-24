@@ -175,9 +175,10 @@ The Messages surface has no logprobs at all, and it does have a schema field of 
 `output_config={"format": {"type": "json_schema", "schema": ...}}`, the counterpart of the two above and
 what the TypeSafe reference adapter sends there. jevper sends it *and* keeps the schema in the system
 prompt: vLLM implements the field (a schema naming a constant the prompt never mentions comes back with
-that constant in the answer), while llama.cpp, LM Studio and ollama accept it and ignore it, which no error
-reports — and a server that discards a field it accepted looks exactly like one that never read it. The
-schema is also rewritten for Anthropic's documented subset on the way out (numerical constraints are a
+that constant in the answer), while llama.cpp and LM Studio accept it and ignore it, which no error reports
+— and ollama and SGLang accept it too, though with a thinking model nothing comes back on that route to
+enforce it. A server that discards a field it accepted looks exactly like one that never read it.
+The schema is also rewritten for Anthropic's documented subset on the way out (numerical constraints are a
 `400` there), and the whole field travels in the request body rather than as an SDK keyword, since the
 oldest Anthropic SDK jevper supports has no such parameter.
 

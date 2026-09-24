@@ -268,8 +268,8 @@ server:
   each `minimum`/`maximum` moves into the description of the field it bounded and the wire schema says
   `Must be at least 0.` where the prompt still says `minimum: 0`. The JSON Schema also stays in the system
   prompt: vLLM implements that field — a schema naming a constant the prompt never mentions comes back with
-  that constant in the answer — while llama.cpp, LM Studio and ollama accept it and ignore it, and a server
-  that discards a field it accepted looks exactly like one that never read it.
+  that constant in the answer — while llama.cpp and LM Studio accept it and ignore it, and a server that
+  discards a field it accepted looks exactly like one that never read it.
 - **`max_tokens` has no server-side default.** jevper sends `1024` — or `1024` plus the caller's thinking
   budget, because Anthropic requires the budget to be strictly *below* `max_tokens` and would otherwise refuse
   the 1024 its own docs call the floor. `extra_body={"max_tokens": n}` overrides both, and a value that cannot

@@ -139,7 +139,7 @@ tolerate, and the fixture tests replay them on every change.
 | unknown model id | `404` naming it | ignored, `200` | `404` naming it | Chat ignored, Responses `404` |
 | `n: 2` | accepted, one choice back | `400` | accepted, two choices | accepted, two choices |
 | `developer` role | accepted | accepted | accepted | **`400`** |
-| `output_config` on `/v1/messages` | accepted, ignored | accepted, ignored | **enforced**, invalid `format.type` a `400` | accepted, ignored |
+| `output_config` on `/v1/messages` | accepted; the trace spends the budget, so nothing returns to enforce | accepted, ignored | **enforced**, invalid `format.type` a `400` | accepted; the trace spends the budget, so nothing returns to enforce |
 | unknown request field | ignored | ignored | ignored | ignored |
 | route 404 body | `404 page not found` (text) | `{"error": {...}}` | `{"detail": "Not Found"}` | `{"detail": "Not Found"}` |
 | some `400` bodies | JSON object | JSON object | JSON object | **a bare JSON string** |
@@ -272,19 +272,21 @@ no text block. `separate_reasoning: false` does not change that; dropping `--rea
 structured scenarios then answer normally. It is a property of serving a model that never emits the marker
 with a parser that waits for it, not of the client.
 
-`output_config.format` — Anthropic's own schema-constrained output — is implemented by **vLLM** and by none
-of the other four. Measured here with a schema whose only legal answer names a constant the prompt never
-mentions: vLLM answered `{"canary": "JEVPER-PROBE"}`, and the same request without the field answered
-`{"Name": "Canary"}`, so the shape came from the field. It also *validates* the field — an unknown
+`output_config.format` — Anthropic's own schema-constrained output — is **implemented by vLLM** and by
+neither of the others that can be asked. Measured with a schema whose only legal answer names a constant the
+prompt never mentions: vLLM answered `{"canary": "JEVPER-PROBE"}`, and the same request without the field
+answered `{"Name": "Canary"}`, so the shape came from the field. It also *validates* the field — an unknown
 `format.type` is a `400` naming `body.output_config.format.type` — which is the rung that lets jevper drop
-the field and remember it in `debug["server_limits"]["output_config"]`. llama.cpp, LM Studio and ollama
-accept the field and ignore it, with no error and no verdict, so on those the JSON Schema has to stay in the
-system prompt and the answer is only as good as the model's instruction-following: without it, a 4B model
-answered `{"intent": "A"}` — a real answer in the wrong shape — to every structured question, and on LM
-Studio one answer came back as the schema itself (`{"minimum": 0, "type": "number"}` in the place of a
-probability), which jevper's one corrective retry turned into a real answer. jevper keeps the schema in the
-prompt on this surface either way: a server that accepts a field and drops it is indistinguishable from one
-that never looked at it.
+the field and remember it in `debug["server_limits"]["output_config"]`. llama.cpp and LM Studio accept the
+field and ignore it, with no error and no verdict, so on those the JSON Schema has to stay in the system
+prompt and the answer is only as good as the model's instruction-following: without it, a 4B model answered
+`{"intent": "A"}` — a real answer in the wrong shape — to every structured question, and on LM Studio one
+answer came back as the schema itself (`{"minimum": 0, "type": "number"}` in the place of a probability),
+which jevper's one corrective retry turned into a real answer. ollama and SGLang accept the field too, but
+with a thinking model *nothing comes back to enforce it* on this route: a 1024-token request came back empty
+with `stop_reason: "max_tokens"` with the field, with a nonsense `format.type`, and with no field at all.
+jevper keeps the schema in the prompt on this surface either way: a server that accepts a field and drops it
+is indistinguishable from one that never looked at it.
 
 One detail of the wire schema is Anthropic's, not jevper's: the API rejects *numerical constraints*, and a
 400 for one costs the field for the rest of the client's life, so each `minimum`/`maximum` is folded into
@@ -293,9 +295,11 @@ too (`{"n": 1}` for a `minimum: 0, maximum: 1` number), so the transform costs n
 makes the field usable on the hosted API. The field travels in the request body rather than as an SDK
 keyword, because the oldest Anthropic SDK jevper supports has no `output_config` parameter at all.
 
-One knob does not reach this route: ollama honours `reasoning_effort: "none"` on its OpenAI routes and
-ignores it on `/v1/messages`, where the trace is still generated (a 256-token budget came back empty with
-`stop_reason: "max_tokens"`, and a 1024-token one answered with the trace attached as a thinking block).
+The same two servers swallow the thinking-off knob on this route: ollama's `reasoning_effort: "none"` and
+SGLang's `chat_template_kwargs: {"enable_thinking": false}` both work on their OpenAI routes and neither
+stops the trace on `/v1/messages`. A Messages call against either needs a budget the trace fits inside
+(jevper's default 1024 answered on ollama) or a model that does not think — SGLang's own paragraph above
+covers the parser that turns the whole generation into reasoning.
 
 ## Sizing a 12 GB card
 
