@@ -354,9 +354,11 @@ looking for a bug that is not there:
   surface `status: "incomplete"` with `incomplete_details.reason: "max_output_tokens"` — and all of them reach
   the caller as *the provider ran out of output tokens before the answer was complete*, with the field to raise.
   This holds however the answer was cut off: mid-object, or with no `{` at all.
-- **The model refused.** OpenAI reports a safety refusal in a `refusal` sibling of a null `content`, and the
-  Messages API as `stop_reason: "refusal"`. The message carries the model's own words, so a refusal reads as a
-  refusal rather than as malformed JSON.
+- **The model refused.** Each surface puts a refusal in its own place, and jevper reads all three: a
+  `refusal` sibling of a null `content` on Chat Completions, a `refusal` content part on Responses, and
+  `stop_reason: "refusal"` on the Messages API. The message carries the model's own words, so a refusal
+  reads as a refusal rather than as malformed JSON, and one that arrives where the answer would have been
+  is never parsed as the answer.
 - **The server separated reasoning from the answer and sent no answer.** A reasoning parser with thinking on
   does this (see [`local-servers.md`](local-servers.md)), and the message says so instead of "no non-whitespace
   token in the response".
