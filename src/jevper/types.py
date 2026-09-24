@@ -7,7 +7,6 @@ is the compatibility contract with the hosted API.
 from __future__ import annotations
 
 import functools
-import math
 from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal
 
@@ -164,26 +163,17 @@ class NoulAnswer(BaseModel):
 
 
 class _Probability(BaseModel):
-    """Shared bounds for the two fields every answer carries: a mass and a confidence.
+    """The one field both answers compute: a confidence, which is a share of certainty in ``[0, 1]``.
 
-    A probability is a share of a distribution and a confidence is a share of certainty, so both live
-    in ``[0, 1]`` and neither is a number a provider could have meant. jevper's own readouts already
-    enforce this — the softmax normalises, the confidence formula is bounded — and these bounds are
-    here so that an answer *assembled by a caller* cannot be handed on as one jevper would have read.
+    The bound belongs here because jevper computed the number — the readouts' confidence formula is
+    bounded by construction, so a value outside ``[0, 1]`` was assembled by hand and is not something
+    jevper would have produced. The probabilities beside it are the provider's own numbers, and with
+    ``normalize_probabilities=False`` they are deliberately passed through as they arrived: bounding
+    them would turn a distribution the caller asked to see for themselves into a validation error.
     """
 
-    probabilities: dict[Any, float] = Field(
-        description="Each option's share of the distribution, in [0, 1]."
-    )
+    probabilities: dict[Any, float]
     confidence: float = Field(ge=0.0, le=1.0)
-
-    @field_validator("probabilities")
-    @classmethod
-    def _masses_are_shares(cls, value: dict[Any, float]) -> dict[Any, float]:
-        for key, share in value.items():
-            if not math.isfinite(share) or share < 0.0 or share > 1.0:
-                raise ValueError(f"probability for {key!r} must be a finite share in [0, 1], got {share!r}")
-        return value
 
 
 class ChoiceAnswer(_Probability):

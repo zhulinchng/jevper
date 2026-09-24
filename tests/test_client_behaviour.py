@@ -1932,29 +1932,21 @@ def test_a_refused_second_surface_is_remembered_too():
 @pytest.mark.parametrize(
     ("model", "payload"),
     [
-        (
-            ChoiceAnswer,
-            {"choice": "billing", "probabilities": {"billing": -0.1, "sales": 1.1}, "confidence": 0.5},
-        ),
-        (ChoiceAnswer, {"choice": "billing", "probabilities": {"billing": float("nan")}, "confidence": 0.5}),
         (ChoiceAnswer, {"choice": "billing", "probabilities": {"billing": 1.0}, "confidence": 1.4}),
+        (ChoiceAnswer, {"choice": "billing", "probabilities": {"billing": 0.5}, "confidence": -0.1}),
         (
             ScoreAnswer,
-            {
-                "score": 1.0,
-                "legend": {0: "Calm", 1: "Frustrated"},
-                "probabilities": {0: -1.0, 1: 2.0},
-                "confidence": 0.5,
-            },
+            {"score": 1.0, "legend": {0: "Calm", 1: "Frustrated"},
+             "probabilities": {0: 0.5, 1: 0.5}, "confidence": 2.0},
         ),
     ],
 )
-def test_an_answer_cannot_carry_a_share_it_could_not_have_read(model, payload):
-    """A probability is a share and a confidence is a certainty; both live in ``[0, 1]``.
+def test_an_answer_cannot_carry_a_certainty_it_could_not_have_computed(model, payload):
+    """A confidence is a share of certainty, and jevper computed it.
 
-    jevper's own readouts enforce this — the softmax normalises, the confidence formula is bounded —
-    so an answer carrying a negative mass or a confidence above 1 was assembled by hand and is not
-    something any provider could have produced.
+    Its own formulas are bounded, so a value outside ``[0, 1]`` was assembled by hand. The
+    probabilities beside it are the provider's numbers and are passed through as they arrived, because
+    ``normalize_probabilities=False`` promises exactly that.
     """
     with pytest.raises(ValidationError):
         model.model_validate(payload)
