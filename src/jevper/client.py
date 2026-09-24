@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import math
 import threading
 import time
 from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from dataclasses import fields as dataclass_fields
 from typing import Any
 
 from pydantic import BaseModel
@@ -288,33 +290,58 @@ def _include_refused(evidence: str) -> bool:
     """The provider refused the Responses surface's logprob carrier, the ``include`` entry.
 
     ``include`` is the only place a Responses request can ask for logprobs, and a provider that does
-    not offer that includable rejects the path rather than the word: OpenRouter answers ``Invalid
-    option: expected one of "file_search_call.results"|...`` for ``path: ["include", 0]``.
+    not offer that includable refuses the path rather than the word. OpenRouter answers ``Invalid
+    option: expected one of "file_search_call.results"|...`` for ``path: ["include", 0]``; OpenAI's
+    own wording for a model that offers no includable is ``Unsupported parameter: 'include' is not
+    supported with this model.`` Both name the field and both say the same thing about it, so both
+    read as the refusal they are — the vocabulary a server chooses to say so is not the fact.
     """
-    return "include" in evidence and any(
-        marker in evidence for marker in _INCLUDE_REJECTION_MARKERS
+    return "include" in evidence and (
+        any(marker in evidence for marker in _INCLUDE_REJECTION_MARKERS)
+        or any(marker in evidence for marker in _UNSUPPORTED_MARKERS)
     )
 
 
-def _logprobs_rejected(exc: BaseException, spec: CallSpec | None = None) -> bool:
+def _include_value_refused(evidence: str) -> bool:
+    """The refusal is about the *value* of an include entry: this provider offers other includables.
+
+    OpenRouter answers ``Invalid option: expected one of "file_search_call.results"|"reasoning.
+    encrypted_content"`` for ``path: ["include", 0]`` — it has listed what it accepts, and the logprob
+    entry is not on the list, so no rearrangement of the other entries will satisfy it.
+    """
+    return any(marker in evidence for marker in _INCLUDE_REJECTION_MARKERS)
+
+
+def _logprobs_rejected(
+    exc: BaseException, spec: CallSpec | None = None, surface: Surface | None = None
+) -> bool:
     """The provider refused the request because of the logprob fields it carried.
 
     Both shapes seen in the wild name the field: Gemini's OpenAI-compatibility layer answers
     ``Unknown name "logprobs": Cannot find field.`` and a reasoning model behind an OpenAI-shaped
     gateway answers ``logprobs are not supported with reasoning models.`` A Responses request asks for
-    logprobs through ``include`` instead, so the field it can be refused for is that one — but only
-    when ``spec`` says this request asked for logprobs at all: the same ``include`` list also carries
-    the reasoning include, and a refusal of that path is about reasoning, not about logprobs.
+    logprobs through ``include`` instead, so the field it can be refused for is that one — and only
+    there: on Chat Completions the carrier is the ``logprobs`` field itself, so a message that merely
+    mentions ``include`` is about something else, however unsupported it says that something is.
+    The ``spec`` has to say the request asked for logprobs either way: the same ``include`` list also
+    carries the reasoning entry, and a refusal of that one is about reasoning, not about logprobs.
     """
     if _status_code(exc) not in _LOGPROB_REJECTION_STATUS_CODES:
         return False
     evidence = _error_evidence(exc)
     if "logprob" in evidence:
         return True
-    return bool(spec is not None and spec.logprobs and _include_refused(evidence))
+    return bool(
+        spec is not None
+        and spec.logprobs
+        and surface == "responses"
+        and _include_refused(evidence)
+    )
 
 
-def _logprobs_unsupported(exc: BaseException, spec: CallSpec | None = None) -> bool:
+def _logprobs_unsupported(
+    exc: BaseException, spec: CallSpec | None = None, surface: Surface | None = None
+) -> bool:
     """The rejection reads as a missing capability rather than a bad value, so it is worth remembering.
 
     ``logprobs are not supported with reasoning models.`` and ``Unknown name "logprobs": Cannot find
@@ -322,12 +349,12 @@ def _logprobs_unsupported(exc: BaseException, spec: CallSpec | None = None) -> b
     20.`` — a server whose cap is lower than the default — refuses the value, so the question is
     answered with a logprob-free method without writing off logprobs for the rest of the client's life.
     """
-    if not _logprobs_rejected(exc, spec):
+    if not _logprobs_rejected(exc, spec, surface):
         return False
     evidence = _error_evidence(exc)
     if any(marker in evidence for marker in _VALUE_MARKERS):
         return False
-    if _include_refused(evidence):
+    if surface == "responses" and _include_refused(evidence):
         return True
     return any(marker in evidence for marker in _UNSUPPORTED_MARKERS)
 
@@ -612,10 +639,24 @@ class _BaseClient:
         with self._auto_lock:
             return self._limits.get(surface, Limits())
 
-    def _remember_limits(self, surface: Surface, limits: Limits) -> None:
-        """Remember a server's limit for the rest of this client's life, like any other verdict."""
+    def _remember_limits(self, surface: Surface, base: Limits, limits: Limits) -> None:
+        """Remember a server's limit for the rest of this client's life, like any other verdict.
+
+        A downgrade is computed from the snapshot its transport was built with, and the questions run
+        concurrently, so writing that result wholesale would let a later write put back a field
+        another question has meanwhile learned to leave out — and the next call would pay the same
+        refusal again. Only the fields this downgrade actually changed are applied, onto whatever is
+        remembered now.
+        """
         with self._auto_lock:
-            self._limits[surface] = limits
+            current = self._limits.get(surface, base)
+            changed = {
+                entry.name: getattr(limits, entry.name)
+                for entry in dataclass_fields(Limits)
+                if getattr(limits, entry.name) != getattr(base, entry.name)
+            }
+            if changed:
+                self._limits[surface] = replace(current, **changed)
 
     def _downgrade(self, exc: Exception, spec: CallSpec, transport: Transport) -> Limits | None:
         """The next request shape to try when a server refuses a field jevper added for capability.
@@ -631,14 +672,29 @@ class _BaseClient:
         another question moved the shared context still descends *its own* ladder rather than the one
         belonging to a surface it never touched.
         """
-        if _status_code(exc) not in _LOGPROB_REJECTION_STATUS_CODES or _logprobs_rejected(exc, spec):
+        if _status_code(exc) not in _LOGPROB_REJECTION_STATUS_CODES:
             return None
         evidence = _error_evidence(exc)
+        limits = transport.limits
+        if (
+            spec.reasoning is not None
+            and limits.include
+            and "include" in evidence
+            and not (spec.logprobs and _include_value_refused(evidence))
+        ):
+            # The list carried the reasoning entry too, and a server that refuses the *field* may
+            # well accept the one entry a label readout needs — dropping the reasoning entry is one
+            # request to find out, and the only thing there is to drop. The exception is a request
+            # that wanted logprobs from a server which has already listed the includables it offers
+            # and left ours out: rearranging the other entries earns the identical refusal, so the
+            # verdict below takes it at once.
+            return replace(limits, include=False)
+        if _logprobs_rejected(exc, spec, transport.surface):
+            return None
         # A complaint about the number is not a complaint about the field: dropping the field there
         # would answer the question with the caller's reasoning off, and remember that as the server's
         # limit. The provider's own error says which number it wanted, so it travels back instead.
         value_complaint = _value_refused(evidence)
-        limits = transport.limits
         if spec.json_schema is not None and any(marker in evidence for marker in _SCHEMA_MARKERS):
             if limits.structured == "schema":
                 # With ``structured_outputs=False`` the request already carried a plain
@@ -656,8 +712,6 @@ class _BaseClient:
             and any(marker in evidence for marker in _REASONING_MARKERS)
         ):
             return replace(limits, reasoning=False)
-        if spec.reasoning is not None and limits.include and "include" in evidence:
-            return replace(limits, include=False)
         if (
             not value_complaint
             and spec.prompt_cache_key is not None
@@ -751,8 +805,8 @@ class _BaseClient:
         """
         if (context.auto or context.api_auto) and spec.logprobs:
             failure = f"{type(exc).__name__}: {exc}"
-            if _logprobs_rejected(exc, spec):
-                capability = _logprobs_unsupported(exc, spec)
+            if _logprobs_rejected(exc, spec, transport.surface):
+                capability = _logprobs_unsupported(exc, spec, transport.surface)
                 note = (
                     ""
                     if capability
@@ -966,6 +1020,9 @@ class _BaseClient:
                 if not context.auto:
                     # An explicit method keeps its own contract: where no surface is left to carry it,
                     # it reports the provider's refusal rather than being swapped for another readout.
+                    # The verdict is still real, so it is remembered like any other: without that, a
+                    # later ``method="auto"`` call pays a request to rediscover it on this surface.
+                    self._note_surface_absence(context.model, surface, exc)
                     raise
                 fell_back = True
                 retry_reasons.append(f"{exc} — answering with method={FALLBACK_METHOD!r}")
@@ -1056,7 +1113,7 @@ class _BaseClient:
             break
         if method in ("logprobs", "grammar"):
             # A readable distribution is proof the provider can supply one: retire earlier absences.
-            self._note_logprobs_present(context.model, context.transport.surface)
+            self._note_logprobs_present(context.model, result.surface)
         native_reasoning = native_reasoning + result.reasoning
         return self._finalize(
             question, labels, readout, method, context, trace, native_reasoning, retry_reasons, log
@@ -1267,7 +1324,7 @@ class SystemOneClient(_BaseClient):
                         # with a fresh retry budget, because the attempts the old request shape spent
                         # say nothing about this one.
                         attempt = 0
-                        self._remember_limits(transport.surface, downgraded)
+                        self._remember_limits(transport.surface, transport.limits, downgraded)
                         self._switch_surface(context, transport.surface)
                         continue
                     failure = self._call_failure(exc, spec, context, transport, log)
@@ -1319,8 +1376,16 @@ class SystemOneClient(_BaseClient):
                         max_workers=self.max_concurrency
                     )
                 executor = self._executor
+            # Each worker runs the caller's context rather than a fresh one, so a trace or span the
+            # caller has open — MLflow's, OpenTelemetry's, or their own — still holds on this thread.
+            # A fresh context per task is what makes that safe: one Context cannot be entered twice
+            # at once, and the questions run concurrently. Without the hand-off, an enclosing span
+            # sees one question land inside it and the rest land as roots of their own, which is
+            # worse than either being consistent.
             futures = {
-                question_id: executor.submit(self._run, question_id, question, context)
+                question_id: executor.submit(
+                    contextvars.copy_context().run, self._run, question_id, question, context
+                )
                 for question_id, question in parsed.items()
             }
             for question_id, future in futures.items():
@@ -1397,7 +1462,7 @@ class AsyncSystemOneClient(_BaseClient):
                         # The field is optional; the question is not. Remember the limit and re-ask —
                         # with a fresh retry budget for the new request shape.
                         attempt = 0
-                        self._remember_limits(transport.surface, downgraded)
+                        self._remember_limits(transport.surface, transport.limits, downgraded)
                         self._switch_surface(context, transport.surface)
                         continue
                     failure = self._call_failure(exc, spec, context, transport, log)

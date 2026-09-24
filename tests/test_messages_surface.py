@@ -419,6 +419,42 @@ def test_a_caller_max_tokens_still_wins_over_the_grown_default(stub_server):
     assert body_sent(stub)["max_tokens"] == 4096
 
 
+def test_a_temperature_is_left_out_when_thinking_is_on(stub_server):
+    """The API refuses a temperature that is not its default alongside a thinking budget.
+
+    So a caller who asked for both cannot have both: the thinking is the explicit choice, the
+    temperature is a knob, and the answer is what the caller came for.
+    """
+    stub = stub_server(messages=answer())
+    client = client_for(stub, reasoning=ReasoningConfig(mode="native", budget_tokens=2048))
+
+    ask(client, temperature=0.6)
+
+    body = body_sent(stub)
+    assert body["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+    assert "temperature" not in body
+    assert "temperature" not in body.get("extra_body", {})
+
+
+def test_a_caller_max_tokens_that_cannot_hold_the_budget_is_refused_locally(stub_server):
+    """The API requires budget_tokens < max_tokens, and jevper can see that before the request.
+
+    Spending a call on a request this code can already prove the server will answer 400 for is the one
+    failure a local check is strictly better at — and the error has to name both numbers.
+    """
+    stub = stub_server(messages=answer())
+    client = client_for(
+        stub, reasoning=ReasoningConfig(mode="native", budget_tokens=2048), extra_body={"max_tokens": 2048}
+    )
+
+    with pytest.raises(JevperError) as raised:
+        ask(client)
+
+    message = str(raised.value)
+    assert "max_tokens=2048" in message and "budget_tokens=2048" in message
+    assert stub.requests == []
+
+
 def test_the_budget_does_not_grow_once_the_server_refused_the_thinking_field(stub_server):
     """The growth exists to make room for a thinking block the server is going to produce."""
     def script(body):

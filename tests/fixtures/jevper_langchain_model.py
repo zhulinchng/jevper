@@ -70,9 +70,15 @@ def messages_for(text: str) -> Sequence[BaseMessage]:
     return [HumanMessage(content=text)]
 
 
-# Models-from-code: with no argument, ModelConfig reads the config MLflow logged beside the code.
-# `get` raises KeyError on a missing key, so read the mapping and fall back to the defaults above.
-_config = ModelConfig().to_dict()
+# Models-from-code: with no argument, ModelConfig reads the config MLflow logged beside the code, and
+# raises FileNotFoundError when there is none — which is also the state a first run is in, since
+# logging is what writes the config. MLflow refuses that read on purpose, for a model whose settings
+# are required; the two settings here are optional, so the documented defaults stand in and
+# `log_model(model_config=...)` overrides them whenever a deployment has something else to say.
+try:
+    _config = ModelConfig().to_dict()
+except FileNotFoundError:
+    _config = {}
 mlflow.models.set_model(
     JevperLangChainChat(
         base_url=_config.get("base_url", "http://127.0.0.1:8000/v1"),

@@ -410,11 +410,12 @@ def test_a_single_question_stays_inside_the_wrapper_span(stub_server, autolog):
     assert completions.parent_id == wrapper.span_id
 
 
-def test_two_questions_become_their_own_traces_inside_the_wrapper(stub_server, autolog):
-    """Two questions are answered on worker threads, and MLflow's context does not cross threads.
+def test_every_question_stays_inside_the_wrapper_span(stub_server, autolog):
+    """Several questions are answered on worker threads, and each is handed the caller's context.
 
-    So the SDK spans are roots of their own rather than children of the wrapper span — the wrapper
-    trace keeps the answer, and the per-call traces keep the provider's view of it.
+    Without that hand-off the SDK spans are roots of their own, so a wrapper span around a
+    multi-question call keeps the answer and nothing else — and the same call with one question
+    nests properly. The wrapper trace is one trace either way, with one child span per question.
     """
     stub = stub_server(chat=answer_script)
     client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions", method="logprobs")
@@ -429,9 +430,37 @@ def test_two_questions_become_their_own_traces_inside_the_wrapper(stub_server, a
     traced_call()
 
     recorded = traces(autolog)
-    grouped = next(t for t in recorded if any(s.name == "system_one" for s in t.data.spans))
-    assert [span.name for span in grouped.data.spans] == ["system_one"]
-    assert len(recorded) == 3
+    assert len(recorded) == 1
+    grouped = recorded[0]
+    wrapper = next(span for span in grouped.data.spans if span.name == "system_one")
+    children = [span for span in grouped.data.spans if span.name == "Completions"]
+    assert len(children) == 2
+    assert {span.name for span in grouped.data.spans} == {"system_one", "Completions"}
+    assert all(span.parent_id == wrapper.span_id for span in children)
+
+
+def test_the_async_driver_nests_the_same_way(stub_server, autolog):
+    """The async driver gathers tasks rather than submitting them, and a task inherits the context
+    it was created in — so its spans are children of the wrapper too, with no hand-off to get wrong."""
+    stub = stub_server(chat=answer_script)
+    client = AsyncSystemOneClient(async_openai_client(stub), model="stub", api="chat_completions")
+
+    @mlflow.trace(name="system_one")
+    async def traced_call() -> Any:
+        return await client.system_one(
+            state="s",
+            questions={"a": Choice(criteria=CRITERIA), "b": Choice(criteria=CRITERIA)},
+        )
+
+    asyncio.run(traced_call())
+
+    recorded = traces(autolog)
+    assert len(recorded) == 1
+    grouped = recorded[0]
+    wrapper = next(span for span in grouped.data.spans if span.name == "system_one")
+    children = [span for span in grouped.data.spans if span.name == "AsyncCompletions"]
+    assert len(children) == 2
+    assert all(span.parent_id == wrapper.span_id for span in children)
 
 
 def test_a_chat_only_client_is_still_traced(stub_server, autolog):
@@ -1225,6 +1254,27 @@ def test_a_jevper_backed_langchain_model_logs_and_predicts(stub_server, tracking
     loaded = mlflow.pyfunc.load_model(info.model_uri)
     result = loaded.predict(["I was charged twice"])
     assert "billing" in json.dumps(result)
+
+
+def test_the_langchain_fixture_survives_being_logged_without_a_config(stub_server, tracking):
+    """Models-from-code has to work on a first run, and a first run has no logged config.
+
+    MLflow deliberately refuses a ``ModelConfig`` read when ``log_model`` was given no
+    ``model_config``, so a fixture whose two settings are optional has to carry its own defaults
+    past that refusal — otherwise it cannot be logged until something has already been logged.
+    """
+    pytest.importorskip("langchain_core")
+    from mlflow.langchain import log_model
+
+    with mlflow.start_run():
+        info = log_model(
+            lc_model=str(FIXTURES / "jevper_langchain_model.py"),
+            name="jevper-langchain-no-config",
+            input_example=["I was charged twice"],
+        )
+
+    loaded = mlflow.pyfunc.load_model(info.model_uri)
+    assert callable(loaded.predict)
 
 
 def test_evaluate_with_expected_facts(stub_server, tracking, tmp_path, monkeypatch):

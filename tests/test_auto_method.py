@@ -886,3 +886,59 @@ def test_async_explicit_logprobs_moves_surface_too(stub_server):
     assert stub.paths == ["/v1/responses", "/v1/chat/completions"]
 
 
+
+
+UNSUPPORTED_INCLUDE = {
+    "error": {
+        "message": "Unsupported parameter: 'include' is not supported with this model.",
+        "type": "invalid_request_error",
+        "param": "include",
+        "code": "unsupported_parameter",
+    }
+}
+
+
+def unsupported_include_host(body):
+    """OpenAI's own wording for a model that offers no includable at all."""
+    if any("logprobs" in str(entry) for entry in body.get("include", ())):
+        return 400, UNSUPPORTED_INCLUDE
+    return 200, responses_body(text=STRUCTURED)
+
+
+def test_an_unsupported_include_is_a_logprob_verdict_not_a_provider_error(stub_server):
+    """A Responses server that refuses ``include`` by name has refused the logprob carrier.
+
+    The word it uses is "unsupported", not "invalid option" — the phrasing this case was first seen
+    in. Either way the request asked for a distribution through the only field that can carry one,
+    and there is no other field to drop, so the verdict belongs to the label readout: auto answers
+    the question in JSON, and an explicit logprobs call reports the refusal rather than a raw 400.
+    """
+    stub = stub_server(responses=unsupported_include_host)
+    client = SystemOneClient(openai_client(stub), model="stub", api="responses", retry=NO_RETRY)
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+    assert response.debug["methods"] == {"q": "structured"}
+    assert "logprob" in response.debug["retry_reasons"][0].lower()
+    assert len(stub.requests) == 2
+
+
+def test_an_explicit_logprobs_call_moves_surface_on_an_unsupported_include(stub_server):
+    """The move is a verdict about the surface, so it is made however the method was chosen.
+
+    OpenAI's own wording for a model that offers no includable names the field and says the field is
+    unsupported — no "invalid option" anywhere. Read as a plain provider error it would end the call;
+    read as the carrier refusal it is, the distribution is one surface away.
+    """
+    stub = stub_server(
+        responses=unsupported_include_host,
+        chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)),
+    )
+    client = SystemOneClient(openai_client(stub), model="stub", method="logprobs", retry=NO_RETRY)
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+    assert response.debug["api"] == "chat_completions"
+    assert "retrying the label readout on api='chat_completions'" in response.debug["retry_reasons"][0]

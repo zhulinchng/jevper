@@ -40,7 +40,10 @@ response.answers["intent"].probabilities  # a real distribution, read from the s
 | llama.cpp | `http://127.0.0.1:8080/v1` | the `--alias` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--jinja` for the model's own template; `grammar` is llama.cpp-only |
 | vLLM | `http://127.0.0.1:8000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; `top_logprobs` is capped by `--max-logprobs` (20) |
 | SGLang | `http://127.0.0.1:30000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; its Responses route needs `top_logprobs` sent explicitly, which jevper always does |
-| LM Studio | `http://127.0.0.1:1234/v1` | the id `lms ls` prints, e.g. `qwen3-4b-instruct-2507` | nothing does — load a non-thinking model | the only server here answering **all three** surfaces, so `auto` finds Responses, Chat Completions and Messages on one box; `logprobs` arrives on both OpenAI surfaces; its Responses route accepts `text.format` and ignores it, so structured answers belong on Chat Completions |
+| LM Studio | `http://127.0.0.1:1234/v1` | the id `lms ls` prints, e.g. `qwen3-4b-instruct-2507` | nothing does — load a non-thinking model | all three surfaces on one box, as do the other four now; `logprobs` arrives on both OpenAI surfaces; its Responses route accepts `text.format` and ignores it, so structured answers belong on Chat Completions |
+
+All five answer the Anthropic Messages route as well (`/v1/messages`), so `api="auto"` has all three to
+choose from on any of them; ollama, llama.cpp and LM Studio were exercised through it directly.
 
 `api="auto"` (the default) works against all five: it prefers the Responses surface, and when that route is
 missing — or answers without carrying logprobs through — it re-asks on Chat Completions and remembers the
@@ -91,6 +94,16 @@ Unknown fields are accepted and dropped by all five, so a field that does not ap
   the schema's. jevper sends the schema in the request and, since it was accepted, does not repeat it in the
   prompt, so `method="structured"` on that surface reads whatever the model invents. Use
   `api="chat_completions"`, or `method="logprobs"`, for structured work there.
+- llama.cpp's Responses route accepts `text.format` and **ignores it** as well (its own converter never
+  reads the field; issue #21922), while its Chat Completions route converts the schema to a grammar and
+  enforces it. Same advice as LM Studio: structured work belongs on `api="chat_completions"` there, and
+  `api="auto"` gets there by itself when the logprob readout moves surfaces.
+- The output budget is the server's own on both OpenAI surfaces, so a model whose context is smaller than
+  the server's default refuses the request before inference: vLLM answers `400 max_tokens=2048 cannot be
+  greater than max_model_len=max_total_tokens=1024`. jevper reports that 400 with the numbers in it; bound
+  the output with `extra_body={"max_tokens": n}` when a server is serving a small-context model. The
+  Messages route is the exception — that API has no default at all, so jevper sends one (1024, plus any
+  thinking budget) and refuses a caller's `max_tokens` that cannot hold the budget it asked for.
 - An unknown path is not a `404` on LM Studio: it answers `200` with
   `{"error": "Unexpected endpoint or method. (POST /…)"}` (bug-tracker #618; confirmed here — `POST /v1/nope` and
   `POST /v1/messages/count_tokens` both answer `200` with that body), which jevper reads as an embedded
@@ -113,6 +126,7 @@ tolerate, and the fixture tests replay them on every change.
 | | ollama 0.34.3 | llama.cpp b11139 | vLLM 0.30.1 | SGLang 0.5.20 |
 | --- | --- | --- | --- | --- |
 | `/v1/responses` route | yes | yes | yes | yes |
+| `/v1/messages` route | yes, since 0.14.0 | yes, since Nov 2025 | yes, since 0.12.0 | yes, since 0.5.9 |
 | logprobs on Chat Completions | yes | yes | yes | yes |
 | logprobs on Responses | **empty list** | **`400`** | yes, with `include` | yes, with `top_logprobs` |
 | `top_logprobs` above 20 | `400` (`must be between 0 and 20`) | accepted | `400` | accepted |

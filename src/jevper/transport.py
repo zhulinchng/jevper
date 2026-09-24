@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .errors import ClientCapabilityError, ProviderError
+from .errors import ClientCapabilityError, JevperError, ProviderError
 from .reasoning import ReasoningConfig, ReasoningContentPart, ReasoningTextPart
 from .types import Method
 
@@ -474,6 +474,25 @@ def _responses_text(response: Any) -> str:
     return "".join(chunks)
 
 
+def _responses_refusal(response: Any) -> str | None:
+    """The model's own refusal, where this surface puts it: a content part of its own type.
+
+    Chat Completions carries a refusal as a sibling of ``content`` and leaves the content null, and the
+    Messages API as a ``refusal`` block. The Responses surface has the third shape, and reading only
+    ``output_text`` turns a refusal into an empty answer — true, and useless, the same way the other
+    two would be without their own reader.
+    """
+    for item in _get(response, "output") or []:
+        if _get(item, "type") != "message":
+            continue
+        for part in _get(item, "content") or []:
+            if _get(part, "type") == "refusal":
+                refusal = str(_get(part, "refusal") or "").strip()
+                if refusal:
+                    return refusal
+    return None
+
+
 def _responses_token_logprobs(response: Any) -> tuple[TokenLogprob, ...]:
     for item in _get(response, "output") or []:
         if _get(item, "type") != "message":
@@ -515,6 +534,7 @@ def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
         reasoning_tokens=_get(details, "reasoning_tokens"),
         cached_tokens=_get(input_details, "cached_tokens"),
         stop=stop,
+        refusal=_responses_refusal(response),
     )
 
 
@@ -572,22 +592,33 @@ def build_messages_kwargs(
         default_max_tokens = DEFAULT_MAX_TOKENS + (budget or 0)
     else:
         default_max_tokens = DEFAULT_MAX_TOKENS
+    max_tokens = body.pop("max_tokens", default_max_tokens)
+    if thinking and isinstance(max_tokens, int) and budget is not None and max_tokens <= budget:
+        # Anthropic requires the budget to be strictly below max_tokens, and jevper owns both numbers
+        # unless the caller took one over. Spending a request on a request this code can already prove
+        # the API will refuse is the one failure mode a local check is strictly better at.
+        raise JevperError(
+            f"max_tokens={max_tokens} must be greater than the thinking budget_tokens={budget}; "
+            "raise max_tokens (extra_body={'max_tokens': n}) or lower ReasoningConfig(budget_tokens=n)"
+        )
     kwargs: dict[str, Any] = {
         "model": model,
         # Required by this API, with no server-side default anywhere that implements it.
-        "max_tokens": body.pop("max_tokens", default_max_tokens),
+        "max_tokens": max_tokens,
         "messages": turns,
     }
     if system:
         kwargs["system"] = system
     if thinking:
         kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
-    if spec.temperature is not None:
+    if spec.temperature is not None and not thinking:
         # Not a typed parameter of the SDK's ``messages.create`` — the newest Claude models refuse a
         # non-default temperature, so the client stopped naming it — but the API itself still accepts
-        # one, and every local server implementing this API reads it. The caller's own body wins.
+        # one, and every local server implementing this API reads it. Extended thinking is the
+        # exception: the API refuses a temperature that is not its default alongside a thinking
+        # budget, so a request that enables thinking leaves it out entirely. The caller's own body
+        # wins either way.
         body.setdefault("temperature", spec.temperature)
-    if body:
         kwargs["extra_body"] = body
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)

@@ -57,13 +57,17 @@ mlflow.flush_trace_async_logging()                 # trace export is asynchronou
 | `api="responses"` | `Responses` (`AsyncResponses` async) | `mlflow.openai.autolog()` |
 | `api="messages"` | `Messages.create` (`AsyncMessages.create` async) | `mlflow.anthropic.autolog()` |
 
-Each SDK call is its own **trace** unless it happens inside a span you opened. A single question is answered
-on the calling thread, so its span becomes a child of your `@mlflow.trace` span. With several questions,
-jevper answers them on a `ThreadPoolExecutor`, and MLflow's tracing context lives in a `ContextVar` that does
-not cross threads: each question's call is then a separate root trace, and the wrapper trace holds only the
-answer. That is MLflow's documented behaviour, not a jevper bug — see its own `advanced-patterns` reference
-("Threads require explicit context propagation"). If you need one trace per call, pass one question per call
-or wrap the per-question work yourself.
+Each SDK call is its own **trace** unless it happens inside a span you opened. jevper answers several
+questions on a thread pool, and each worker gets a copy of the caller's context, so a `@mlflow.trace`
+span around `system_one` is the parent of every question's SDK span: one trace, one child span per
+question, whether the call carried one question or ten. (MLflow's *active run* is a thread-local rather
+than a context variable, so a run started with `mlflow.start_run()` is not attached to spans created on
+those workers. A `@mlflow.trace` span is the way to get one trace per call.)
+
+The fixture `tests/fixtures/jevper_langchain_model.py` reads its `base_url` and `model` from the
+`model_config` MLflow logged beside the code. MLflow deliberately refuses that read when a model was
+logged without one, so the fixture falls back to its own defaults: `log_model(..., model_config=...)`
+is what a deployment passes when it has something else to say.
 
 What lands on a span, all observed on real calls:
 
@@ -95,7 +99,8 @@ answer comes back anyway.
 
 ## Hosting jevper as an MLflow model
 
-MLflow 3.16.1 offers three base classes for a chat model. Two of them are exercised end to end in
+MLflow 3.16.1 offers three base classes for a chat model (a fourth, `ChatAgent`, exists for agents
+rather than chat). Two of them are exercised end to end in
 `tests/fixtures/`, logged with the models-from-code pattern (`python_model=<path>` — a cloudpickled instance
 cannot carry an HTTP client, and the client belongs in `load_context` anyway).
 

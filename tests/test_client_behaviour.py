@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import threading
 import time
@@ -26,6 +27,7 @@ from jevper import (
     ClientCapabilityError,
     InvalidQuestionError,
     JevperError,
+    LabelReadoutError,
     MalformedAnswerError,
     Noul,
     ProviderError,
@@ -1271,6 +1273,29 @@ def test_a_chat_refusal_is_reported_as_a_refusal(stub_server):
     assert "I cannot help with that." in str(error.value)
 
 
+def test_a_responses_refusal_part_is_reported_as_a_refusal(stub_server):
+    """Each surface puts a refusal somewhere of its own; this is the Responses one.
+
+    A refusal part carries no ``output_text``, so reading only the text parts reports an empty answer
+    — "no JSON object in the answer", which is true and tells the caller nothing about the model.
+    """
+    stub = stub_server(
+        responses=lambda _: (
+            200,
+            responses_body(text="", refusal="I cannot help with that."),
+        )
+    )
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="responses", method="structured", n_retry_malformed=0
+    )
+
+    with pytest.raises(MalformedAnswerError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "refused to answer" in str(error.value)
+    assert "I cannot help with that." in str(error.value)
+
+
 def test_a_truncated_answer_names_the_budget_even_when_it_parsed_partially(stub_server):
     """The ``{`` is there, the rest is not: the parse error is real and the budget is the reason."""
     stub = stub_server(
@@ -1292,6 +1317,113 @@ def test_a_truncated_answer_names_the_budget_even_when_it_parsed_partially(stub_
 
     assert "ran out of output tokens" in str(error.value)
     assert "length" in str(error.value)
+
+
+def test_a_worker_thread_sees_the_callers_context():
+    """Whatever the caller's thread carries has to reach the threads that answer the questions.
+
+    Tracing libraries keep the open span in a context variable rather than in thread state — MLflow
+    and OpenTelemetry both do — so a worker that starts from a fresh context silently drops the
+    parent, and the first question nests while the rest of the same call land as roots.
+    """
+    seen: list[str | None] = []
+    marker = contextvars.ContextVar("jevper-test-marker")
+
+    class ContextReadingClient:
+        class Chat:
+            class Completions:
+                def create(self, **kwargs):
+                    seen.append(marker.get())
+                    return chat_body(content="A", logprobs=CHOICE_LOGS)
+
+            completions = Completions()
+
+        chat = Chat()
+
+    client = SystemOneClient(
+        ContextReadingClient(), model="stub", api="chat_completions", max_concurrency=2
+    )
+    marker.set("set-by-the-caller")
+
+    response = client.system_one(
+        state="s", questions={"a": Choice(criteria=CRITERIA), "b": Choice(criteria=CRITERIA)}
+    )
+
+    assert response.answers.keys() == {"a", "b"}
+    assert seen == ["set-by-the-caller", "set-by-the-caller"]
+
+
+class _RacingSurfaceClient:
+    """One question's Responses call is held open while another's 404 moves the shared context."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.responses_calls = 0
+        self.lock = threading.Lock()
+        outer = self
+
+        class Responses:
+            def create(self, **kwargs):
+                with outer.lock:
+                    outer.responses_calls += 1
+                    call = outer.responses_calls
+                if call == 1:
+                    outer.release.wait(timeout=5)
+                    return responses_body(text="A", logprobs=CHOICE_LOGS)
+                raise StatusError(404, "the server has no 'responses' route")
+
+        class Completions:
+            def create(self, **kwargs):
+                if kwargs.get("response_format"):
+                    return chat_body(content=STRUCTURED)
+                # A label answer on this surface, and no distribution with it: this Chat Completions
+                # route is the one that carries none.
+                return chat_body(content="A")
+
+        class Chat:
+            completions = Completions()
+
+        self.responses = Responses()
+        self.chat = Chat()
+
+
+def test_a_distribution_credits_the_surface_that_produced_it():
+    """A distribution proves what the surface that returned it can do — not what another one can.
+
+    The questions share one context, so while the first is in flight the second can move the context
+    to another surface. Reading the credit off the context would tell the surface that never carried
+    one that it can, and the absence remembered against it would be forgotten with it.
+    """
+    duck = _RacingSurfaceClient()
+    client = SystemOneClient(duck, model="stub", max_concurrency=2, retry=RetryPolicy(n_retries=0))
+    question = {"q": Choice(criteria=CRITERIA)}
+
+    for _ in range(2):
+        client.system_one(state="s", questions=question, api="chat_completions")
+    assert client._logprobs_absent_here("stub", "chat_completions")
+
+    done = []
+
+    def call() -> None:
+        done.append(
+            client.system_one(
+                state="s",
+                questions={"a": Choice(criteria=CRITERIA), "b": Choice(criteria=CRITERIA)},
+            )
+        )
+
+    worker = threading.Thread(target=call)
+    worker.start()
+    while duck.responses_calls < 2:
+        time.sleep(0.01)
+    time.sleep(0.05)  # the second question's 404 has moved the shared context
+    duck.release.set()
+    worker.join(timeout=10)
+
+    assert done and done[0].answers.keys() == {"a", "b"}
+    assert client._logprobs_absent_here("stub", "chat_completions"), (
+        "a distribution from the Responses surface credited Chat Completions"
+    )
 
 
 def test_an_unusable_first_choice_is_read_as_no_choice_at_all(stub_server):
@@ -1652,3 +1784,106 @@ def test_examples_are_validated_before_the_first_provider_call(stub_server):
         )
 
     assert stub.requests == []
+
+
+class _TwoRefusalsClient:
+    """Two questions refused for two different fields, both read from the same transport snapshot.
+
+    The barrier makes the two first attempts land together, so neither can see the other's downgrade
+    before computing its own — which is the only way the two can collide.
+    """
+
+    def __init__(self, barrier: threading.Barrier) -> None:
+        self.barrier = barrier
+        self.lock = threading.Lock()
+        self.arrivals = 0
+        self.bodies: list[dict[str, Any]] = []
+        outer = self
+
+        class Completions:
+            def create(self, **kwargs):
+                with outer.lock:
+                    outer.arrivals += 1
+                    arrival = outer.arrivals
+                    outer.bodies.append(kwargs)
+                if arrival <= 2:
+                    outer.barrier.wait(timeout=5)
+                    if arrival == 1:
+                        raise StatusError(400, "response_format is not supported by this server")
+                    raise StatusError(400, "prompt_cache_key is not supported by this server")
+                return chat_body(content=STRUCTURED)
+
+        class Chat:
+            completions = Completions()
+
+        self.chat = Chat()
+
+def test_concurrent_downgrades_both_stick():
+    """A field one question learned to leave out must not come back because another one wrote later.
+
+    The questions run concurrently and each downgrade is computed from the snapshot its transport was
+    built with, so writing that result wholesale would let the second write restore the first's
+    refused field — and the next call would pay the same refusal again.
+    """
+    duck = _TwoRefusalsClient(threading.Barrier(2, timeout=5))
+    client = SystemOneClient(
+        duck,
+        model="stub",
+        api="chat_completions",
+        method="structured",
+        retry=RetryPolicy(n_retries=0),
+        max_concurrency=2,
+    )
+    questions = {"a": Choice(criteria=CRITERIA), "b": Choice(criteria=CRITERIA)}
+
+    first = client.system_one(state="s", questions=questions)
+    assert first.answers.keys() == {"a", "b"}
+
+    duck.bodies.clear()
+    client.system_one(state="s", questions=questions)
+
+    # The schema refusal is remembered as the next rung down rather than as "no schema": the ladder
+    # keeps the answer constrained to an object. The cache-key refusal is remembered as itself.
+    assert duck.bodies[0]["response_format"] == {"type": "json_object"}
+    assert "prompt_cache_key" not in duck.bodies[0], "the cache-key refusal was forgotten"
+
+
+class _TwoSurfaceClient:
+    """Both OpenAI surfaces, each refusing the logprob request with its own capability wording."""
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+        outer = self
+
+        class Completions:
+            def create(self, **kwargs):
+                outer.requests.append(("chat_completions", kwargs))
+                raise StatusError(400, "logprobs are not supported with this model")
+
+        class Chat:
+            completions = Completions()
+
+        class Responses:
+            def create(self, **kwargs):
+                outer.requests.append(("responses", kwargs))
+                raise StatusError(400, "logprobs are not supported with this model")
+
+        self.chat = Chat()
+        self.responses = Responses()
+
+
+def test_a_refused_second_surface_is_remembered_too():
+    """Two surfaces, neither with logprobs: the second verdict is as real as the first.
+
+    A caller who asked for the distribution explicitly gets the refusal, and a later ``method="auto"``
+    call must not spend a request rediscovering it on the surface the failed call already tried.
+    """
+    duck = _TwoSurfaceClient()
+    client = SystemOneClient(duck, model="stub", api="auto", retry=RetryPolicy(n_retries=0))
+
+    with pytest.raises(LabelReadoutError):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}, method="logprobs")
+
+    assert [surface for surface, _ in duck.requests] == ["responses", "chat_completions"]
+    assert client._logprobs_absent_here("stub", "responses")
+    assert client._logprobs_absent_here("stub", "chat_completions")

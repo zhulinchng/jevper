@@ -41,7 +41,7 @@ Three things count as *this provider cannot do logprobs*:
 | Evidence | Response |
 | --- | --- |
 | The provider rejects the logprob fields with a 4xx that names them — Gemini's OpenAI-compatibility layer answers `Unknown name "logprobs": Cannot find field.`, a reasoning model behind an OpenAI-shaped gateway answers `logprobs are not supported with reasoning models.` | Under `api="auto"`, ask on the surface that carries the readout — and remember the verdict, so later calls start there |
-| The provider refuses the `include` entry a Responses request carries them in — OpenRouter answers `400 Invalid option: expected one of …` for `path: ["include", 0]`, without ever writing the word "logprob" | same |
+| The provider refuses the `include` entry a Responses request carries them in, without ever writing the word "logprob" — OpenRouter answers `400 Invalid option: expected one of …` for `path: ["include", 0]`, and OpenAI's own wording for a model that offers no includable is `400 Unsupported parameter: 'include' is not supported with this model.` | same. The carrier is per surface: on Chat Completions it is the `logprobs` field, so a message that merely mentions `include` is about something else |
 | The answer carries no logprobs at all (`logprobs: null`, or a compatibility layer that drops the field) | same, once a second response confirms it |
 | The answer token's logprobs carry no alternatives — `top_logprobs` empty, or nothing but the sampled token — so there is no distribution to read | same |
 
