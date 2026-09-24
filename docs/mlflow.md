@@ -54,8 +54,8 @@ mlflow.flush_trace_async_logging()                 # trace export is asynchronou
 | --- | --- | --- |
 | `api="chat_completions"` (sync) | `Completions` | `mlflow.openai.autolog()` |
 | `api="chat_completions"` (async) | `AsyncCompletions` | `mlflow.openai.autolog()` |
-| `api="responses"` | `Responses` | `mlflow.openai.autolog()` |
-| `api="messages"` | `Messages.create` | `mlflow.anthropic.autolog()` |
+| `api="responses"` | `Responses` (`AsyncResponses` async) | `mlflow.openai.autolog()` |
+| `api="messages"` | `Messages.create` (`AsyncMessages.create` async) | `mlflow.anthropic.autolog()` |
 
 Each SDK call is its own **trace** unless it happens inside a span you opened. A single question is answered
 on the calling thread, so its span becomes a child of your `@mlflow.trace` span. With several questions,
@@ -72,7 +72,7 @@ What lands on a span, all observed on real calls:
 | `mlflow.llm.model` | The model jevper sent |
 | `mlflow.llm.provider` | `anthropic` on the Messages route (absent on the OpenAI routes) |
 | `mlflow.message.format` | `openai` or `anthropic` |
-| `mlflow.chat.tokenUsage` | `{"input_tokens", "output_tokens", "total_tokens"}`, plus `cache_read_input_tokens` on the Responses route; all three are `null` when the provider sent no usage |
+| `mlflow.chat.tokenUsage` | `{"input_tokens", "output_tokens", "total_tokens"}`, plus `cache_read_input_tokens` on the Responses route. It is *absent* when the provider sent no `usage` at all, and holds `null` for each token when the provider sent a usage object with those fields missing — so a test asserting one of those shapes fails on the other |
 | `mlflow.spanInputs` / `mlflow.spanOutputs` | The request kwargs jevper built, and the raw provider response |
 | `mlflow.spanLogLevel` | `20` on a successful SDK call, `40` on a failed one; a plain `@mlflow.trace` span of your own is `10` |
 | request fields | `mlflow.spanInputs` always holds every keyword jevper sent. MLflow *also* promotes some of them to attributes, and which ones depends on the route: `logprobs`, `top_logprobs`, `prompt_cache_key`, `model` on chat; `include`, `store`, `top_logprobs`, `model` on responses; none on the Messages route, where `max_tokens` lives in `span.inputs` |
@@ -85,9 +85,12 @@ answer — so `response.debug["llm_attempts"]` and the trace tell the same story
 Two failure modes are worth knowing. A request the provider *rejects* — a 400, a 404, a refused field —
 leaves a span with an error status, and the call still raises jevper's own error. A response the provider
 *answers* that jevper cannot read is different: a refusal or a spent budget arrives as an HTTP 200, so the
-span is `OK` while jevper raises `MalformedAnswerError`/`LabelReadoutError`. The span tells you what the
-provider said; jevper's error tells you whether an answer came out of it. And an *unwritable* tracking store
-does not break the call — MLflow cannot export the span, and the answer comes back anyway.
+span is `OK` while jevper raises `MalformedAnswerError`/`LabelReadoutError`. The rule behind both is that the
+span's status follows the *SDK call*: `OK` if it returned, error if it raised — which also means a 200 whose
+body the SDK itself cannot parse is an error span, while one whose shape the SDK tolerates and jevper then
+trips over is not. The span tells you what the provider said; jevper's error tells you whether an answer came
+out of it. And an *unwritable* tracking store does not break the call — MLflow cannot export the span, and the
+answer comes back anyway.
 `mlflow.tracing.disable()` records nothing and changes nothing else.
 
 ## Hosting jevper as an MLflow model
@@ -266,6 +269,7 @@ tracking URI) to the server-hosted gateway's passthrough path, so it does not re
   deprecated, and the server-hosted routes (`/gateway/mlflow/v1/...`) are what current documentation
   describes. Re-run `tests/test_mlflow.py` after upgrading MLflow.
 * Streaming is not covered: jevper answers in one call per question, so there is no streaming path to trace,
-  and MLflow's Anthropic autolog does not record streaming calls in any case.
+  and MLflow's Anthropic autolog does not record streaming output in any case — `messages.create(stream=True)`
+  leaves a span whose output is the stream object's repr, and `messages.stream()` produces no span at all.
 * The trace-attribute names (`mlflow.chat.tokenUsage`, `mlflow.llm.model`, …) are MLflow's, not jevper's; the
   suite asserts them, so a rename shows up as a failing test rather than a silent gap.
