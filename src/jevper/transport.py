@@ -97,6 +97,10 @@ class Limits:
     thinking: bool = True
     """Whether the server accepts the Messages API's ``thinking`` field. vLLM's protocol has no such
     field at all, so a request carrying one is refused there and re-asked without it."""
+    output_config: bool = True
+    """Whether the server accepts the Messages API's ``output_config`` structured-output field. The
+    OpenAI surfaces carry their schema in ``response_format``/``text``; Anthropic's native equivalent
+    is ``output_config.format``, and a server implementing Messages without it refuses the field."""
 
 
 def _schema_instruction(spec: CallSpec) -> str:
@@ -148,6 +152,8 @@ def _caller_body(extra_body: Mapping[str, Any] | None, limits: Limits) -> dict[s
         body.pop("include", None)
     if not limits.cache_key:
         body.pop("prompt_cache_key", None)
+    if not limits.output_config:
+        body.pop("output_config", None)
     if not limits.thinking:
         body.pop("thinking", None)
     return body
@@ -570,19 +576,28 @@ def build_messages_kwargs(
 ) -> dict[str, Any]:
     """The Anthropic Messages request.
 
-    Two fields of the other surfaces have no equivalent here, so neither is ever sent: there is no
-    logprob carrier at all, and no schema field — so the JSON Schema travels in the system prompt
-    instead, which is the only place this request can state the answer's shape. ``structured_outputs``
-    is therefore accepted and unused, so that every surface builder keeps one signature.
+    There is no logprob carrier here at all, so a label readout never reaches this builder. The answer's
+    shape has a field of its own — ``output_config.format``, this API's schema-constrained output and the
+    counterpart of ``response_format`` on Chat Completions, which the TypeSafe reference adapter sends
+    here — and jevper sends it whenever ``structured_outputs`` is on, the server has not refused it, and
+    the caller has not named it in ``extra_body``.
+
+    The system prompt carries the schema either way. A server can refuse the field, which the ladder
+    catches, or accept it and drop it without a word — vLLM's Messages request model has no such field
+    and pydantic discards extras — and a shape that reached neither place is a shape the model never saw.
     """
     limits = limits or Limits()
     system, turns = _split_system(spec.messages)
+    body = _caller_body(extra_body, limits)
+    native_schema = (
+        spec.json_schema is not None
+        and structured_outputs
+        and limits.output_config
+        and "output_config" not in body
+    )
     if spec.json_schema is not None:
-        # This API has no schema field at all, so the shape has to travel in the top-level system
-        # prompt — the only place a request on this surface can state the answer's format.
         instruction = _schema_instruction(spec)
         system = f"{system}\n\n{instruction}" if system else instruction
-    body = _caller_body(extra_body, limits)
     budget = spec.reasoning.budget_tokens if spec.reasoning is not None else None
     thinking = budget is not None and limits.thinking and "thinking" not in body
     if thinking:
@@ -611,6 +626,8 @@ def build_messages_kwargs(
         kwargs["system"] = system
     if thinking:
         kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+    if native_schema:
+        kwargs["output_config"] = {"format": {"type": "json_schema", "schema": spec.json_schema}}
     if spec.temperature is not None and not thinking:
         # Not a typed parameter of the SDK's ``messages.create`` — the newest Claude models refuse a
         # non-default temperature, so the client stopped naming it — but the API itself still accepts
@@ -619,6 +636,10 @@ def build_messages_kwargs(
         # budget, so a request that enables thinking leaves it out entirely. The caller's own body
         # wins either way.
         body.setdefault("temperature", spec.temperature)
+    if body:
+        # Whatever is left of the caller's body reaches the request on every path, not only when a
+        # temperature happened to be sent: ``extra_body`` is the only way to name a field this
+        # builder does not type, and dropping it would silently ignore the caller's request.
         kwargs["extra_body"] = body
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)

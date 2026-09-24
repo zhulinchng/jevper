@@ -11,7 +11,7 @@ from jevper import SystemOneClient, AsyncSystemOneClient, Choice, Noul, Score, E
 `__all__` also contains `Answer`, `Api`, `ChoiceAnswer`, `Example`, `Examples`, `JSONContent`, `Method`,
 `MethodSelection`, `NoulAnswer`, `NoulCriteria`, `ProviderError`, `Question`, `Readout`,
 `ReasoningContentPart`, `ReasoningSummaryPart`, `ReasoningTextPart`, `RetryPolicy`, `ScoreAnswer`,
-`SystemOneResponse`, `Usage`, `reasoning_text`, the five other error classes, and `__version__`.
+`SystemOneResponse`, `Usage`, `reasoning_text`, the seven other error classes, and `__version__`.
 
 ## `SystemOneClient`
 
@@ -30,7 +30,7 @@ Anthropic SDK's, pointed at any server that implements the Messages API); it sta
 | `api` | `"auto"` | `"auto"`, `"chat_completions"`, `"responses"` or `"messages"` (the Anthropic Messages API); `"auto"` prefers `responses`, then `chat_completions`, then `messages`, falling back when the server answers 404 for a route — see [methods.md](methods.md#auto) |
 | `reasoning` | `None` | A `ReasoningConfig`; `None` disables reasoning entirely. `mode="auto"` resolves to `native` on the Responses surface and `two_step` elsewhere, and `budget_tokens` is what the Messages surface sends as its `thinking` field — see [reasoning.md](reasoning.md) |
 | `examples` | `()` | Default few-shot examples: a sequence for all questions, or a mapping keyed by question id |
-| `structured_outputs` | `True` | Send a strict `json_schema` response format; `False` falls back to `{"type": "json_object"}` with the schema left in the prompt. A server that refuses the strict schema gets the same fallback automatically |
+| `structured_outputs` | `True` | Send a strict `json_schema` response format — `response_format` on Chat Completions, `text.format` on Responses, and the Messages API's own `output_config.format`; `False` leaves the schema in the prompt instead (`{"type": "json_object"}` on the OpenAI surfaces). A server that refuses the strict schema gets the same fallback automatically |
 | `normalize_probabilities` | `True` | Rescale `structured` distributions that are off by more than `1e-6`; `False` returns the model's numbers verbatim |
 | `top_logprobs` | `20` | Requested alternatives for `logprobs`/`grammar`; must be in `[0, 20]`, and at least 2 when the method is pinned to `logprobs`/`grammar` — the sampled token alone is not a distribution |
 | `max_concurrency` | `8` | Questions in flight at once (thread pool, or asyncio semaphore) |
@@ -38,7 +38,7 @@ Anthropic SDK's, pointed at any server that implements the Messages API); it sta
 | `retry` | `None` | Transient-failure retries; `RetryPolicy()` (2 retries, 0.5s base, 8s cap) when unset |
 | `temperature` | `None` | Not sent unless set. `0.0` is recommended for `structured`/`discrete`; `logprobs` needs no setting. Left out of a Messages request that enables `thinking`, which the API refuses alongside a non-default temperature |
 | `prompt_cache_key` | `None` | The provider's cache-routing key. Unset, jevper derives one per question from the parts of the prompt that do not change between calls, so a rubric's requests are routed together; set it to group (or account for) requests your own way |
-| `extra_body` | `None` | Merged into every request body (the grammar field is merged here too). A key it names is the value that reaches the wire — the SDK merges `extra_body` *after* the typed parameters — so jevper leaves that field alone rather than sending a typed value the caller's own key would override. `response_format`/`text` named here therefore also puts the JSON Schema in the prompt, since no schema of jevper's is in the request. On the Messages surface, `max_tokens` comes from here — jevper always sends one there, defaulting to `DEFAULT_MAX_TOKENS` (1024), or 1024 plus `ReasoningConfig(budget_tokens=…)`; a `max_tokens` that cannot hold the thinking budget asked for raises `JevperError` locally, naming both numbers, rather than earning the API's 400 |
+| `extra_body` | `None` | Merged into every request body (the grammar field is merged here too). A key it names is the value that reaches the wire — the SDK merges `extra_body` *after* the typed parameters — so jevper leaves that field alone rather than sending a typed value the caller's own key would override. `response_format`/`text`/`output_config` named here therefore also puts the JSON Schema in the prompt, since no schema of jevper's is in the request. On the Messages surface, `max_tokens` comes from here — jevper always sends one there, defaulting to `DEFAULT_MAX_TOKENS` (1024), or 1024 plus `ReasoningConfig(budget_tokens=…)`; a `max_tokens` that cannot hold the thinking budget asked for raises `JevperError` locally, naming both numbers, rather than earning the API's own refusal. Every other key travels on all three surfaces, whether or not a temperature was set |
 | `extra_headers` | `None` | Sent with every request |
 
 Constructor validation is eager: an unknown `method`/`api`, `top_logprobs` outside `[0, 20]` or below 2 with a
@@ -76,10 +76,17 @@ per-call `method` of `logprobs`/`grammar` with `top_logprobs` below 2, and for a
 
 | `state` | Rendered as |
 | --- | --- |
-| `"text"` | one `user` turn |
+| `"text"` | one `user` turn holding `<document>…</document>` |
 | `[{"role": "user", "content": "..."}, ...]` | those turns verbatim (roles `system`, `user`, `assistant`, `developer`; `content` must be `str`) |
 | `{"messages": [...]}` | same as above |
-| any other JSON value | one `user` turn holding `json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2)` |
+| any other JSON value | one `user` turn holding `<document>` around `json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2)` |
+
+A state handed over as one value is quoted, and every angle bracket inside it is written as its JSON
+escape, so the document cannot close its own quote and carry on as prompt text: the state is the
+content under judgement, and content under judgement is what an attacker would try to steer an
+answer with. Every system prompt says so in as many words. A state handed over as chat turns keeps its
+roles instead — the turns are already its boundary, and folding them into a document would destroy the
+conversation they are.
 
 Whichever form it takes, the state is rendered into the **last** messages of the prompt — after the system
 prompt, the few-shot turns and the question block — so that every state classified with one rubric shares the
@@ -118,9 +125,10 @@ Score(instructions=None, criteria=["level description"], examples=())
   pretty-printed JSON.
 - `criteria` is required for `Choice` and `Score`, optional for `Noul`. `Noul` criteria keys must be `true`
   and/or `false`; anything else raises `InvalidQuestionError`.
-- Limits: `Choice` 2–255 options (the Jev API limit), `Score` 2–10 levels. `logprobs` and `grammar` cap a
-  `Choice` at 26 options, because they read one label token; `structured` and `discrete` carry the full range
-  with two-letter labels past `Z`. Unknown fields are rejected (`extra="forbid"`).
+- Limits: `Choice` 1–255 options (the Jev API documents the 255 maximum and no minimum), `Score` 2–10
+  levels. `logprobs` and `grammar` cap a `Choice` at 26 options, because they read one label token;
+  `structured` and `discrete` carry the full range with two-letter labels past `Z`. Unknown fields are
+  rejected (`extra="forbid"`).
 - `examples` is a tuple of `Example` and is excluded from `model_dump()`, so dumps keep exactly the Jev wire
   keys `{"type", "instructions", "criteria"}`.
 - Validation runs on construction and again in `system_one`, so both paths fail identically. A mapping passed
@@ -162,7 +170,11 @@ ScoreAnswer(type="score", score=1.05, legend={0: "Calm", 1: "Frustrated", 2: "Ve
 - `choice` is the highest-probability option, ties resolved by criteria order; `probabilities` is keyed in
   criteria order.
 - `noul` answers carry no `confidence` — the Jev API omits it for `noul`.
-- `score` is `Σ i·pᵢ` over zero-based levels; `legend` maps level index to the criteria entry.
+- `score` is `Σ i·pᵢ` over zero-based levels, read off the distribution rescaled to sum to one; `legend`
+  maps level index to the criteria entry. The rescale matters only with `normalize_probabilities=False`,
+  where the reported `probabilities` stay the model's own numbers: a score carried from an unnormalized
+  distribution would leave the `0..N-1` line the Jev answer schema documents. This is the arithmetic
+  the TypeSafe reference adapter uses.
 - `confidence` for `choice` is `(max(p) − 1/n) / (1 − 1/n)`, i.e. the peak probability scaled from uniform
   (0) to certainty (1). For `score` it is `max(0, 1 − MAD(p) / MAD_uniform)`, where `MAD` is the mean absolute
   deviation from the modal level and `MAD_uniform` is that quantity for a uniform distribution. Both are
@@ -210,7 +222,7 @@ SGLang's `--enable-cache-report` for its Chat Completions route. See
 | `retry_reasons` | Corrective-retry messages, in order |
 | `probability_errors` | `{question_id: abs(sum − 1)}` for `structured` distributions outside `1e-6` |
 | `original_probabilities` | The model's raw distribution, only for questions that were rescaled |
-| `server_limits` | Only when the server refused a capability field: `structured` (`"schema"`/`"object"`/`"none"`), `reasoning`, `include`, `cache_key` and `thinking` as it last accepted them |
+| `server_limits` | Only when the server refused a capability field: `structured` (`"schema"`/`"object"`/`"none"`), `output_config` (the Messages API's schema field), `reasoning`, `include`, `cache_key` and `thinking` as it last accepted them |
 | `labels_missing` | Labels the provider did not report a logprob for, per question |
 
 Every key is always present — except `methods`, which only `method="auto"` adds — and the last three are empty
@@ -224,7 +236,7 @@ that produced the final answer.
 ## `RetryPolicy`
 
 ```python
-RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0)
+RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0, respect_retry_after=True)
 ```
 
 Applies per provider call. A failure is transient when the exception exposes a `status_code` reading as one of
@@ -233,13 +245,20 @@ exception or from `exc.response.status_code` when only the response carries it),
 class in its MRO — contains `Connection` or
 `Timeout`, or is an `httpx`-family transport failure (`TransportError`, `TimeoutException`). That last clause
 is what covers `httpx.ConnectError`, `ReadError` and `RemoteProtocolError`, whose names carry neither marker;
-a client-side `LocalProtocolError` is not retried. The delay before retry
-`n` is `min(base_delay · 3ⁿ, max_delay)` (so 0.5s, 1.5s, … by default). That backoff is the only thing that
-shapes the wait: the `Retry-After` and `X-RateLimit-*` headers a 429 carries are *not* read, even though
-providers such as OpenRouter recommend honoring them. Anything else — and a transient
-failure with the retries exhausted — is raised as `ProviderError` carrying `.attempts` and `.status_code`. A
-`RetryPolicy` with a negative or non-finite field (`NaN`, `inf`), or a `retry` that is not a `RetryPolicy`,
-raises `JevperError` at construction.
+a client-side `LocalProtocolError` is not retried.
+
+The wait is whatever the provider asked for when it said: a `Retry-After` (delta-seconds or an HTTP date)
+or the millisecond `retry-after-ms` some providers send instead replaces the computed backoff, which is
+what the TypeSafe clients do by default — coming back sooner than a rate limit asked is one way to extend
+it. `max_delay` caps jevper's own curve, not the server's instruction, so a header asking for minutes is
+waited out in minutes; `respect_retry_after=False` goes back to the curve alone, and `n_retries=0` fails on
+the first rate-limited response. A header jevper cannot read — not a number, not a date, negative — is
+the backoff's business, never a reason to skip the wait.
+
+Without a readable header the delay before retry `n` is `min(base_delay · 3ⁿ, max_delay)` (so 0.5s, 1.5s, …
+by default). Anything else — and a transient failure with the retries exhausted — is raised as
+`ProviderError` carrying `.attempts` and `.status_code`. A `RetryPolicy` with a negative or non-finite
+field (`NaN`, `inf`), or a `retry` that is not a `RetryPolicy`, raises `JevperError` at construction.
 
 ## `ReasoningConfig`
 
@@ -265,6 +284,8 @@ All inherit from `JevperError`.
 | `ClientCapabilityError` | the client lacks the attribute a surface needs, or a response carried no choices and no explanation of why |
 | `LabelReadoutError` | no logprobs at all, no alternatives for the answer token, no non-whitespace token, a first token that is not a label, no logprob for the answer token, a non-finite logprob, or no probability mass on any label. The first two are the provider's doing, so they are not corrective-retried and `method="auto"` answers with `structured` instead |
 | `MalformedAnswerError` | JSON answer missing/extra keys, a non-finite or out-of-range number, an unknown label, a score that is not a level index |
+| `IncompleteAnswerError` | the provider stopped generating before the answer was complete — `finish_reason: "length"`, `stop_reason: "max_tokens"`, a Responses `status: "incomplete"`, or a filtered answer. A `ProviderError` subclass, and terminal: a cut-off generation is not a malformed answer to correct, because another attempt spends a call to be cut off the same way |
+| `ModelRefusalError` | the model declined to answer and the provider said so — OpenAI's `refusal` field or content part, `stop_reason: "refusal"`. A `ProviderError` subclass, and terminal: a refusal is complete, not broken, so a corrective retry would only be refused again |
 | `ProviderError` | provider failure after transient retries; `.attempts` holds the attempt records and `.status_code` the status the provider reported, including one carried inside a `200` body. Also raised when every surface `api="auto"` could try answered `404`: the route is missing, so the failure is the provider's, not a private verdict's |
 | `JevperError` | base class, and the type used for constructor misuse, bad `state` messages, and content that is not JSON-serializable or contains a non-finite number |
 
@@ -296,6 +317,7 @@ the surface it implies, and a provider failure that survived its retries moves n
 `jevper.client.TRANSIENT_STATUS_CODES`, `jevper.client.MAX_TOP_LOGPROBS` (`20`),
 `jevper.client.MAX_PROMPT_CACHE_KEY` (`256`, the cap jevper enforces on a caller's cache key),
 `jevper.labels.MAX_LABEL_OPTIONS` (`26`, the single-token alphabet), `jevper.labels.MAX_CHOICE_OPTIONS` and
-`jevper.types.CHOICE_MAX_OPTIONS` (`255`), `jevper.types.SCORE_MAX_LEVELS` (`10`) and
+`jevper.types.CHOICE_MAX_OPTIONS` (`255`), `jevper.types.CHOICE_MIN_OPTIONS` (`1`),
+`jevper.types.SCORE_MIN_LEVELS` (`2`), `jevper.types.SCORE_MAX_LEVELS` (`10`) and
 `jevper.normalize.PROBABILITY_TOLERANCE` (`1e-6`) are available for callers that need to validate their own
 inputs before constructing a question.

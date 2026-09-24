@@ -15,6 +15,8 @@ import time
 from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from pydantic import BaseModel
@@ -126,15 +128,17 @@ _VALUE_MARKERS = (
     "not a valid",
 )
 # Text that names a *field jevper added for capability* rather than a bad value: the server does not
-# implement structured outputs, the reasoning parameters, or the Responses ``include`` list. None of the
-# three is needed to answer a question — the prompt already asks for one JSON object — so the field is
-# dropped and the call is re-asked, and the server's limit is remembered.
+# implement structured outputs — ``response_format``/``text.format`` on the OpenAI surfaces,
+# ``output_config`` on the Messages API — the reasoning parameters, or the Responses ``include`` list.
+# None of them is needed to answer a question — the prompt already asks for one JSON object — so the
+# field is dropped and the call is re-asked, and the server's limit is remembered.
 _SCHEMA_MARKERS = (
     "response_format",
     "json_schema",
     "text.format",
     "structured output",
     "structured_output",
+    "output_config",
 )
 _REASONING_MARKERS = ("reasoning_effort", "reasoning")
 # The Responses surface carries logprobs in ``include``, so a provider that does not offer that
@@ -175,11 +179,20 @@ Examples = Sequence[Example] | Mapping[str, Sequence[Example]]
 
 
 class RetryPolicy(BaseModel):
-    """Transient-failure retries: status codes 429/5xx and connection/timeout errors."""
+    """Transient-failure retries: status codes 429/5xx and connection/timeout errors.
+
+    A rate-limited provider says when to come back in ``Retry-After`` — or the millisecond
+    ``retry-after-ms`` some send instead — and the TypeSafe clients honor it by default: the header
+    replaces the computed backoff, so jevper waits as long as the server asked rather than as long as
+    its own curve says. Set ``respect_retry_after=False`` for the curve alone, or ``n_retries=0`` to
+    fail on the first rate-limited response. The honored delay is the server's to set: a header asking
+    for minutes is waited out in minutes, and ``max_delay`` caps the computed curve rather than it.
+    """
 
     n_retries: int = 2
     base_delay: float = 0.5
     max_delay: float = 8.0
+    respect_retry_after: bool = True
 
 
 def _status_code(exc: BaseException) -> int | None:
@@ -208,8 +221,15 @@ def _is_transient(exc: BaseException) -> bool:
     return any(marker in name for name in names for marker in _TRANSIENT_NAME_MARKERS)
 
 
-def _retry_delay(policy: RetryPolicy, attempt: int) -> float:
-    """Exponential backoff for transient retries, capped by the policy."""
+def _retry_delay(policy: RetryPolicy, attempt: int, exc: BaseException | None = None) -> float:
+    """How long to wait before retrying: what the provider asked for, else exponential backoff."""
+    if policy.respect_retry_after and exc is not None:
+        asked = _retry_after_seconds(exc)
+        if asked is not None:
+            # A provider that says when to come back is taken at its word, uncapped: the point of the
+            # header is that coming back sooner is another request it will refuse. `max_delay` is the
+            # caller's ceiling on the *computed* curve, not on the server's own instruction.
+            return asked
     if policy.base_delay >= policy.max_delay:
         return policy.max_delay
     # The cap is reached by multiplying, not by computing ``3**attempt``: that overflows a float past
@@ -222,6 +242,58 @@ def _retry_delay(policy: RetryPolicy, attempt: int) -> float:
         if delay >= policy.max_delay:
             return policy.max_delay
     return delay
+
+
+_RETRY_AFTER_MS = "retry-after-ms"
+_RETRY_AFTER = "retry-after"
+
+
+def _header(headers: Any, name: str) -> str | None:
+    """One response header as text, from an httpx ``Headers`` or a plain mapping."""
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if getter is None:
+        return None
+    for key in (name, name.title()):
+        try:
+            value = getter(key)
+        except (AttributeError, KeyError, TypeError, ValueError):  # not a mapping after all
+            return None
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """How long the failed response asked jevper to wait, when it said.
+
+    ``retry-after-ms`` is the millisecond form OpenRouter and Anthropic send; ``Retry-After`` is
+    either delta-seconds or an HTTP date, which is how a proxy states the same wait. Anything
+    unreadable falls back to the backoff rather than being guessed at.
+    """
+    headers = getattr(exc, "headers", None)
+    if _header(headers, _RETRY_AFTER_MS) is None and _header(headers, _RETRY_AFTER) is None:
+        headers = getattr(getattr(exc, "response", None), "headers", None)
+    for name, scale in ((_RETRY_AFTER_MS, 1e-3), (_RETRY_AFTER, 1.0)):
+        raw = _header(headers, name)
+        if raw is None:
+            continue
+        try:
+            seconds = float(raw) * scale
+        except ValueError:
+            if name != _RETRY_AFTER:
+                continue
+            try:
+                when = parsedate_to_datetime(raw)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            seconds = when.timestamp() - time.time()
+        if math.isfinite(seconds) and seconds >= 0:
+            return seconds
+    return None
 
 
 def _require_top_logprobs(method: Method, top_logprobs: int) -> None:
@@ -722,14 +794,21 @@ class _BaseClient:
         # limit. The provider's own error says which number it wanted, so it travels back instead.
         value_complaint = _value_refused(evidence)
         if spec.json_schema is not None and any(marker in evidence for marker in _SCHEMA_MARKERS):
-            if limits.structured == "schema":
+            if transport.surface == "messages":
+                # Anthropic's own schema field, and the only one this surface has. There is no
+                # ``json_object`` rung to step down to: dropping the field leaves the prompt carrying
+                # the schema, which is where it lived before the field existed. A complaint about the
+                # schema's contents is worth the rung too, for the reason the comment above gives.
+                if limits.output_config:
+                    return replace(limits, output_config=False)
+            elif limits.structured == "schema":
                 # With ``structured_outputs=False`` the request already carried a plain
                 # ``json_object``: the next rung is no format field at all, and re-sending the same
                 # bytes would only spend a second call on the same refusal.
                 if not transport.structured_outputs:
                     return replace(limits, structured="none")
                 return replace(limits, structured="object")
-            if limits.structured == "object":
+            elif limits.structured == "object":
                 return replace(limits, structured="none")
         if (
             not value_complaint
@@ -1123,6 +1202,14 @@ class _BaseClient:
                 prompt_cache_key=cache_key,
             )
             result = yield spec
+            unavailable = methods.answer_failure(result)
+            if unavailable is not None:
+                # Truncated, filtered and refused responses are not malformed answers: reading one
+                # would turn a generation the provider itself cut short into a typed decision, and a
+                # corrective retry spends a call to be cut short again. Reported as the provider's
+                # failure, with the attempt history the other provider errors carry.
+                unavailable.attempts = log.attempts
+                raise unavailable
             try:
                 readout = methods.readout(method, result, question, labels)
             except _LogprobsUnavailable:
@@ -1182,8 +1269,14 @@ class _BaseClient:
         else:
             levels = list(range(len(question.criteria)))
             distribution = {level: probabilities[level] for level in levels}
+            # The score is an expected value, so it is only meaningful over a distribution that sums
+            # to 1: with `normalize_probabilities=False` the reported numbers are the provider's own,
+            # and a distribution off 1 would otherwise put `score` off the 0..N-1 line the Jev answer
+            # schema documents. The TypeSafe reference adapter rescales for exactly this and leaves
+            # the reported probabilities untouched, so the answer stays verbatim and the score does not.
+            score_distribution = rescale(distribution)
             answer = ScoreAnswer(
-                score=math.fsum(level * probability for level, probability in distribution.items()),
+                score=math.fsum(level * probability for level, probability in score_distribution.items()),
                 legend={level: description for level, description in enumerate(question.criteria)},
                 probabilities=distribution,
                 confidence=score_confidence(list(distribution.values())),
@@ -1268,13 +1361,10 @@ class _BaseClient:
             }
         limits = self._limits_for(context.transport.surface)
         if limits != Limits():
-            # The server refused a request field jevper added, and the answer came without it.
+            # The server refused a request field jevper added, and the answer came without it. Every
+            # field of the limits is reported, so a new rung cannot be forgotten here.
             debug["server_limits"] = {
-                "structured": limits.structured,
-                "reasoning": limits.reasoning,
-                "include": limits.include,
-                "cache_key": limits.cache_key,
-                "thinking": limits.thinking,
+                entry.name: getattr(limits, entry.name) for entry in dataclass_fields(Limits)
             }
         return SystemOneResponse(
             model=context.model,
@@ -1359,7 +1449,7 @@ class SystemOneClient(_BaseClient):
                     # itself would print as its own cause.
                     raise failure from (None if failure is exc else exc)
                 log.n_retries += 1
-                time.sleep(_retry_delay(self.retry, attempt))
+                time.sleep(_retry_delay(self.retry, attempt, exc))
                 attempt += 1
                 continue
             log.add_result(result)
@@ -1497,7 +1587,7 @@ class AsyncSystemOneClient(_BaseClient):
                     # itself would print as its own cause.
                     raise failure from (None if failure is exc else exc)
                 log.n_retries += 1
-                await asyncio.sleep(_retry_delay(self.retry, attempt))
+                await asyncio.sleep(_retry_delay(self.retry, attempt, exc))
                 attempt += 1
                 continue
             log.add_result(result)

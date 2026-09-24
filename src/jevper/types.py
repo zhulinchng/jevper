@@ -27,7 +27,11 @@ from .reasoning import ReasoningContentPart
 JSONContent = str | int | float | bool | None | dict[str, Any] | list[Any]
 Probability = Annotated[float, Field(allow_inf_nan=False)]
 
-CHOICE_MIN_OPTIONS = 2
+CHOICE_MIN_OPTIONS = 1
+# The Jev API documents a maximum of 255 Choice options and no minimum, and its own reference adapter
+# answers a one-option Choice with confidence 1.0, so refusing one here would reject a request the
+# wire format accepts. A Score keeps its documented 2..10 levels: a one-level rubric has no ordering
+# to read, which is why the API asks for two there and says nothing about Choice.
 CHOICE_MAX_OPTIONS = MAX_CHOICE_OPTIONS
 SCORE_MIN_LEVELS = 2
 SCORE_MAX_LEVELS = 10  # Jev API limit

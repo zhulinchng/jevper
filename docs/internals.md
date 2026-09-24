@@ -215,12 +215,14 @@ Worth keeping when editing:
   is below the default) and a 5xx that survived the retries are `capability=False` and are *not* cached: the
   question is answered with a logprob-free method, but the next call tries logprobs again.
 - A request field jevper added for capability is dropped, not fatal. A 4xx that refuses structured output, the
-  reasoning parameters, the Responses `include` list, the cache key or the Messages `thinking` field moves that
-  field one step down its ladder — `json_schema` → `json_object` → nothing, then reasoning, then include, then
-  the key, then thinking — and the same call is re-asked, with the limit remembered per surface and reported in
-  `debug["server_limits"]`. None of them is needed to answer, so the question is answered instead of failing.
-  The ladder is finite, so a server that refuses everything still ends in a `ProviderError`, and a rejection
-  that names the logprob fields belongs to the readout fallback instead and never reaches it.
+  reasoning parameters, the Responses `include` list, the cache key, the Messages `thinking` field or the
+  Messages `output_config` moves that field one step down its ladder — `json_schema` → `json_object` → nothing,
+  then reasoning, then include, then the key, then thinking, then the Messages schema field — and the same call
+  is re-asked, with the limit remembered per surface and reported in
+  `debug["server_limits"]`, which is derived from the `Limits` dataclass so a new rung cannot be forgotten
+  there. None of them is needed to answer, so the question is answered instead of failing. The ladder is finite,
+  so a server that refuses everything still ends in a `ProviderError`, and a rejection that names the logprob
+  fields belongs to the readout fallback instead and never reaches it.
 - A refusal of the *value* is not a refusal of the *field*, and only the second moves the ladder.
   `budget_tokens: must be at least 1024` and `reasoning_effort must be one of low, medium, high` name fields
   the server knows and numbers it will not take; dropping the field there would answer the question with the
@@ -242,18 +244,20 @@ Worth keeping when editing:
   two-step call still share a key even though their system prompts differ, because the point of the key is to
   route the answer pass at the analysis pass's cache. A caller's own key replaces the derived one everywhere,
   including in the re-asks the ladder performs.
-- An answer that never arrived says why, on every path that reports it. `CallResult.stop` carries the
-  provider's own reason — `finish_reason` on Chat Completions, `incomplete_details.reason` on the Responses
-  surface, `stop_reason` on the Messages API — and the readouts append it to the error raised for a missing or
-  unparseable answer, including the two `parse_json_object` paths where the answer contained a `{` but could
-  not be read. A reasoning model that spends the whole output budget thinking (vLLM and SGLang answer
-  `status: "incomplete"`, llama.cpp and ollama `finish_reason: "length"`, the Messages API `stop_reason:
-  "max_tokens"`) otherwise fails with "no non-whitespace token in the response", which is true and useless.
-  A model's refusal is the other reason an answer never arrives — OpenAI's `refusal` sibling of a null
-  `content`, the Messages API's `stop_reason: "refusal"` — and `CallResult.refusal` carries the model's own
-  words so it reads as a refusal rather than as malformed JSON.
-- Capability failures are not corrective-retried: a correction turn changes the prompt, not what the provider
-  reports. Only the model-side failures (a non-label token, an unusable JSON shape) are worth another call.
+- An answer that never arrived says why, and a generation the provider itself cut short is never read as one.
+  `CallResult.stop` carries the provider's own reason — `finish_reason` on Chat Completions,
+  `incomplete_details.reason` on the Responses surface, `stop_reason` on the Messages API — and
+  `methods.answer_failure` reads it before any readout runs: a truncation (`length`, `max_tokens`,
+  `max_output_tokens`, `model_context_window_exceeded`) or any other non-terminal stop raises
+  `IncompleteAnswerError`, and a refusal raises `ModelRefusalError`. Both are `ProviderError` subclasses and
+  both are terminal, because a correction turn changes the prompt and not the budget the provider stopped at or
+  the fact that the model declined. The readouts keep the reason on the errors they raise for an answer that did
+  arrive but could not be read, including the two `parse_json_object` paths where the answer contained a `{` but
+  could not be parsed. `CallResult.refusal` carries the model's own words, so a refusal reads as a refusal
+  rather than as malformed JSON.
+- Capability failures are not corrective-retried, and neither are refusals or a spent budget: a correction turn
+ changes the prompt, not what the provider reports. Only the model-side failures (a non-label token, an
+  unusable JSON shape) are worth another call.
 - A logprob readout needs at least two candidates. `top_logprobs` with nothing but the sampled token is not a
   distribution, so it raises instead of reporting the answer as certain; a provider that reports entries but
   nulls for some of them is the documented partial case and keeps `labels_missing` semantics.

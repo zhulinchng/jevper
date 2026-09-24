@@ -167,15 +167,22 @@ Neither builder ever sends `max_tokens`, `max_completion_tokens` or `max_output_
 against those caps, and a small cap silently truncates a reasoning model. Cost is bounded by reading only the
 first answer token. Any other provider field goes through `extra_body`.
 
-When a server refuses one of the fields above — `400 response_format is not supported`, or the Responses
-`text.format`, or `reasoning_effort`, or the `reasoning.encrypted_content` include — jevper treats it the way it
-treats a surface that cannot carry logprobs: the field is dropped and the same call is re-asked, one step down
-the ladder at a time (`json_schema` → `json_object` → no `response_format` at all, then reasoning, then the
-include), and the limit is remembered for the rest of the client's life. None of the three is needed to answer —
-the prompt already asks for one JSON object and the readout validates it — so the question is answered instead
-of failing. The ladder is finite, so a server that refuses everything still ends in a `ProviderError`, and
-`debug["server_limits"]` reports what was learned. A field the caller put in `extra_body` is dropped with it:
-the SDK merges `extra_body` last, so leaving it there would re-send the refused field under another name.
+The Messages surface has no logprobs at all, and it does have a schema field of its own: Anthropic's
+`output_config={"format": {"type": "json_schema", "schema": ...}}`, the counterpart of the two above and
+what the TypeSafe reference adapter sends there. jevper sends it *and* keeps the schema in the system
+prompt, because a server can take that field and discard it without a word — vLLM's Messages request
+model drops what it does not model — and the five local servers constrain nothing on this route.
+
+When a server refuses one of the fields above — `400 response_format is not supported`, the Responses
+`text.format`, the Messages `output_config`, `reasoning_effort`, or the `reasoning.encrypted_content`
+include — jevper treats it the way it treats a surface that cannot carry logprobs: the field is dropped and
+the same call is re-asked, one step down the ladder at a time (`json_schema` → `json_object` → no
+`response_format` at all, then reasoning, then the include), and the limit is remembered for the rest of the
+client's life. None of them is needed to answer — the prompt already asks for one JSON object and the
+readout validates it — so the question is answered instead of failing. The ladder is finite, so a server that
+refuses everything still ends in a `ProviderError`, and `debug["server_limits"]` reports what was learned. A
+field the caller put in `extra_body` is dropped with it: the SDK merges `extra_body` last, so leaving it there
+would re-send the refused field under another name.
 
 A refusal of the *value* is not a refusal of the field, and the difference decides whether the field may be
 dropped at all. `budget_tokens: must be at least 1024`, `Invalid 'top_logprobs': integer must be between 0 and
@@ -299,7 +306,10 @@ Readout:
    their largest value first, so normalization cannot raise `OverflowError`. With
    `normalize_probabilities=False` the model's numbers are returned verbatim and only the error
    is recorded — never raised, matching the reference adapter.
-4. `choice` is the argmax of the final distribution, and `confidence` is computed from it.
+4. `choice` is the argmax of the final distribution, and `confidence` is computed from it. A `score` is
+   `Σ i·pᵢ` over the distribution *rescaled* to sum 1, whatever `probabilities` reports: an expected value
+   read off an unnormalized distribution leaves the `0..N-1` line the Jev answer schema documents, and
+   this is the arithmetic the reference adapter uses.
 
 `structured_outputs=False` keeps the schema in the prompt but sends `{"type": "json_object"}` instead of a
 strict schema — the documented workaround when a provider rejects `response_format`. It is also automatic: a

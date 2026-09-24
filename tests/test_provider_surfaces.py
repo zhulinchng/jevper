@@ -30,6 +30,7 @@ from fakes import (
 from jevper import (
     AsyncSystemOneClient,
     Choice,
+    IncompleteAnswerError,
     LabelReadoutError,
     ProviderError,
     RetryPolicy,
@@ -108,12 +109,12 @@ def test_a_reasoning_only_answer_names_the_token_budget(stub_server, server):
     stub = served(stub_server, (server, "chat-logprobs"))
     client = client_for(stub, api="chat_completions", method="logprobs", n_retry_malformed=0)
 
-    with pytest.raises(LabelReadoutError) as error:
+    with pytest.raises(IncompleteAnswerError) as error:
         client.system_one(state=STATE, questions=QUESTIONS)
 
     message = str(error.value)
-    assert "'Thinking'" in message
-    assert "output tokens" in message  # the budget note, from the recorded finish_reason
+    assert "ran out of output tokens" in message  # from the recorded finish_reason
+    assert len(stub.requests) == 1
 
 
 @pytest.mark.parametrize("server", ("vllm", "sglang"))
@@ -126,11 +127,11 @@ def test_a_truncated_responses_answer_names_the_budget(stub_server, server):
     )
     client = client_for(stub, api="responses", method="logprobs", n_retry_malformed=0)
 
-    with pytest.raises(LabelReadoutError) as error:
+    with pytest.raises(IncompleteAnswerError) as error:
         client.system_one(state=STATE, questions=QUESTIONS)
 
     assert "max_output_tokens" in str(error.value)
-    assert "does not report them" in str(error.value)
+    assert "ran out of output tokens" in str(error.value)
 
 
 def test_an_empty_logprob_array_is_read_as_no_logprobs(stub_server):
@@ -452,12 +453,12 @@ def test_a_long_run_that_hits_the_budget_says_so(stub_server):
         stub, api="chat_completions", method="logprobs", n_retry_malformed=0
     )
 
-    with pytest.raises(LabelReadoutError) as error:
+    with pytest.raises(IncompleteAnswerError) as error:
         client.system_one(state=STATE, questions=QUESTIONS)
 
     message = str(error.value)
-    assert "'Thinking'" in message
-    assert "output tokens" in message
+    assert "ran out of output tokens" in message
+    assert "'length'" in message
 
 
 @pytest.mark.parametrize("server", SERVERS)

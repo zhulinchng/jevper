@@ -8,10 +8,12 @@ from __future__ import annotations
 from .client import AsyncSystemOneClient, Examples, RetryPolicy, SystemOneClient
 from .errors import (
     ClientCapabilityError,
+    IncompleteAnswerError,
     InvalidQuestionError,
     JevperError,
     LabelReadoutError,
     MalformedAnswerError,
+    ModelRefusalError,
     ProviderError,
     UnsupportedMethodError,
 )
@@ -53,6 +55,7 @@ __all__ = [
     "ClientCapabilityError",
     "Example",
     "Examples",
+    "IncompleteAnswerError",
     "InvalidQuestionError",
     "JSONContent",
     "JevperError",
@@ -60,6 +63,7 @@ __all__ = [
     "MalformedAnswerError",
     "Method",
     "MethodSelection",
+    "ModelRefusalError",
     "Noul",
     "NoulAnswer",
     "NoulCriteria",

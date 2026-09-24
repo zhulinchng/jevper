@@ -14,9 +14,12 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from .errors import (
+    IncompleteAnswerError,
     InvalidQuestionError,
     LabelReadoutError,
     MalformedAnswerError,
+    ModelRefusalError,
+    ProviderError,
     UnsupportedMethodError,
     _LogprobsUnavailable,
 )
@@ -264,6 +267,42 @@ def _stop_note(result: CallResult) -> str:
             "reasoning from the answer, and its thinking may be on"
         )
     return note
+
+
+_COMPLETE_STOPS: Mapping[str, frozenset[str]] = {
+    "chat_completions": frozenset({"stop"}),
+    "responses": frozenset(),
+    "messages": frozenset({"end_turn", "stop_sequence"}),
+}
+"""What each surface calls a finished generation. The Responses surface needs no entry: it reports
+``status`` separately and jevper only fills ``stop`` there when the response did not complete."""
+
+
+def answer_failure(result: CallResult) -> ProviderError | None:
+    """The reason this response carries no answer, when the provider gave one.
+
+    A generation that was cut short, filtered, or refused is not a malformed answer to be corrected:
+    reading it would turn a truncated or declined generation into a typed decision, and another
+    attempt spends a call to be cut short or refused the same way. The TypeSafe reference adapter
+    rejects the same three cases for the same reason.
+    """
+    if result.refusal or result.stop == "refusal":
+        message = "the model refused to answer"
+        if result.refusal:
+            message += f": {result.refusal[:200]!r}"
+        if result.stop:
+            message += f" — the provider reported {result.stop!r}"
+        return ModelRefusalError(message)
+    if result.stop in _TRUNCATED_STOPS:
+        return IncompleteAnswerError(
+            f"the provider ran out of output tokens before the answer was complete ({result.stop!r}); "
+            f"raise the limit, for example extra_body={{'max_tokens': 2048}}"
+        )
+    if result.stop is not None and result.stop not in _COMPLETE_STOPS.get(result.surface, frozenset()):
+        return IncompleteAnswerError(
+            f"the provider stopped before the answer was complete ({result.stop!r})"
+        )
+    return None
 
 
 def first_answer_token(result: CallResult, labels: Sequence[str], *, method: Method) -> TokenLogprob:

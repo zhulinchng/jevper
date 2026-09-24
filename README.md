@@ -92,12 +92,15 @@ labelled options, `Score` rates on an ordered scale:
 | Type | Criteria | Answer |
 | --- | --- | --- |
 | `Noul(instructions=..., criteria={"true": ..., "false": ...})` | optional | `{"type": "noul", "noul": 0.93}` |
-| `Choice(instructions=..., criteria={"billing": "...", ...})` | 2–255 keys | `{"type": "choice", "choice": "billing", "probabilities": {...}, "confidence": 0.83}` |
+| `Choice(instructions=..., criteria={"billing": "...", ...})` | 1–255 keys | `{"type": "choice", "choice": "billing", "probabilities": {...}, "confidence": 0.83}` |
 | `Score(instructions=..., criteria=["Calm", "Frustrated", "Very angry"])` | 2–10 levels | `{"type": "score", "score": 1.05, "legend": {...}, "probabilities": {...}, "confidence": 0.92}` |
 
-`Score.score` is the probability-weighted level index (`Σ i·pᵢ`, levels zero-based), as in the Jev API.
-`Choice` takes up to 255 options, the Jev API limit. The two methods that read a label *token* —
-`logprobs` and `grammar` — stop at 26, because the first token of `"AA"` is `"A"`; past 26 options they
+`Score.score` is the probability-weighted level index (`Σ i·pᵢ`, levels zero-based), as in the Jev API —
+read off the distribution rescaled to sum 1, so with `normalize_probabilities=False` the reported
+`probabilities` stay the model's own numbers while the score stays on the `0..N-1` line.
+`Choice` takes up to 255 options, the Jev API limit, and the API documents no minimum.
+The two methods that read a label *token* — `logprobs` and `grammar` — stop at 26, because the first token
+of `"AA"` is `"A"`; past 26 options they
 raise `InvalidQuestionError` pointing at `structured` and `discrete`, which answer in JSON and use
 two-letter labels. The default `method="auto"` never hits that error: it answers a wide `Choice` in JSON.
 
@@ -128,8 +131,13 @@ self-report — and answers in JSON where they do not, remembering the verdict p
 provider table, the exact request bodies, the readout rules and the failure modes.
 
 The same holds for the request fields jevper adds: a server that refuses structured output, the reasoning
-parameters, the Responses `include` list or the cache key gets that field dropped and the call re-asked, so a
-partially implemented server answers instead of failing. `debug["server_limits"]` reports what it refused.
+parameters, the Responses `include` list, the cache key or the Messages `output_config` gets that field
+dropped and the call re-asked, so a partially implemented server answers instead of failing.
+`debug["server_limits"]` reports what it refused.
+
+Hosted providers need no adapter of their own. Gemini speaks the OpenAI API at
+`https://generativelanguage.googleapis.com/v1beta/openai/`, so `OpenAI(base_url=…, api_key=…)` is the whole
+integration; what it lacks in logprobs, `auto` answers around.
 
 ## Reasoning
 
@@ -245,9 +253,12 @@ server:
   `method="grammar"` raise `UnsupportedMethodError` before a request is sent, and `method="auto"` answers in
   JSON without spending a call to find out. `structured` and `discrete` work exactly as they do elsewhere: the
   prompt already asks for one JSON object.
-- **There is no schema field either**, so `structured`/`discrete` put the JSON Schema in the system prompt. The
-  answer's shape is then only as good as the model's instruction-following, where the other surfaces constrain
-  it in the request itself.
+- **Its schema field is Anthropic's own**, `output_config.format`, the counterpart of `response_format`:
+  `structured`/`discrete` send it wherever the server takes it, and a server that refuses it gets it dropped
+  and the call re-asked, reported in `debug["server_limits"]["output_config"]`. The JSON Schema also stays
+  in the system prompt, because a server can take that field and discard it without a word — vLLM's
+  Messages request model drops what it does not model — and on none of the local servers is the answer's
+  shape constrained by the request.
 - **`max_tokens` has no server-side default.** jevper sends `1024` — or `1024` plus the caller's thinking
   budget, because Anthropic requires the budget to be strictly *below* `max_tokens` and would otherwise refuse
   the 1024 its own docs call the floor. `extra_body={"max_tokens": n}` overrides both, and a value that cannot
@@ -280,15 +291,20 @@ unusable `state`, a `model` that is not a non-empty string, a count option that 
 | `ClientCapabilityError` | the client lacks the attribute the chosen surface needs, or the response carried no choices and no explanation of why |
 | `LabelReadoutError` | the first answer token is not a label, or the provider returned no logprobs (or no alternatives, or no logprob for that token). The provider-side cases are not corrective-retried, and `method="auto"` answers them with `structured` |
 | `MalformedAnswerError` | the JSON answer had an unusable shape after corrective retries |
+| `IncompleteAnswerError` | the provider stopped generating before the answer was complete — `finish_reason: "length"`, `stop_reason: "max_tokens"`, a Responses `status: "incomplete"`, or a filtered answer. A `ProviderError` subclass, and terminal: a cut-off generation is not something a corrective retry can fix |
+| `ModelRefusalError` | the model declined to answer and the provider said so. Also a `ProviderError` subclass, and terminal — a refusal is complete, not broken |
 | `ProviderError` | a provider call failed; `.attempts` carries the attempt history and `.status_code` the status the provider reported — including one carried inside a `200` body, which is how OpenRouter reports an upstream failure |
 | `JevperError` | constructor misuse, a bad `state` message, or content that is not JSON-serializable |
 
 Transient failures (HTTP 408/429/500/502/503/504/529, connection and timeout errors — including the `httpx`
 transport errors whose class names carry neither word) are retried per call with
-`RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0)` and exponential
-backoff `min(base_delay · 3ⁿ, max_delay)`. Unreadable answers get one corrective retry
-(`n_retry_malformed`) with the failure appended to the conversation. `ProviderError` propagates after all
-questions have settled, in question insertion order.
+`RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0, respect_retry_after=True)`. The wait is the
+provider's own instruction when it sent one: a `Retry-After` (seconds or an HTTP date) or the millisecond
+`retry-after-ms` replaces the exponential backoff `min(base_delay · 3ⁿ, max_delay)`, which is what the
+TypeSafe clients do — coming back sooner than a rate limit asked only extends it. `max_delay` caps jevper's
+curve, not the server's number; `respect_retry_after=False` goes back to the curve alone. Unreadable answers
+get one corrective retry (`n_retry_malformed`) with the failure appended to the conversation. `ProviderError`
+propagates after all questions have settled, in question insertion order.
 
 ## Tracing
 

@@ -271,7 +271,11 @@ def test_structured_without_normalization_reports_the_models_own_numbers(stub_se
 
     answer = response.answers["anger"]
     assert answer.probabilities == {0: 0.5, 1: 0.1, 2: 0.1}
-    assert answer.score == pytest.approx(0.3, abs=1e-12)
+    # The score is an expected value, so it is read off the distribution rescaled to sum to one —
+    # (0.5·0 + 0.1·1 + 0.1·2) / 0.7 — even though the reported probabilities stay the model's own.
+    # Carrying the raw total into the score would put it at 0.3, below the 0 the model gave no mass
+    # to, and the TypeSafe reference adapter rescales for exactly this.
+    assert answer.score == pytest.approx(3 / 7, abs=1e-12)
     assert response.debug["probability_errors"]["anger"] == pytest.approx(0.3, abs=1e-12)
     # Nothing was rewritten, so there is no pre-normalization copy of the distribution.
     assert "original_probabilities" in response.debug

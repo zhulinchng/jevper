@@ -9,12 +9,17 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any
 
-Script = Callable[[dict[str, Any]], "tuple[int, dict[str, Any]]"]
+Script = Callable[
+    [dict[str, Any]],
+    "tuple[int, Any] | tuple[int, Any, Mapping[str, str]]",
+]
+"""A route's answer. The optional third element is response headers, for the few behaviours a server
+states in a header rather than a body — a rate limit's ``Retry-After`` above all."""
 
 
 def chat_body(
@@ -230,10 +235,15 @@ class StubServer:
                     script = stub.messages
                 else:
                     script = stub.chat
+                answered: tuple[Any, ...]
+                response_headers: Mapping[str, str] = {}
                 if script is None:
-                    status, payload = 404, {"error": {"message": f"no stub script for {self.path}"}}
+                    answered = (404, {"error": {"message": f"no stub script for {self.path}"}})
                 else:
-                    status, payload = script(body)
+                    answered = script(body)
+                status, payload = answered[0], answered[1]
+                if len(answered) > 2:
+                    response_headers = answered[2]
                 if isinstance(payload, str):
                     # A string payload is sent verbatim: real servers answer with plain text
                     # (ollama's ``404 page not found``) or with a bare JSON string (SGLang's
@@ -250,6 +260,8 @@ class StubServer:
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
+                for name, value in response_headers.items():
+                    self.send_header(name, str(value))
                 self.end_headers()
                 self.wfile.write(data)
 

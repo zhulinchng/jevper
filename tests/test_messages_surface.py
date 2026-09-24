@@ -14,6 +14,7 @@ server which refuses the ``thinking`` field costs one request rather than the an
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -29,8 +30,10 @@ from fakes import (
 from jevper import (
     AsyncSystemOneClient,
     Choice,
+    IncompleteAnswerError,
     JevperError,
     MalformedAnswerError,
+    ModelRefusalError,
     ProviderError,
     ReasoningConfig,
     SystemOneClient,
@@ -122,14 +125,59 @@ def test_max_tokens_from_extra_body_wins_and_is_not_sent_twice(stub_server):
     assert "max_tokens" not in body.get("extra_body", {})
 
 
-def test_the_schema_travels_in_the_system_prompt(stub_server):
-    """This API has no schema field, so the answer's shape has to be stated in the prompt itself."""
+def test_the_schema_travels_in_the_native_output_config(stub_server):
+    """Anthropic's schema-constrained output is ``output_config.format``, the counterpart of
+    ``response_format``: the schema is a field of the request, not text in the prompt."""
     stub = stub_server(messages=answer())
     ask(client_for(stub))
 
-    system = body_sent(stub)["system"]
+    body = body_sent(stub)
+    assert body["output_config"]["format"]["type"] == "json_schema"
+    assert '"probabilities"' in json.dumps(body["output_config"]["format"]["schema"])
+    assert "output_config" not in body.get("extra_body", {})
+
+
+def test_a_server_that_refuses_output_config_gets_the_schema_in_the_prompt(stub_server):
+    """The prompt is the fallback, exactly as it was before the field existed — and it costs one request."""
+    calls: list[dict] = []
+
+    def refuse(_: object) -> tuple[int, object]:
+        calls.append({})
+        if len(calls) == 1:
+            return (400, {"error": {"message": "output_config: extra inputs are not permitted"}})
+        return (200, messages_body(text=JSON_ANSWER))
+
+    stub = stub_server(messages=refuse)
+    client = client_for(stub)
+    response = ask(client)
+
+    assert response.answers["q"].choice == "billing"
+    assert len(stub.requests) == 2
+    assert "output_config" in stub.requests[0]
+    assert "output_config" not in stub.requests[1]
+    system = stub.requests[1]["system"]
     assert '"probabilities"' in system
-    assert '"billing"' in system and '"technical"' in system and '"sales"' in system
+    assert response.debug["server_limits"]["output_config"] is False
+
+
+def test_structured_outputs_false_keeps_the_schema_in_the_prompt(stub_server):
+    stub = stub_server(messages=answer())
+    ask(client_for(stub, structured_outputs=False))
+
+    body = body_sent(stub)
+    assert "output_config" not in body
+    assert '"probabilities"' in body["system"]
+
+
+def test_extra_body_travels_without_a_temperature(stub_server):
+    """``extra_body`` is the only way to name a field this builder does not type, so it cannot be
+    conditional on a temperature happening to be sent alongside it."""
+    stub = stub_server(messages=answer())
+    ask(client_for(stub, extra_body={"top_k": 20}))
+
+    body = body_sent(stub)
+    assert "temperature" not in body
+    assert body["top_k"] == 20
 
 
 def test_temperature_and_extra_body_travel(stub_server):
@@ -509,26 +557,27 @@ def test_a_thinking_budget_refused_for_its_value_is_not_dropped(stub_server):
 
 def test_a_truncated_messages_answer_names_the_budget(stub_server):
     """This API reports a spent output budget as ``max_tokens``, not as Chat Completions' ``length``."""
-    stub = stub_server(messages=lambda _: (200, messages_body(text="", stop_reason="max_tokens")))
-    client = client_for(stub, n_retry_malformed=0)
+    stub = stub_server(messages=lambda _: (200, messages_body(text=JSON_ANSWER, stop_reason="max_tokens")))
+    client = client_for(stub, n_retry_malformed=2)
 
-    with pytest.raises(MalformedAnswerError) as error:
+    with pytest.raises(IncompleteAnswerError) as error:
         ask(client)
 
-    assert "ran out of output tokens" in str(error.value)
+    assert "before the answer was complete" in str(error.value)
     assert "max_tokens" in str(error.value)
+    assert len(stub.requests) == 1
 
 
 def test_a_refused_messages_answer_says_the_model_refused(stub_server):
-    """``stop_reason: "refusal"`` is a 200 with no answer, and reads as a parsing bug without this."""
+    """``stop_reason: "refusal"`` is a 200 with no answer, and a retry spends a call to be refused."""
     stub = stub_server(messages=lambda _: (200, messages_body(text="", stop_reason="refusal")))
-    client = client_for(stub, n_retry_malformed=0)
+    client = client_for(stub, n_retry_malformed=2)
 
-    with pytest.raises(MalformedAnswerError) as error:
+    with pytest.raises(ModelRefusalError) as error:
         ask(client)
 
     assert "refused to answer" in str(error.value)
-
+    assert len(stub.requests) == 1
 
 def test_a_messages_discrete_answer_is_read(stub_server):
     """The one-label method needs no distribution, which is the only thing this surface cannot carry."""

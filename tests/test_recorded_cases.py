@@ -28,8 +28,7 @@ from test_provider_surfaces import (
 )
 
 from jevper import (
-    LabelReadoutError,
-    MalformedAnswerError,
+    IncompleteAnswerError,
     ProviderError,
     SystemOneClient,
     reasoning_text,
@@ -170,21 +169,21 @@ def test_a_recorded_refusal_of_tops_without_logprobs_reaches_the_caller(stub_ser
 
 
 @pytest.mark.parametrize("server", ("ollama", "sglang"))
-def test_a_recorded_200_without_logprobs_is_not_a_distribution(stub_server, server):
-    """ollama and SGLang answer the same request 200 and send no logprobs at all.
+def test_a_recorded_200_that_ran_out_of_budget_is_reported_as_truncated(stub_server, server):
+    """ollama and SGLang answer the same request 200, with no logprobs and no text at all.
 
-    The verdict has to be jevper's "this provider does not report them" — the one ``method="auto"``
-    remembers — and it has to name the budget, because the recorded answer never got past thinking.
+    The recorded bodies carry ``finish_reason: "length"``: the servers spent the whole budget thinking
+    and never wrote an answer, so the honest verdict is the spent budget rather than a missing
+    distribution — reading a truncated response as a provider capability would remember a lie.
     """
     stub = served(stub_server, (server, "chat-tops-without-logprobs"))
     client = client_for(stub, api="chat_completions", method="logprobs", retry=NO_RETRIES)
 
-    with pytest.raises(LabelReadoutError) as error:
+    with pytest.raises(IncompleteAnswerError) as error:
         client.system_one(state=STATE, questions=QUESTIONS)
 
-    assert isinstance(error.value, _LogprobsUnavailable)
-    assert "does not report them" in str(error.value)
-    assert "output tokens" in str(error.value)
+    assert "ran out of output tokens" in str(error.value)
+    assert len(stub.paths) == 1
 
 
 # --- the Responses surface: a completed logprob stream, and the cache pair ------------------------
@@ -281,8 +280,8 @@ def test_a_recorded_bad_model_404_names_the_model(stub_server, server):
 def test_a_recorded_bad_model_that_was_served_anyway_is_an_answer(stub_server, server):
     """llama.cpp serves its loaded model and SGLang echoes the id back: a 200, and no model error.
 
-    The recorded body is reasoning-only, so the failure is jevper's own answer-shape error naming the
-    budget — not a provider error, which would blame an id the server never looked at.
+    The recorded body is a truncated reasoning-only answer, so the failure names the spent budget —
+    not a provider error, which would blame an id the server never looked at.
     """
     stub = served(stub_server, (server, "chat-bad-model"))
     client = SystemOneClient(
@@ -294,10 +293,10 @@ def test_a_recorded_bad_model_that_was_served_anyway_is_an_answer(stub_server, s
         n_retry_malformed=0,
     )
 
-    with pytest.raises(MalformedAnswerError) as error:
+    with pytest.raises(IncompleteAnswerError) as error:
         client.system_one(state=STATE, questions=QUESTIONS)
 
-    assert "output tokens" in str(error.value)
+    assert "ran out of output tokens" in str(error.value)
     assert len(stub.paths) == 1
 
 

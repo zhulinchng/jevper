@@ -259,10 +259,10 @@ in the middle of the conversation.
 
 The reasoning parsers matter here too. With thinking left on — vLLM's and SGLang's templates default to it —
 the parser puts the whole generation into a thinking block and returns no text block at all, so there is no
-answer to read and a `structured` call raises `MalformedAnswerError`, whose message now says the response
-carried reasoning only. Disable thinking per call, exactly as on the other surfaces:
-`extra_body={"chat_template_kwargs": {"enable_thinking": False}}` — with that, every scenario on vLLM's
-Messages route answers, on both the non-thinking and the thinking model.
+answer to read and the call raises `IncompleteAnswerError` when the route also reports a spent budget
+(`stop_reason: "max_tokens"`), naming the limit to raise. Disable thinking per call, exactly as on the other
+surfaces: `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` — with that, every scenario on
+vLLM's Messages route answers, on both the non-thinking and the thinking model.
 
 SGLang needs one more decision, on the server side. With `--reasoning-parser qwen3` and a *non-thinking*
 model — whose template has no `enable_thinking` to set, so the parser never sees the closing thinking marker
@@ -271,11 +271,16 @@ no text block. `separate_reasoning: false` does not change that; dropping `--rea
 structured scenarios then answer normally. It is a property of serving a model that never emits the marker
 with a parser that waits for it, not of the client.
 
-One thing the fleet showed that the protocol does not say: no server constrains the *shape* of the answer on
-this route, because there is no schema field in it. jevper therefore puts the JSON Schema in the system
-prompt, and the answer is then only as good as the model's instruction-following. Without that the structured
-system prompt referred to "the provided schema" while nothing provided one, and a 4B model answered
-`{"intent": "A"}` — a real answer in the wrong shape — to every structured question.
+One thing the fleet showed that the protocol did not say then: none of these five servers constrains the
+*shape* of the answer on this route. Anthropic's own API has a field for it — `output_config.format` — and
+jevper sends it wherever the server takes it, but none of these five does, so the JSON Schema also stays in
+the system prompt and the answer is only as good as the model's instruction-following. Without that the
+structured system prompt referred to "the provided schema" while nothing provided one, and a 4B model
+answered `{"intent": "A"}` — a real answer in the wrong shape — to every structured question. A server that
+*refuses* the field costs one request and is reported as `debug["server_limits"]["output_config"]`. vLLM is
+the awkward case: its Messages request model has no `thinking` field either and pydantic drops what it does
+not model, so a field it ignores produces no error and no verdict — which is exactly why the prompt keeps
+the schema on this surface whether the field is sent or not.
 
 ## Sizing a 12 GB card
 
@@ -292,7 +297,7 @@ worked here, one server at a time (they cannot share the card):
 Neither builder sends `max_tokens`, so a chatty model can generate far more than the answer needs. Bound it
 per call with `extra_body={"max_tokens": 512}` — the one field worth setting on a small card. With thinking
 left on, that cap is spent on the reasoning first: ollama answered a 512-token cap with an empty `content` and
-`finish_reason: "length"`, which reaches the caller as a malformed answer whose message names the budget
-(`finish_reason: "length"` on Chat Completions, `status: "incomplete"` with
-`incomplete_details.reason: "max_output_tokens"` on the Responses surface). Disable thinking *and* bound the
-output.
+`finish_reason: "length"`, which reaches the caller as an `IncompleteAnswerError` naming the budget
+(`finish_reason: "length"` on Chat Completions, `stop_reason: "max_tokens"` on the Messages route,
+`status: "incomplete"` with `incomplete_details.reason: "max_output_tokens"` on the Responses surface).
+Disable thinking *and* bound the output.

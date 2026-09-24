@@ -100,3 +100,21 @@ class ProviderError(JevperError):
         super().__init__(message)
         self.attempts: list[dict[str, Any]] = attempts or []
         self.status_code = status_code
+
+
+class IncompleteAnswerError(ProviderError):
+    """The provider stopped generating before the answer was complete.
+
+    A cut-off answer is not a malformed one: reading it would turn a truncated generation into a typed
+    decision, which is the one failure this library exists to prevent. Nothing about a second attempt
+    with the same output budget changes it either, so the error is terminal rather than corrected.
+    """
+
+
+class ModelRefusalError(ProviderError):
+    """The model declined to answer, and the provider reported it as the reason.
+
+    A refusal is complete, not broken: OpenAI returns it beside an empty ``content`` and the Messages
+    API as ``stop_reason: "refusal"``. Retrying it as malformed output spends a call to be refused
+    again, so the reason is reported instead.
+    """
