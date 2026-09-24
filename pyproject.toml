@@ -32,6 +32,9 @@ dependencies = ["pydantic>=2.7"]
 # Messages surface — jevper imports nothing from it, and drives it through the real SDK against the
 # stub server, exactly as it does for openai.
 test = ["pytest>=8", "openai>=1.92", "anthropic>=0.49"]
+# The MLflow integration suite (tests/test_mlflow.py) skips without this. The gateway extra is what puts
+# `mlflow gateway` on the CLI at all, and the langchain extra is what the LangChain-flavour test needs.
+mlflow = ["mlflow[gateway,langchain]>=3.16"]
 
 [project.urls]
 Homepage = "https://github.com/zhulinchng/jevper"
