@@ -43,7 +43,7 @@ response.answers["intent"].probabilities  # a real distribution, read from the s
 | LM Studio | `http://127.0.0.1:1234/v1` | the id `lms ls` prints, e.g. `qwen3-4b-instruct-2507` | nothing does — load a non-thinking model | all three surfaces on one box, as do the other four now; `logprobs` arrives on both OpenAI surfaces; its Responses route accepts `text.format` and ignores it, so structured answers belong on Chat Completions |
 
 All five answer the Anthropic Messages route as well (`/v1/messages`), so `api="auto"` has all three to
-choose from on any of them; ollama, llama.cpp and LM Studio were exercised through it directly.
+choose from on any of them; ollama, llama.cpp, SGLang and LM Studio were exercised through it directly.
 
 `api="auto"` (the default) works against all five: it prefers the Responses surface, and when that route is
 missing — or answers without carrying logprobs through — it re-asks on Chat Completions and remembers the
