@@ -18,7 +18,7 @@ including a self-hosted llama.cpp server.
 from openai import OpenAI
 from jevper import Choice, SystemOneClient
 
-client = SystemOneClient(OpenAI(), model="gpt-5.6-terra", method="logprobs")
+client = SystemOneClient(OpenAI(), model="gpt-5.6-terra")
 
 response = client.system_one(
     state="I was charged twice for the same subscription this month.",
@@ -39,6 +39,12 @@ answer.choice        # "billing"
 answer.probabilities # {"billing": 0.88, "technical": 0.08, "sales": 0.03}
 answer.confidence    # 0.83
 ```
+
+`method` defaults to `auto`: it asks for logprobs where the provider has them and answers in JSON where it
+does not, remembering the verdict per model and surface. `gpt-5.6-terra` is a reasoning model and returns
+none, so the probabilities above arrive as JSON. Point `method="logprobs"` at a provider that does return
+them — a local ollama, llama.cpp or vLLM server, or a non-reasoning OpenAI model — to read the model's
+real distribution instead of its self-report.
 
 ## Install
 
@@ -105,19 +111,20 @@ methods does not change your types; only the label alphabet differs (`logprobs` 
 single-letter labels, so they cap at 26 options).
 
 | Method | Request | Readout | Needs |
-| --- | --- | --- | --- |
 | `auto` (default) | `logprobs`, or `structured` where the provider cannot return logprobs | whichever method it resolved to | a provider that returns logprobs, or JSON-schema structured output |
-| `logprobs` | `logprobs=true, top_logprobs=20` | softmax over the labels' logprobs of the first answer token | a provider that returns chat logprobs (or the Responses surface with `include` logprobs) |
+| `logprobs` | `logprobs=true, top_logprobs=20` | softmax over the labels' logprobs of the first answer token | a provider that returns chat logprobs, or the Responses surface with `include` logprobs. A surface that refuses the carrier hands the readout to the other OpenAI surface, method intact; with nowhere left to go, the refusal is reported |
 | `grammar` | the same plus a GBNF `grammar` in `extra_body` | same as `logprobs` | a Chat Completions server that accepts `grammar` (llama.cpp and friends) |
 | `structured` | strict JSON schema, model returns a probability per option | the model's own numbers, rescaled to sum 1 when off by more than `1e-6` | JSON-schema structured output |
 | `discrete` | strict JSON schema, model returns one option | one-hot distribution | JSON-schema structured output |
 
-`auto` is the default because logprobs are not universal: OpenAI's reasoning models reject them
-(`logprobs are not supported with reasoning models.`), Anthropic and Gemini's OpenAI-compatibility endpoint
-never had them, and a model that returns a logprob with no alternatives gives you no distribution at all.
-`auto` reads the logprobs where they exist — they are one short call and the model's real distribution
-rather than a self-report — and answers in JSON where they do not, remembering the verdict per model and
-surface. See [docs/methods.md](https://github.com/zhulinchng/jevper/blob/main/docs/methods.md#auto) for the
+`auto` is the default because logprobs are not universal: OpenAI's reasoning models — the GPT-5.6 family
+included — do not offer them, Anthropic and Gemini's OpenAI-compatibility endpoints never had them, and a
+model that returns a logprob with no alternatives gives you no distribution at all. A gateway in front of
+one says so in as many words (`logprobs are not supported with reasoning models.`), and so does a
+Responses endpoint that refuses the `include` list the carrier travels in.
+`auto` reads the logprobs where they exist — one short call, and the model's real distribution rather than a
+self-report — and answers in JSON where they do not, remembering the verdict per model and surface. See
+[docs/methods.md](https://github.com/zhulinchng/jevper/blob/main/docs/methods.md#auto) for the
 provider table, the exact request bodies, the readout rules and the failure modes.
 
 The same holds for the request fields jevper adds: a server that refuses structured output, the reasoning
@@ -180,7 +187,11 @@ response.debug                 # per-attempt requests/responses, retry reasons, 
 `response.model_dump_json()` serializes to the Jev answer shape — the answer field names and JSON keys match
 `POST /v1/systemone`. Token counts are `None` when any constituent call omitted them; `n_calls` counts the
 provider calls that returned a result, including analysis passes and corrective retries, while `n_retries`
-counts transient-failure retries only. A failed attempt appears in `debug["llm_attempts"]` but not in `usage`. See [docs/api.md](https://github.com/zhulinchng/jevper/blob/main/docs/api.md) for the full reference.
+counts transient-failure retries only. A failed attempt appears in `debug["llm_attempts"]` but not in `usage`.
+Confidence is a share in `[0, 1]` and the call counters are counts, because jevper computes them; the
+probabilities beside them are the model's own numbers, passed through verbatim when
+`normalize_probabilities=False`. See [docs/api.md](https://github.com/zhulinchng/jevper/blob/main/docs/api.md)
+for the full reference.
 
 ## Prompt caching
 
@@ -227,7 +238,7 @@ client = SystemOneClient(Anthropic(base_url="http://127.0.0.1:1234"), model="qwe
 client.system_one(state=record, questions=rubric, api="messages", method="structured")
 ```
 
-Four things differ from the OpenAI surfaces, and all four come from the protocol rather than from any
+Five things differ from the OpenAI surfaces, and all five come from the protocol rather than from any
 server:
 
 - **No logprobs exist in it.** Not withheld by some servers — absent from the API. `method="logprobs"` and
@@ -239,7 +250,12 @@ server:
   it in the request itself.
 - **`max_tokens` has no server-side default.** jevper sends `1024` — or `1024` plus the caller's thinking
   budget, because Anthropic requires the budget to be strictly *below* `max_tokens` and would otherwise refuse
-  the 1024 its own docs call the floor. `extra_body={"max_tokens": n}` overrides both.
+  the 1024 its own docs call the floor. `extra_body={"max_tokens": n}` overrides both, and a value that cannot
+  hold the budget you asked for raises `JevperError` locally, naming both numbers, rather than being sent to
+  earn the 400.
+- **`temperature` is not a typed parameter of the current SDK** and is left out of a request that enables
+  thinking, which the API refuses alongside a non-default one. On the other requests it travels in the request
+  body, so a local server still reads it.
 - **Thinking is asked for with a budget, not an effort name.** `ReasoningConfig(budget_tokens=2048)` sends
   `thinking={"type": "enabled", "budget_tokens": 2048}`: a budget is the only reason to ask for this surface's
   own thinking, so it selects it even under `mode="auto"`. A server that refuses the field gets it dropped and
@@ -254,7 +270,8 @@ which version: [docs/local-servers.md](https://github.com/zhulinchng/jevper/blob
 ## Failures
 
 Local problems fail before any request is sent: an invalid question, an empty `questions` mapping, an
-unusable `state`, or `grammar` on a surface that cannot carry a grammar.
+unusable `state`, a `model` that is not a non-empty string, a count option that is not an integer, or
+`grammar` on a surface that cannot carry a grammar.
 
 | Error | Raised when |
 | --- | --- |
@@ -272,6 +289,15 @@ transport errors whose class names carry neither word) are retried per call with
 backoff `min(base_delay · 3ⁿ, max_delay)`. Unreadable answers get one corrective retry
 (`n_retry_malformed`) with the failure appended to the conversation. `ProviderError` propagates after all
 questions have settled, in question insertion order.
+
+## Tracing
+
+Every provider call goes through the SDK client you hand in, so `mlflow.openai.autolog()`,
+`mlflow.anthropic.autolog()` or OpenTelemetry instrumentation sees them without extra wiring — including the
+attempts made before settling on a request shape the provider accepts. The per-question worker threads run a
+copy of your context, so a span you open around `system_one` parents every one of them: one trace per call,
+one child span per question, however many questions it carried. Span names, attributes and the hosting
+recipes: [docs/mlflow.md](https://github.com/zhulinchng/jevper/blob/main/docs/mlflow.md).
 
 ## Verification
 
@@ -300,7 +326,7 @@ uv pip install -e '.[test,mlflow]' && pytest -q tests/test_mlflow.py
 
 - [docs/api.md](https://github.com/zhulinchng/jevper/blob/main/docs/api.md) — constructor and `system_one` parameters, answer/usage/debug shapes, errors
 - [docs/methods.md](https://github.com/zhulinchng/jevper/blob/main/docs/methods.md) — the four methods, request bodies, readout rules, surface selection
-- [docs/local-servers.md](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md) — ollama, llama.cpp, vLLM and SGLang: what to pass, turning thinking off, what fits a small GPU
+- [docs/local-servers.md](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md) — ollama, llama.cpp, vLLM, SGLang and LM Studio: what to pass, turning thinking off, what fits a small GPU, and what each one ignores or refuses
 - [docs/reasoning.md](https://github.com/zhulinchng/jevper/blob/main/docs/reasoning.md) — native vs two-step reasoning, traces, encrypted content
 - [docs/few-shot.md](https://github.com/zhulinchng/jevper/blob/main/docs/few-shot.md) — example levels, precedence, rendering, structured examples
 - [docs/internals.md](https://github.com/zhulinchng/jevper/blob/main/docs/internals.md) — module map, call flow, concurrency, retries, testing
