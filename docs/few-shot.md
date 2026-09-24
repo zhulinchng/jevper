@@ -49,13 +49,22 @@ For each example, in order:
 
 | Turn | Content |
 | --- | --- |
-| `user` | `render_question_turn(example.state, question, labels)` — the example state's message contents joined with `"\n\n"`, then the question block |
+| `user` | `render_question_turn(example.state, question, labels)` — the question block, then the example state's message contents joined with `"\n\n"` |
 | `assistant` | the expected answer (see below) |
 
 The full message list for a call is therefore
-`[system] + state turns + example turns + [question block]`: the state is never repeated in the final turn,
-and a caller-supplied `system` message inside a chat-list `state` stays where it was, after jevper's own system
-prompt.
+`[system] + example turns + [question block] + state turns`. The state comes **last** because it is the part
+that changes from call to call: a provider reuses a cached prefix only up to the first token that differs, so
+putting the state second — where it used to be — made every call about a new state reprocess the whole prompt.
+Measured against ollama, llama.cpp, vLLM and SGLang, moving it to the end takes the reused prefix of a
+2400-token prompt from about 40 tokens to 528–1010 (see
+[local-servers.md](local-servers.md#prompt-caching)). The state is never repeated.
+
+A state that carries its own `system` or `developer` turn has that content folded into jevper's system
+prompt, in the order given, and the rest of the state goes last as usual. No server here accepts a `system`
+turn that is not first — llama.cpp's template raises `System message must be at the beginning.` and vLLM and
+SGLang answer `400` with the same words — and jevper's own prompt always leads, so the alternative would be to
+drop the caller's instruction or fail the call.
 
 Expected answers per method:
 

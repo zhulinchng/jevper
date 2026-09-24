@@ -6,6 +6,7 @@ rendered in the same format as the answer the method expects.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -31,6 +32,10 @@ ANSWER_CUE = "Now reply with the label only."
 STRUCTURED_ANSWER_CUE = "Now reply with the JSON object only."
 
 _STATE_ROLES = ("system", "user", "assistant", "developer")
+_INSTRUCTION_ROLES = ("system", "developer")
+"""State turns with these roles cannot stay where the caller put them: a system message has to lead the
+conversation. llama.cpp's Qwen template raises ``System message must be at the beginning.`` for one that
+does not, and vLLM and SGLang answer ``400`` with the same words."""
 
 
 def render_content(value: JSONContent) -> str:
@@ -102,9 +107,13 @@ def render_question_block(question: Question, labels: Sequence[str]) -> str:
 
 
 def render_question_turn(state: Any, question: Question, labels: Sequence[str]) -> str:
-    """Collapse a state into a single user turn: state message contents joined with the question block."""
-    contents = [message["content"] for message in render_state_messages(state)]
-    contents.append(render_question_block(question, labels))
+    """Collapse a state into a single user turn: the question block, then the state's contents.
+
+    The question comes first so a demonstration has the same shape as the real call, where the state
+    turns follow the question turn.
+    """
+    contents = [render_question_block(question, labels)]
+    contents.extend(message["content"] for message in render_state_messages(state))
     return "\n\n".join(contents)
 
 
@@ -246,7 +255,7 @@ def _lookup(probabilities: Mapping[Any, float], key: Any) -> float:
 def render_examples(
     examples: Iterable[Example], question: Question, labels: Sequence[str], *, method: Method
 ) -> list[dict[str, str]]:
-    """One user turn (example state + question block) and one assistant turn (expected answer) per example."""
+    """One user turn (question block + example state) and one assistant turn (expected answer) per example."""
     turns: list[dict[str, str]] = []
     keys = label_to_key(question, labels) if method in ("structured", "discrete") else {}
     for index, example in enumerate(examples):
@@ -283,6 +292,30 @@ def system_prompt(method: Method) -> str:
     return STRUCTURED_SYSTEM_PROMPT if method in ("structured", "discrete") else SYSTEM_PROMPT
 
 
+CACHE_KEY_PREFIX = "jevper-"
+CACHE_KEY_DIGEST_CHARS = 32
+"""128 bits of SHA-256. A key is a routing label, not a secret: a collision would only put two prompts
+that cannot both match one prefix into the same cache bucket."""
+
+
+def derived_cache_key(model: str, parts: PromptParts) -> str:
+    """A stable cache key for the prefix every call about this question shares.
+
+    A provider uses ``prompt_cache_key`` to route requests that can reuse one another's cache to the
+    same machine, so the key must be identical across the calls that share a prefix and different
+    across the calls that do not. What changes between calls is the state — and, between the two
+    reasoning passes, the system prompt — so neither is hashed: the examples and the question block
+    are, because another rubric, another demonstration set or another method's answer shape is another
+    prefix. Two-step reasoning therefore keys both passes alike, and every state classified with one
+    question set keys alike.
+    """
+    digest = hashlib.sha256()
+    for chunk in (model, *(part for turn in parts.example_turns for part in turn.values()), parts.question_block):
+        digest.update(chunk.encode("utf-8"))
+        digest.update(b"\x1f")
+    return CACHE_KEY_PREFIX + digest.hexdigest()[:CACHE_KEY_DIGEST_CHARS]
+
+
 def answer_cue(method: Method) -> str:
     """The two-step cue for the answer pass, phrased for the shape that pass has to produce."""
     return STRUCTURED_ANSWER_CUE if method in ("structured", "discrete") else ANSWER_CUE
@@ -304,17 +337,43 @@ def build_parts(
     )
 
 
-def assemble(parts: PromptParts, *, system: str) -> list[dict[str, str]]:
-    """The message list for one pass: system prompt, state turns, few-shot turns, question block.
+def hoist_instructions(
+    system: str, state: Sequence[dict[str, str]]
+) -> tuple[str, list[dict[str, str]]]:
+    """Move a state's own ``system``/``developer`` turns into the leading system message.
 
-    The caller's state turns are preserved as-is and the question block is the final user turn, so the
-    state is never repeated. Each pass gets its own message dicts; the rendered strings are shared.
+    jevper's own system prompt always leads, so a caller's system turn would land second — and every
+    server here refuses that: llama.cpp's template raises ``System message must be at the beginning.``
+    and vLLM and SGLang answer the same as a 400. Their content is instructions, so it joins the system
+    prompt rather than being dropped or rejected, in the order it was given, and the rest of the state
+    keeps the order the caller wrote.
     """
+    instructions = [turn["content"] for turn in state if turn["role"] in _INSTRUCTION_ROLES]
+    if not instructions:
+        return system, list(state)
+    rest = [turn for turn in state if turn["role"] not in _INSTRUCTION_ROLES]
+    return "\n\n".join([system, *instructions]), rest
+
+
+def assemble(parts: PromptParts, *, system: str) -> list[dict[str, str]]:
+    """The message list for one pass: system prompt, few-shot turns, question block, state turns.
+
+    The state comes last because it is the part that changes from call to call. A provider reuses a
+    cached prefix up to the first token that differs, so with the state second — where it used to be —
+    every call about a new state reprocessed the whole prompt; measured against ollama, llama.cpp, vLLM
+    and SGLang, moving it to the end takes the reused prefix from about 40 tokens to 528–1010 of a
+    2400-token prompt. The question block is a turn of its own rather than part of the state turn so
+    that a chat-list state stays verbatim, roles included — except for its instruction turns, which
+    ``hoist_instructions`` folds into the system prompt because no server here accepts a late one.
+
+    The state is never repeated. Each pass gets its own message dicts; the rendered strings are shared.
+    """
+    system, state = hoist_instructions(system, parts.state_messages)
     return [
         {"role": "system", "content": system},
-        *(dict(message) for message in parts.state_messages),
         *(dict(message) for message in parts.example_turns),
         {"role": "user", "content": parts.question_block},
+        *(dict(message) for message in state),
     ]
 
 

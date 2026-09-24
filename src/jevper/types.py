@@ -188,6 +188,10 @@ class Usage(BaseModel):
     input_tokens: int | None = None
     output_tokens: int | None = None
     reasoning_tokens: int | None = None
+    cached_tokens: int | None = None
+    """Prompt tokens the provider read from its prompt cache. Reported by OpenAI, OpenRouter, vLLM,
+    SGLang, llama.cpp and ollama; ``None`` when the provider said nothing, which is not the same as a
+    reported ``0`` — that is a provider whose prefix cache is cold or off."""
     n_calls: int = 0
     n_retries: int = 0
     latency: float = 0.0

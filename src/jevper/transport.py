@@ -29,6 +29,8 @@ class CallSpec:
     grammar: str | None = None
     reasoning: ReasoningConfig | None = None
     temperature: float | None = None
+    prompt_cache_key: str | None = None
+    """The provider's cache-routing key for this request, or ``None`` to send no key at all."""
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,9 @@ class CallResult:
     input_tokens: int | None = None
     output_tokens: int | None = None
     reasoning_tokens: int | None = None
+    cached_tokens: int | None = None
+    """Prompt tokens the provider read from its cache, when it says. ``None`` is "not reported":
+    a server that has prefix caching off reports a plain zero, and that is a different fact."""
     stop: str | None = None
     """Why generation ended: ``finish_reason`` on Chat Completions, the incompleteness reason on the
     Responses surface. A reasoning model can spend the whole budget thinking — vLLM and SGLang then
@@ -73,6 +78,8 @@ class Limits:
     """``schema`` sends ``json_schema``, ``object`` sends ``json_object``, ``none`` sends nothing."""
     reasoning: bool = True
     include: bool = True
+    cache_key: bool = True
+    """Whether the server accepts ``prompt_cache_key``. Like the others, a field jevper may drop."""
 
 
 def build_chat_kwargs(
@@ -99,6 +106,8 @@ def build_chat_kwargs(
             kwargs["response_format"] = {"type": "json_object"}
     if spec.reasoning is not None and spec.reasoning.effort is not None and limits.reasoning:
         kwargs["reasoning_effort"] = spec.reasoning.effort
+    if spec.prompt_cache_key is not None and limits.cache_key:
+        kwargs["prompt_cache_key"] = spec.prompt_cache_key
     if spec.temperature is not None:
         kwargs["temperature"] = spec.temperature
     body = dict(extra_body or {})
@@ -155,6 +164,8 @@ def build_responses_kwargs(
             }
         elif limits.structured != "none":
             kwargs["text"] = {"format": {"type": "json_object"}}
+    if spec.prompt_cache_key is not None and limits.cache_key:
+        kwargs["prompt_cache_key"] = spec.prompt_cache_key
     if spec.temperature is not None:
         kwargs["temperature"] = spec.temperature
     if extra_body:
@@ -297,6 +308,7 @@ def _chat_result(response: Any, request: dict[str, Any]) -> CallResult:
     message = _get(choice, "message")
     usage = _get(response, "usage")
     details = _get(usage, "completion_tokens_details")
+    prompt_details = _get(usage, "prompt_tokens_details")
     return CallResult(
         text=_content_text(_get(message, "content")),
         token_logprobs=_token_logprobs(_get(choice, "logprobs")),
@@ -307,6 +319,7 @@ def _chat_result(response: Any, request: dict[str, Any]) -> CallResult:
         input_tokens=_get(usage, "prompt_tokens"),
         output_tokens=_get(usage, "completion_tokens"),
         reasoning_tokens=_get(details, "reasoning_tokens"),
+        cached_tokens=_get(prompt_details, "cached_tokens"),
         stop=_get(choice, "finish_reason"),
     )
 
@@ -349,6 +362,7 @@ def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
             raise failure
     usage = _get(response, "usage")
     details = _get(usage, "output_tokens_details")
+    input_details = _get(usage, "input_tokens_details")
     # A Responses call that hit the output budget says so here rather than in a finish_reason.
     stop = None
     if _get(response, "status") == "incomplete":
@@ -363,6 +377,7 @@ def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
         input_tokens=_get(usage, "input_tokens"),
         output_tokens=_get(usage, "output_tokens"),
         reasoning_tokens=_get(details, "reasoning_tokens"),
+        cached_tokens=_get(input_details, "cached_tokens"),
         stop=stop,
     )
 

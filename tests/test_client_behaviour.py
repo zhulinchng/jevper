@@ -159,7 +159,7 @@ def test_one_call_per_question_and_answers_keyed_in_order(stub_server):
     assert response.answers["intent"].choice == "billing"
     assert response.answers["duplicate"].noul == pytest.approx(0.912934228, abs=1e-9)
     assert response.answers["anger"].probabilities[0] == pytest.approx(0.884873983, abs=1e-9)
-    question_blocks = [request["messages"][-1]["content"] for request in requests]
+    question_blocks = [request["messages"][-2]["content"] for request in requests]
     assert any("A: billing" in block for block in question_blocks)
     assert any("A: Yes" in block for block in question_blocks)
     assert any("A: 0 — Calm" in block for block in question_blocks)
@@ -171,7 +171,7 @@ def test_one_call_per_question_and_answers_keyed_in_order(stub_server):
 
 def test_one_failing_question_raises_in_insertion_order_after_all_settle(stub_server):
     def script(body):
-        question = body["messages"][-1]["content"]
+        question = body["messages"][-2]["content"]
         if "A: billing" in question:
             return 400, {"error": {"message": "boom", "type": "invalid_request_error"}}
         return 200, chat_body(content="A", logprobs=CHOICE_LOGS)
@@ -188,14 +188,13 @@ def test_one_failing_question_raises_in_insertion_order_after_all_settle(stub_se
     assert len(stub.bodies("/chat/completions")) == 2
 
 
-def test_state_chat_messages_are_preserved_and_question_block_is_last(stub_server):
+def test_state_chat_messages_are_preserved_after_the_question_block(stub_server):
     stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
     client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
 
     client.system_one(
         state={
             "messages": [
-                {"role": "system", "content": "You are a support triage assistant."},
                 {"role": "user", "content": "I was charged twice."},
                 {"role": "assistant", "content": "Let me look into that."},
             ]
@@ -204,10 +203,11 @@ def test_state_chat_messages_are_preserved_and_question_block_is_last(stub_serve
     )
 
     messages = stub.bodies("/chat/completions")[0]["messages"]
-    assert [message["role"] for message in messages] == ["system", "system", "user", "assistant", "user"]
+    assert [message["role"] for message in messages] == ["system", "user", "user", "assistant"]
     assert messages[0]["content"].startswith("You are a precise classification engine")
-    assert messages[1]["content"] == "You are a support triage assistant."
-    assert messages[-1]["content"].startswith("Options:")
+    assert messages[1]["content"].startswith("Options:")
+    assert messages[2]["content"] == "I was charged twice."
+    assert messages[-1]["content"] == "Let me look into that."
 
 
 def test_json_state_is_pretty_printed_into_one_turn(stub_server):
@@ -221,9 +221,10 @@ def test_json_state_is_pretty_printed_into_one_turn(stub_server):
 
     messages = stub.bodies("/chat/completions")[0]["messages"]
     assert len(messages) == 3
-    assert messages[1]["role"] == "user"
-    assert '"order_id": 42' in messages[1]["content"]
-    assert '"qty": 2' in messages[1]["content"]
+    assert messages[1]["content"].startswith("Options:")
+    assert messages[2]["role"] == "user"
+    assert '"order_id": 42' in messages[2]["content"]
+    assert '"qty": 2' in messages[2]["content"]
 
 
 def test_noul_criteria_are_rendered_as_yes_no_means_lines(stub_server):
@@ -240,7 +241,7 @@ def test_noul_criteria_are_rendered_as_yes_no_means_lines(stub_server):
         },
     )
 
-    block = stub.bodies("/chat/completions")[0]["messages"][-1]["content"]
+    block = stub.bodies("/chat/completions")[0]["messages"][-2]["content"]
     assert "Question:\nIs this message a complaint?" in block
     assert "A: Yes" in block and "B: No" in block
     assert "Yes means: the customer is unhappy" in block
@@ -407,7 +408,7 @@ def test_failed_attempt_records_the_provider_request(stub_server):
     request = error.value.attempts[0]["request"]
     assert request["model"] == "stub"
     assert request["response_format"]["json_schema"]["name"] == "jevper_choice"
-    assert request["messages"][-1]["content"].startswith("Options:")
+    assert request["messages"][-2]["content"].startswith("Options:")
 
 
 def test_non_string_instructions_and_criteria_render_as_json(stub_server):
@@ -424,12 +425,12 @@ def test_non_string_instructions_and_criteria_render_as_json(stub_server):
 
     bodies = stub.bodies("/chat/completions")
     choice_block = next(
-        body["messages"][-1]["content"] for body in bodies if "A: low" in body["messages"][-1]["content"]
+        body["messages"][-2]["content"] for body in bodies if "A: low" in body["messages"][-2]["content"]
     )
     assert "Question:\n42" in choice_block
     assert "A: low — 1" in choice_block and "B: high — 5" in choice_block
     score_block = next(
-        body["messages"][-1]["content"] for body in bodies if "A: 0" in body["messages"][-1]["content"]
+        body["messages"][-2]["content"] for body in bodies if "A: 0" in body["messages"][-2]["content"]
     )
     assert "A: 0 — 1" in score_block and "C: 2 — 3" in score_block
     assert response.scores["anger"].legend == {0: 1, 1: 2, 2: 3}
@@ -964,3 +965,61 @@ def test_the_async_client_drops_a_refused_field_too(stub_server):
         body["response_format"]["type"] for body in stub.bodies("/chat/completions")
     ] == ["json_schema", "json_object"]
     assert response.debug["server_limits"]["structured"] == "object"
+
+
+@pytest.mark.parametrize("role", ["system", "developer"])
+def test_a_state_instruction_turn_is_hoisted_into_the_system_prompt(stub_server, role):
+    """No server here accepts a system turn that is not first, and jevper's own prompt is first.
+
+    llama.cpp's template raises "System message must be at the beginning." for one that is not, and vLLM
+    and SGLang answer 400 with the same words. The caller's instruction joins the system prompt — its
+    content is an instruction, and dropping it would change the question — and the rest of the state
+    still goes last, where it can be cached.
+    """
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    client.system_one(
+        state=[
+            {"role": role, "content": "You are a support triage assistant."},
+            {"role": "user", "content": "I was charged twice."},
+        ],
+        questions={"q": Choice(criteria={"billing": None, "sales": None})},
+    )
+
+    messages = stub.bodies("/chat/completions")[0]["messages"]
+    assert [message["role"] for message in messages] == ["system", "user", "user"]
+    assert messages[0]["content"].startswith("You are a precise classification engine")
+    assert messages[0]["content"].endswith("You are a support triage assistant.")
+    assert messages[1]["content"].startswith("Options:")
+    assert messages[2]["content"] == "I was charged twice."
+
+
+def test_a_state_without_an_instruction_turn_goes_last(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    client.system_one(
+        state=[{"role": "user", "content": "I was charged twice."}, {"role": "assistant", "content": "Looking."}],
+        questions={"q": Choice(criteria={"billing": None, "sales": None})},
+    )
+
+    messages = stub.bodies("/chat/completions")[0]["messages"]
+    assert [message["role"] for message in messages] == ["system", "user", "user", "assistant"]
+    assert messages[1]["content"].startswith("Options:")
+
+
+def test_a_state_of_only_instructions_leaves_no_state_turn(stub_server):
+    """The whole state was instructions: they join the system prompt and nothing is left to place."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    client.system_one(
+        state=[{"role": "system", "content": "Answer as a support triage assistant."}],
+        questions={"q": Choice(criteria={"billing": None, "sales": None})},
+    )
+
+    messages = stub.bodies("/chat/completions")[0]["messages"]
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert messages[0]["content"].endswith("Answer as a support triage assistant.")
+    assert messages[1]["content"].startswith("Options:")

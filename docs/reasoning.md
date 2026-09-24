@@ -58,7 +58,7 @@ turn.
 sequenceDiagram
     participant C as jevper
     participant P as provider
-    C->>P: analysis system prompt, state, few-shot, question block
+    C->>P: analysis system prompt, few-shot, question block, state
     P-->>C: free-form considerations
     C->>P: answer messages + assistant(trace) + the answer cue
     P-->>C: label or JSON answer

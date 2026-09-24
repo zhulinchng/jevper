@@ -268,7 +268,7 @@ def test_discrete_labels_grow_to_two_letters_beyond_26_options(stub_server):
     enum = sent["response_format"]["json_schema"]["schema"]["properties"]["choice"]["enum"]
     assert (enum[:3], enum[25:27], enum[-1]) == (["AA", "AB", "AC"], ["AZ", "BA"], "BD")
     assert len(enum) == 30
-    assert "BD: option_29" in sent["messages"][-1]["content"]
+    assert "BD: option_29" in sent["messages"][-2]["content"]
 
 
 def test_discrete_accepts_equivalent_score_index_forms(stub_server):

@@ -53,6 +53,130 @@
    "body": {
     "choices": [
      {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "content": "D",
+       "role": "assistant"
+      }
+     }
+    ],
+    "model": "qwen3.5:9b",
+    "usage": {
+     "completion_tokens": 2,
+     "prompt_tokens": 1989,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "total_tokens": 1991
+    }
+   },
+   "method": "POST",
+   "name": "chat-cache-key",
+   "path": "/v1/chat/completions",
+   "request": {
+    "max_tokens": 4,
+    "messages": [
+     {
+      "content": "You are a precise classification engine. Answer the question by selecting exactly one of the provided labels. Reply with the label only: no punctuation, no explanation, no other text.",
+      "role": "system"
+     },
+     {
+      "content": "The quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. The central region renegotiated its contract in March and asked for a usage breakdown by project, which the finance team produced by hand. \n\nRecord S1: S1-0 S1-1 S1-2 S1-3 S1-4 S1-5 S1-6 S1-7 S1-8 S1-9 S1-10 S1-11 S1-12 S1-13 S1-14 S1-15 S1-16 S1-17 S1-18 S1-19 S1-20 S1-21 S1-22 S1-23 S1-24 S1-25 S1-26 S1-27 S1-28 S1-29 S1-30 S1-31 S1-32 S1-33 S1-34 S1-35 S1-36 S1-37 S1-38 S1-39 S1-40 S1-41 S1-42 S1-43 S1-44 S1-45 S1-46 S1-47 S1-48 S1-49 S1-50 S1-51 S1-52 S1-53 S1-54 S1-55 S1-56 S1-57 S1-58 S1-59 S1-60 S1-61 S1-62 S1-63 S1-64 S1-65 S1-66 S1-67 S1-68 S1-69 S1-70 S1-71 S1-72 S1-73 S1-74 S1-75 S1-76 S1-77 S1-78 S1-79 S1-80 S1-81 S1-82 S1-83 S1-84 S1-85 S1-86 S1-87 S1-88 S1-89 S1-90 S1-91 S1-92 S1-93 S1-94 S1-95 S1-96 S1-97 S1-98 S1-99 S1-100 S1-101 S1-102 S1-103 S1-104 S1-105 S1-106 S1-107 S1-108 S1-109 S1-110 S1-111 S1-112 S1-113 S1-114 S1-115 S1-116 S1-117 S1-118 S1-119 S1-120 S1-121 S1-122 S1-123 S1-124 S1-125 S1-126 S1-127 S1-128 S1-129 S1-130 S1-131 S1-132 S1-133 S1-134 S1-135 S1-136 S1-137 S1-138 S1-139 S1-140 S1-141 S1-142 S1-143 S1-144 S1-145 S1-146 S1-147 S1-148 S1-149 S1-150 S1-151 S1-152 S1-153 S1-154 S1-155 S1-156 S1-157 S1-158 S1-159 S1-160 S1-161 S1-162 S1-163 S1-164 S1-165 S1-166 S1-167 S1-168 S1-169 S1-170 S1-171 S1-172 S1-173 S1-174 S1-175 S1-176 S1-177 S1-178 S1-179 S1-180 S1-181 S1-182 S1-183 S1-184 S1-185 S1-186 S1-187 S1-188 S1-189 S1-190 S1-191 S1-192 S1-193 S1-194 S1-195 S1-196 S1-197 S1-198 S1-199",
+      "role": "user"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. The central region renegotiated its contract in March and asked for a usage breakdown by project, which the finance team produced by hand. \n\nRecord EXA: EXA-0 EXA-1 EXA-2 EXA-3 EXA-4 EXA-5 EXA-6 EXA-7 EXA-8 EXA-9 EXA-10 EXA-11 EXA-12 EXA-13 EXA-14 EXA-15 EXA-16 EXA-17 EXA-18 EXA-19 EXA-20 EXA-21 EXA-22 EXA-23 EXA-24 EXA-25 EXA-26 EXA-27 EXA-28 EXA-29 EXA-30 EXA-31 EXA-32 EXA-33 EXA-34 EXA-35 EXA-36 EXA-37 EXA-38 EXA-39",
+      "role": "user"
+     },
+     {
+      "content": "A",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. The central region renegotiated its contract in March and asked for a usage breakdown by project, which the finance team produced by hand. \n\nRecord EXB: EXB-0 EXB-1 EXB-2 EXB-3 EXB-4 EXB-5 EXB-6 EXB-7 EXB-8 EXB-9 EXB-10 EXB-11 EXB-12 EXB-13 EXB-14 EXB-15 EXB-16 EXB-17 EXB-18 EXB-19 EXB-20 EXB-21 EXB-22 EXB-23 EXB-24 EXB-25 EXB-26 EXB-27 EXB-28 EXB-29 EXB-30 EXB-31 EXB-32 EXB-33 EXB-34 EXB-35 EXB-36 EXB-37 EXB-38 EXB-39",
+      "role": "user"
+     },
+     {
+      "content": "B",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3.5:9b",
+    "reasoning_effort": "none"
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "content": "C",
+       "role": "assistant"
+      }
+     }
+    ],
+    "model": "qwen3.5:9b",
+    "usage": {
+     "completion_tokens": 2,
+     "prompt_tokens": 1989,
+     "prompt_tokens_details": {
+      "cached_tokens": 1985
+     },
+     "total_tokens": 1991
+    }
+   },
+   "method": "POST",
+   "name": "chat-cache-warm",
+   "path": "/v1/chat/completions",
+   "request": {
+    "max_tokens": 4,
+    "messages": [
+     {
+      "content": "You are a precise classification engine. Answer the question by selecting exactly one of the provided labels. Reply with the label only: no punctuation, no explanation, no other text.",
+      "role": "system"
+     },
+     {
+      "content": "The quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. The central region renegotiated its contract in March and asked for a usage breakdown by project, which the finance team produced by hand. \n\nRecord S1: S1-0 S1-1 S1-2 S1-3 S1-4 S1-5 S1-6 S1-7 S1-8 S1-9 S1-10 S1-11 S1-12 S1-13 S1-14 S1-15 S1-16 S1-17 S1-18 S1-19 S1-20 S1-21 S1-22 S1-23 S1-24 S1-25 S1-26 S1-27 S1-28 S1-29 S1-30 S1-31 S1-32 S1-33 S1-34 S1-35 S1-36 S1-37 S1-38 S1-39 S1-40 S1-41 S1-42 S1-43 S1-44 S1-45 S1-46 S1-47 S1-48 S1-49 S1-50 S1-51 S1-52 S1-53 S1-54 S1-55 S1-56 S1-57 S1-58 S1-59 S1-60 S1-61 S1-62 S1-63 S1-64 S1-65 S1-66 S1-67 S1-68 S1-69 S1-70 S1-71 S1-72 S1-73 S1-74 S1-75 S1-76 S1-77 S1-78 S1-79 S1-80 S1-81 S1-82 S1-83 S1-84 S1-85 S1-86 S1-87 S1-88 S1-89 S1-90 S1-91 S1-92 S1-93 S1-94 S1-95 S1-96 S1-97 S1-98 S1-99 S1-100 S1-101 S1-102 S1-103 S1-104 S1-105 S1-106 S1-107 S1-108 S1-109 S1-110 S1-111 S1-112 S1-113 S1-114 S1-115 S1-116 S1-117 S1-118 S1-119 S1-120 S1-121 S1-122 S1-123 S1-124 S1-125 S1-126 S1-127 S1-128 S1-129 S1-130 S1-131 S1-132 S1-133 S1-134 S1-135 S1-136 S1-137 S1-138 S1-139 S1-140 S1-141 S1-142 S1-143 S1-144 S1-145 S1-146 S1-147 S1-148 S1-149 S1-150 S1-151 S1-152 S1-153 S1-154 S1-155 S1-156 S1-157 S1-158 S1-159 S1-160 S1-161 S1-162 S1-163 S1-164 S1-165 S1-166 S1-167 S1-168 S1-169 S1-170 S1-171 S1-172 S1-173 S1-174 S1-175 S1-176 S1-177 S1-178 S1-179 S1-180 S1-181 S1-182 S1-183 S1-184 S1-185 S1-186 S1-187 S1-188 S1-189 S1-190 S1-191 S1-192 S1-193 S1-194 S1-195 S1-196 S1-197 S1-198 S1-199",
+      "role": "user"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. The central region renegotiated its contract in March and asked for a usage breakdown by project, which the finance team produced by hand. \n\nRecord EXA: EXA-0 EXA-1 EXA-2 EXA-3 EXA-4 EXA-5 EXA-6 EXA-7 EXA-8 EXA-9 EXA-10 EXA-11 EXA-12 EXA-13 EXA-14 EXA-15 EXA-16 EXA-17 EXA-18 EXA-19 EXA-20 EXA-21 EXA-22 EXA-23 EXA-24 EXA-25 EXA-26 EXA-27 EXA-28 EXA-29 EXA-30 EXA-31 EXA-32 EXA-33 EXA-34 EXA-35 EXA-36 EXA-37 EXA-38 EXA-39",
+      "role": "user"
+     },
+     {
+      "content": "A",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. The central region renegotiated its contract in March and asked for a usage breakdown by project, which the finance team produced by hand. \n\nRecord EXB: EXB-0 EXB-1 EXB-2 EXB-3 EXB-4 EXB-5 EXB-6 EXB-7 EXB-8 EXB-9 EXB-10 EXB-11 EXB-12 EXB-13 EXB-14 EXB-15 EXB-16 EXB-17 EXB-18 EXB-19 EXB-20 EXB-21 EXB-22 EXB-23 EXB-24 EXB-25 EXB-26 EXB-27 EXB-28 EXB-29 EXB-30 EXB-31 EXB-32 EXB-33 EXB-34 EXB-35 EXB-36 EXB-37 EXB-38 EXB-39",
+      "role": "user"
+     },
+     {
+      "content": "B",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.",
+      "role": "user"
+     }
+    ],
+    "model": "qwen3.5:9b",
+    "reasoning_effort": "none"
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "choices": [
+     {
       "finish_reason": "length",
       "index": 0,
       "message": {
@@ -1615,6 +1739,176 @@
     "model": "definitely-not-a-model"
    },
    "status": 404
+  },
+  {
+   "body": {
+    "error": null,
+    "incomplete_details": null,
+    "instructions": null,
+    "max_output_tokens": 16,
+    "metadata": {},
+    "model": "qwen3.5:9b",
+    "output": [
+     {
+      "summary": [
+       {
+        "type": "summary_text"
+       }
+      ],
+      "type": "reasoning"
+     },
+     {
+      "content": [
+       {
+        "logprobs": [],
+        "type": "output_text"
+       }
+      ],
+      "role": "assistant",
+      "status": "completed",
+      "type": "message"
+     }
+    ],
+    "reasoning": null,
+    "status": "completed",
+    "tools": [],
+    "top_logprobs": 0,
+    "usage": {
+     "input_tokens": 1987,
+     "input_tokens_details": {
+      "cached_tokens": 1985
+     },
+     "output_tokens": 16,
+     "output_tokens_details": {
+      "reasoning_tokens": 0
+     },
+     "total_tokens": 2003
+    }
+   },
+   "method": "POST",
+   "name": "responses-cache-cold",
+   "path": "/v1/responses",
+   "request": {
+    "input": [
+     {
+      "content": "You are a precise classification engine. Answer the question by selecting exactly one of the provided labels. Reply with the label only: no punctuation, no explanation, no other text.",
+      "role": "system"
+     },
+     {
+      "content": "The quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. The central region renegotiated its contract in March and asked for a usage breakdown by project, which the finance team produced by hand. \n\nRecord S1: S1-0 S1-1 S1-2 S1-3 S1-4 S1-5 S1-6 S1-7 S1-8 S1-9 S1-10 S1-11 S1-12 S1-13 S1-14 S1-15 S1-16 S1-17 S1-18 S1-19 S1-20 S1-21 S1-22 S1-23 S1-24 S1-25 S1-26 S1-27 S1-28 S1-29 S1-30 S1-31 S1-32 S1-33 S1-34 S1-35 S1-36 S1-37 S1-38 S1-39 S1-40 S1-41 S1-42 S1-43 S1-44 S1-45 S1-46 S1-47 S1-48 S1-49 S1-50 S1-51 S1-52 S1-53 S1-54 S1-55 S1-56 S1-57 S1-58 S1-59 S1-60 S1-61 S1-62 S1-63 S1-64 S1-65 S1-66 S1-67 S1-68 S1-69 S1-70 S1-71 S1-72 S1-73 S1-74 S1-75 S1-76 S1-77 S1-78 S1-79 S1-80 S1-81 S1-82 S1-83 S1-84 S1-85 S1-86 S1-87 S1-88 S1-89 S1-90 S1-91 S1-92 S1-93 S1-94 S1-95 S1-96 S1-97 S1-98 S1-99 S1-100 S1-101 S1-102 S1-103 S1-104 S1-105 S1-106 S1-107 S1-108 S1-109 S1-110 S1-111 S1-112 S1-113 S1-114 S1-115 S1-116 S1-117 S1-118 S1-119 S1-120 S1-121 S1-122 S1-123 S1-124 S1-125 S1-126 S1-127 S1-128 S1-129 S1-130 S1-131 S1-132 S1-133 S1-134 S1-135 S1-136 S1-137 S1-138 S1-139 S1-140 S1-141 S1-142 S1-143 S1-144 S1-145 S1-146 S1-147 S1-148 S1-149 S1-150 S1-151 S1-152 S1-153 S1-154 S1-155 S1-156 S1-157 S1-158 S1-159 S1-160 S1-161 S1-162 S1-163 S1-164 S1-165 S1-166 S1-167 S1-168 S1-169 S1-170 S1-171 S1-172 S1-173 S1-174 S1-175 S1-176 S1-177 S1-178 S1-179 S1-180 S1-181 S1-182 S1-183 S1-184 S1-185 S1-186 S1-187 S1-188 S1-189 S1-190 S1-191 S1-192 S1-193 S1-194 S1-195 S1-196 S1-197 S1-198 S1-199",
+      "role": "user"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. The central region renegotiated its contract in March and asked for a usage breakdown by project, which the finance team produced by hand. \n\nRecord EXA: EXA-0 EXA-1 EXA-2 EXA-3 EXA-4 EXA-5 EXA-6 EXA-7 EXA-8 EXA-9 EXA-10 EXA-11 EXA-12 EXA-13 EXA-14 EXA-15 EXA-16 EXA-17 EXA-18 EXA-19 EXA-20 EXA-21 EXA-22 EXA-23 EXA-24 EXA-25 EXA-26 EXA-27 EXA-28 EXA-29 EXA-30 EXA-31 EXA-32 EXA-33 EXA-34 EXA-35 EXA-36 EXA-37 EXA-38 EXA-39",
+      "role": "user"
+     },
+     {
+      "content": "A",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. The central region renegotiated its contract in March and asked for a usage breakdown by project, which the finance team produced by hand. \n\nRecord EXB: EXB-0 EXB-1 EXB-2 EXB-3 EXB-4 EXB-5 EXB-6 EXB-7 EXB-8 EXB-9 EXB-10 EXB-11 EXB-12 EXB-13 EXB-14 EXB-15 EXB-16 EXB-17 EXB-18 EXB-19 EXB-20 EXB-21 EXB-22 EXB-23 EXB-24 EXB-25 EXB-26 EXB-27 EXB-28 EXB-29 EXB-30 EXB-31 EXB-32 EXB-33 EXB-34 EXB-35 EXB-36 EXB-37 EXB-38 EXB-39",
+      "role": "user"
+     },
+     {
+      "content": "B",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.",
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16,
+    "model": "qwen3.5:9b",
+    "reasoning_effort": "none"
+   },
+   "status": 200
+  },
+  {
+   "body": {
+    "error": null,
+    "incomplete_details": null,
+    "instructions": null,
+    "max_output_tokens": 16,
+    "metadata": {},
+    "model": "qwen3.5:9b",
+    "output": [
+     {
+      "summary": [
+       {
+        "type": "summary_text"
+       }
+      ],
+      "type": "reasoning"
+     },
+     {
+      "content": [
+       {
+        "logprobs": [],
+        "type": "output_text"
+       }
+      ],
+      "role": "assistant",
+      "status": "completed",
+      "type": "message"
+     }
+    ],
+    "reasoning": null,
+    "status": "completed",
+    "tools": [],
+    "top_logprobs": 0,
+    "usage": {
+     "input_tokens": 1987,
+     "input_tokens_details": {
+      "cached_tokens": 1985
+     },
+     "output_tokens": 16,
+     "output_tokens_details": {
+      "reasoning_tokens": 0
+     },
+     "total_tokens": 2003
+    }
+   },
+   "method": "POST",
+   "name": "responses-cache-warm",
+   "path": "/v1/responses",
+   "request": {
+    "input": [
+     {
+      "content": "You are a precise classification engine. Answer the question by selecting exactly one of the provided labels. Reply with the label only: no punctuation, no explanation, no other text.",
+      "role": "system"
+     },
+     {
+      "content": "The quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. The central region renegotiated its contract in March and asked for a usage breakdown by project, which the finance team produced by hand. \n\nRecord S1: S1-0 S1-1 S1-2 S1-3 S1-4 S1-5 S1-6 S1-7 S1-8 S1-9 S1-10 S1-11 S1-12 S1-13 S1-14 S1-15 S1-16 S1-17 S1-18 S1-19 S1-20 S1-21 S1-22 S1-23 S1-24 S1-25 S1-26 S1-27 S1-28 S1-29 S1-30 S1-31 S1-32 S1-33 S1-34 S1-35 S1-36 S1-37 S1-38 S1-39 S1-40 S1-41 S1-42 S1-43 S1-44 S1-45 S1-46 S1-47 S1-48 S1-49 S1-50 S1-51 S1-52 S1-53 S1-54 S1-55 S1-56 S1-57 S1-58 S1-59 S1-60 S1-61 S1-62 S1-63 S1-64 S1-65 S1-66 S1-67 S1-68 S1-69 S1-70 S1-71 S1-72 S1-73 S1-74 S1-75 S1-76 S1-77 S1-78 S1-79 S1-80 S1-81 S1-82 S1-83 S1-84 S1-85 S1-86 S1-87 S1-88 S1-89 S1-90 S1-91 S1-92 S1-93 S1-94 S1-95 S1-96 S1-97 S1-98 S1-99 S1-100 S1-101 S1-102 S1-103 S1-104 S1-105 S1-106 S1-107 S1-108 S1-109 S1-110 S1-111 S1-112 S1-113 S1-114 S1-115 S1-116 S1-117 S1-118 S1-119 S1-120 S1-121 S1-122 S1-123 S1-124 S1-125 S1-126 S1-127 S1-128 S1-129 S1-130 S1-131 S1-132 S1-133 S1-134 S1-135 S1-136 S1-137 S1-138 S1-139 S1-140 S1-141 S1-142 S1-143 S1-144 S1-145 S1-146 S1-147 S1-148 S1-149 S1-150 S1-151 S1-152 S1-153 S1-154 S1-155 S1-156 S1-157 S1-158 S1-159 S1-160 S1-161 S1-162 S1-163 S1-164 S1-165 S1-166 S1-167 S1-168 S1-169 S1-170 S1-171 S1-172 S1-173 S1-174 S1-175 S1-176 S1-177 S1-178 S1-179 S1-180 S1-181 S1-182 S1-183 S1-184 S1-185 S1-186 S1-187 S1-188 S1-189 S1-190 S1-191 S1-192 S1-193 S1-194 S1-195 S1-196 S1-197 S1-198 S1-199",
+      "role": "user"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. The central region renegotiated its contract in March and asked for a usage breakdown by project, which the finance team produced by hand. \n\nRecord EXA: EXA-0 EXA-1 EXA-2 EXA-3 EXA-4 EXA-5 EXA-6 EXA-7 EXA-8 EXA-9 EXA-10 EXA-11 EXA-12 EXA-13 EXA-14 EXA-15 EXA-16 EXA-17 EXA-18 EXA-19 EXA-20 EXA-21 EXA-22 EXA-23 EXA-24 EXA-25 EXA-26 EXA-27 EXA-28 EXA-29 EXA-30 EXA-31 EXA-32 EXA-33 EXA-34 EXA-35 EXA-36 EXA-37 EXA-38 EXA-39",
+      "role": "user"
+     },
+     {
+      "content": "A",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.\n\nThe quarterly review covers three regions and eleven accounts. In the north, adoption grew steadily after the migration completed, and the support load stayed flat despite the volume. The central region renegotiated its contract in March and asked for a usage breakdown by project, which the finance team produced by hand. \n\nRecord EXB: EXB-0 EXB-1 EXB-2 EXB-3 EXB-4 EXB-5 EXB-6 EXB-7 EXB-8 EXB-9 EXB-10 EXB-11 EXB-12 EXB-13 EXB-14 EXB-15 EXB-16 EXB-17 EXB-18 EXB-19 EXB-20 EXB-21 EXB-22 EXB-23 EXB-24 EXB-25 EXB-26 EXB-27 EXB-28 EXB-29 EXB-30 EXB-31 EXB-32 EXB-33 EXB-34 EXB-35 EXB-36 EXB-37 EXB-38 EXB-39",
+      "role": "user"
+     },
+     {
+      "content": "B",
+      "role": "assistant"
+     },
+     {
+      "content": "Question:\nClassify the record by its primary subject.\n\nOptions:\nA: billing \u2014 Invoices, charges, refunds, payment methods, subscription price.\nB: technical \u2014 API errors, latency, rate limits, SDK behaviour, authentication.\nC: sales \u2014 Pricing plans, trials, quotes, procurement, contract terms.\nD: other \u2014 Anything that is not billing, technical or sales.",
+      "role": "user"
+     }
+    ],
+    "max_output_tokens": 16,
+    "model": "qwen3.5:9b",
+    "reasoning_effort": "none"
+   },
+   "status": 200
   },
   {
    "body": {

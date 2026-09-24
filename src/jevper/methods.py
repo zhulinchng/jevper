@@ -134,6 +134,7 @@ def build_spec(
     top_logprobs: int = 20,
     temperature: float | None = None,
     reasoning: ReasoningConfig | None = None,
+    prompt_cache_key: str | None = None,
 ) -> CallSpec:
     """The request shape for one method. Only ``logprobs``/``grammar`` ask for logprobs."""
     if method == "structured":
@@ -144,6 +145,7 @@ def build_spec(
             schema_name=name,
             temperature=temperature,
             reasoning=reasoning,
+            prompt_cache_key=prompt_cache_key,
         )
     if method == "discrete":
         name, schema = discrete_schema(question, labels)
@@ -153,6 +155,7 @@ def build_spec(
             schema_name=name,
             temperature=temperature,
             reasoning=reasoning,
+            prompt_cache_key=prompt_cache_key,
         )
     return CallSpec(
         messages=messages,
@@ -161,6 +164,7 @@ def build_spec(
         grammar=labels_grammar(labels) if method == "grammar" else None,
         temperature=temperature,
         reasoning=reasoning,
+        prompt_cache_key=prompt_cache_key,
     )
 
 

@@ -40,20 +40,20 @@ def test_examples_render_as_question_turns_then_label_turns(stub_server):
     assert [message["role"] for message in messages] == [
         "system",
         "user",
-        "user",
         "assistant",
         "user",
         "assistant",
+        "user",
         "user",
     ]
-    assert "Charge duplicated on the invoice" in messages[2]["content"]
-    assert "Options:" in messages[2]["content"]
-    assert messages[3]["content"] == "A"
-    assert "Login fails after the update" in messages[4]["content"]
-    assert messages[5]["content"] == "B"
-    assert "The receipt shows two identical charges" in messages[1]["content"]
-    assert "The receipt shows two identical charges" not in messages[6]["content"]
-    assert messages[6]["content"].startswith("Options:")
+    assert "Charge duplicated on the invoice" in messages[1]["content"]
+    assert "Options:" in messages[1]["content"]
+    assert messages[2]["content"] == "A"
+    assert "Login fails after the update" in messages[3]["content"]
+    assert messages[4]["content"] == "B"
+    assert messages[5]["content"].startswith("Options:")
+    assert "The receipt shows two identical charges" not in messages[5]["content"]
+    assert "The receipt shows two identical charges" in messages[6]["content"]
 
 
 def test_question_level_examples_win_over_call_and_constructor(stub_server):
@@ -109,7 +109,7 @@ def test_constructor_examples_apply_as_the_last_resort(stub_server):
 
     messages = stub.bodies("/chat/completions")[0]["messages"]
     assert "from-constructor" in json.dumps(messages)
-    assert messages[3]["content"] == "C"
+    assert messages[2]["content"] == "C"
 
 
 def test_structured_examples_render_json_answers(stub_server):
@@ -146,19 +146,19 @@ def test_structured_examples_render_json_answers(stub_server):
     bodies = stub.bodies("/chat/completions")
     assert len(bodies) == 2
     # The two questions are answered concurrently, so arrival order is not guaranteed.
-    choice_body = next(body for body in bodies if "A: billing" in body["messages"][-1]["content"])
-    noul_body = next(body for body in bodies if "A: Yes" in body["messages"][-1]["content"])
+    choice_body = next(body for body in bodies if "A: billing" in body["messages"][-2]["content"])
+    noul_body = next(body for body in bodies if "A: Yes" in body["messages"][-2]["content"])
     messages = choice_body["messages"]
     assert messages[0]["content"].startswith("You are a precise classification engine. Answer the question by returning a JSON object")
-    assert json.loads(messages[3]["content"]) == {
+    assert json.loads(messages[2]["content"]) == {
         "probabilities": {"billing": 0.6, "technical": 0.3, "sales": 0.1}
     }
-    assert json.loads(messages[5]["content"]) == {
+    assert json.loads(messages[4]["content"]) == {
         "probabilities": {"billing": 0.0, "technical": 1.0, "sales": 0.0}
     }
     noul_messages = noul_body["messages"]
-    assert json.loads(noul_messages[3]["content"]) == {"noul": 0.9}
-    assert json.loads(noul_messages[5]["content"]) == {"noul": 0.0}
+    assert json.loads(noul_messages[2]["content"]) == {"noul": 0.9}
+    assert json.loads(noul_messages[4]["content"]) == {"noul": 0.0}
 
 
 def test_examples_are_not_part_of_the_wire_question(stub_server):
@@ -200,8 +200,8 @@ def test_example_answer_forms_resolve_to_labels(stub_server):
     )
 
     bodies = stub.bodies("/chat/completions")
-    verdict = next(body for body in bodies if "A: Yes" in body["messages"][-1]["content"])
-    intent = next(body for body in bodies if "A: billing" in body["messages"][-1]["content"])
+    verdict = next(body for body in bodies if "A: Yes" in body["messages"][-2]["content"])
+    intent = next(body for body in bodies if "A: billing" in body["messages"][-2]["content"])
     labels = lambda body: [message["content"] for message in body["messages"] if message["role"] == "assistant"]
     assert labels(verdict) == ["A", "B"]
     assert labels(intent) == ["C", "C"]

@@ -36,18 +36,20 @@ caller (`close()` only shuts down jevper's own thread pool).
 | `n_retry_malformed` | `1` | Corrective retries when an answer cannot be read |
 | `retry` | `None` | Transient-failure retries; `RetryPolicy()` (2 retries, 0.5s base, 8s cap) when unset |
 | `temperature` | `None` | Not sent unless set. `0.0` is recommended for `structured`/`discrete`; `logprobs` needs no setting |
+| `prompt_cache_key` | `None` | The provider's cache-routing key. Unset, jevper derives one per question from the parts of the prompt that do not change between calls, so a rubric's requests are routed together; set it to group (or account for) requests your own way |
 | `extra_body` | `None` | Merged into every request body (the grammar field is merged here too) |
 | `extra_headers` | `None` | Sent with every request |
 
 Constructor validation is eager: an unknown `method`/`api`, `top_logprobs` outside `[0, 20]` or below 2 with a
 pinned `logprobs`/`grammar`, `max_concurrency < 1`, a negative `n_retry_malformed`, a non-`ReasoningConfig`
-`reasoning`, a `retry` that is not a `RetryPolicy` or has a negative or non-finite field, and an `extra_body` or
+`reasoning`, a `retry` that is not a `RetryPolicy` or has a negative or non-finite field, a `prompt_cache_key`
+that is not a non-empty string of at most `MAX_PROMPT_CACHE_KEY` characters, and an `extra_body` or
 `extra_headers` that is not a mapping all raise `JevperError`.
 
 ### `system_one`
 
 ```python
-system_one(*, state, questions, examples=(), model=None, method=None, api=None, reasoning=None, temperature=None)
+system_one(*, state, questions, examples=(), model=None, method=None, api=None, reasoning=None, temperature=None, prompt_cache_key=None)
     -> SystemOneResponse
 ```
 
@@ -61,6 +63,7 @@ system_one(*, state, questions, examples=(), model=None, method=None, api=None, 
 | `api` | `None` | Overrides the constructor api |
 | `reasoning` | `None` | Overrides the constructor reasoning |
 | `temperature` | `None` | Overrides the constructor temperature |
+| `prompt_cache_key` | `None` | Overrides the constructor cache key; `None` keeps the constructor's (or the derived one) |
 
 Per-call values win over constructor defaults. Everything is resolved and validated before the first provider
 call, so a bad question, an empty `questions` mapping, an unusable `state`, or `grammar` on the Responses
@@ -76,6 +79,13 @@ per-call `method` of `logprobs`/`grammar` with `top_logprobs` below 2, and for a
 | `[{"role": "user", "content": "..."}, ...]` | those turns verbatim (roles `system`, `user`, `assistant`, `developer`; `content` must be `str`) |
 | `{"messages": [...]}` | same as above |
 | any other JSON value | one `user` turn holding `json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2)` |
+
+Whichever form it takes, the state is rendered into the **last** messages of the prompt — after the system
+prompt, the few-shot turns and the question block — so that every state classified with one rubric shares the
+same prefix and the provider can reuse its cache. A chat-list state's own `system`/`developer` turns are
+folded into that system prompt — every server here refuses a `system` turn that is not first, and jevper's own
+prompt leads — while the rest of the state stays verbatim and goes last. See
+[local-servers.md](local-servers.md#message-order-is-what-decides-the-reuse).
 
 ### `close()` / `aclose()`
 
@@ -166,12 +176,20 @@ ScoreAnswer(type="score", score=1.05, legend={0: "Calm", 1: "Frustrated", 2: "Ve
 `nouls`, `choices` and `scores` are cached properties returning `answers` filtered by answer type.
 
 ```python
-Usage(input_tokens=None, output_tokens=None, reasoning_tokens=None, n_calls=0, n_retries=0, latency=0.0)
+Usage(input_tokens=None, output_tokens=None, reasoning_tokens=None, cached_tokens=None, n_calls=0, n_retries=0, latency=0.0)
 ```
 
 A token count is `None` when any constituent call omitted it (a reported `0` is preserved). `n_calls` counts
 analysis passes and corrective retries; `n_retries` counts transient-failure retries only. `latency` is
 wall-clock seconds for the whole `system_one` call.
+
+`cached_tokens` is the prompt tokens the provider read from its own prompt cache, read from
+`usage.prompt_tokens_details.cached_tokens` on Chat Completions and `usage.input_tokens_details.cached_tokens`
+on the Responses surface. It is the one number that says caching worked; a provider that reports nothing
+leaves it `None`, which is not the same as a reported `0` — that is a server whose prefix cache is cold, or
+off. Not every server reports it at all, and two need a flag to: vLLM's `--enable-prompt-tokens-details` and
+SGLang's `--enable-cache-report` for its Chat Completions route. See
+[local-servers.md](local-servers.md#prompt-caching).
 
 ### `debug`
 
@@ -185,7 +203,7 @@ wall-clock seconds for the whole `system_one` call.
 | `retry_reasons` | Corrective-retry messages, in order |
 | `probability_errors` | `{question_id: abs(sum − 1)}` for `structured` distributions outside `1e-6` |
 | `original_probabilities` | The model's raw distribution, only for questions that were rescaled |
-| `server_limits` | Only when the server refused a capability field: `structured` (`"schema"`/`"object"`/`"none"`), `reasoning` and `include` as it last accepted them |
+| `server_limits` | Only when the server refused a capability field: `structured` (`"schema"`/`"object"`/`"none"`), `reasoning`, `include` and `cache_key` as it last accepted them |
 | `labels_missing` | Labels the provider did not report a logprob for, per question |
 
 Every key is always present — except `methods`, which only `method="auto"` adds — and the last three are empty
@@ -269,6 +287,7 @@ the surface it implies, and a provider failure that survived its retries moves n
 `jevper.client.AUTO_METHOD` (`"logprobs"`) and `jevper.client.FALLBACK_METHOD` (`"structured"`) are what
 `method="auto"` tries and falls back to.
 `jevper.client.TRANSIENT_STATUS_CODES`, `jevper.client.MAX_TOP_LOGPROBS` (`20`),
+`jevper.client.MAX_PROMPT_CACHE_KEY` (`256`, the cap jevper enforces on a caller's cache key),
 `jevper.labels.MAX_LABEL_OPTIONS` (`26`, the single-token alphabet), `jevper.labels.MAX_CHOICE_OPTIONS` and
 `jevper.types.CHOICE_MAX_OPTIONS` (`255`), `jevper.types.SCORE_MAX_LEVELS` (`10`) and
 `jevper.normalize.PROBABILITY_TOLERANCE` (`1e-6`) are available for callers that need to validate their own

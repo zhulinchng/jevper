@@ -60,7 +60,7 @@ pytest -q
 
 ```mermaid
 flowchart LR
-    A["state + questions"] --> B["build_parts + assemble: system prompt, state turns, few-shot turns, question block"]
+    A["state + questions"] --> B["build_parts + assemble: system prompt, few-shot turns, question block, state turns"]
     B --> C{"method (auto resolves first)"}
     C -->|logprobs| D["logprobs=true, top_logprobs=20"]
     C -->|grammar| E["+ GBNF grammar in extra_body"]
@@ -121,8 +121,8 @@ surface. See [docs/methods.md](https://github.com/zhulinchng/jevper/blob/main/do
 provider table, the exact request bodies, the readout rules and the failure modes.
 
 The same holds for the request fields jevper adds: a server that refuses structured output, the reasoning
-parameters or the Responses `include` list gets that field dropped and the call re-asked, so a partially
-implemented server answers instead of failing. `debug["server_limits"]` reports what it refused.
+parameters, the Responses `include` list or the cache key gets that field dropped and the call re-asked, so a
+partially implemented server answers instead of failing. `debug["server_limits"]` reports what it refused.
 
 ## Reasoning
 
@@ -144,7 +144,7 @@ in `response.usage`. See [docs/reasoning.md](https://github.com/zhulinchng/jevpe
 
 ## Few-shot examples
 
-Examples are chat turns (example state + question block, then the expected answer), so the demonstration is
+Examples are chat turns (question block + example state, then the expected answer), so the demonstration is
 always in the format the active method expects. They can be attached at three levels:
 
 ```python
@@ -172,7 +172,7 @@ from `model_dump()`, so question dumps keep exactly the Jev wire keys. See
 response.model                 # the model actually used
 response.answers               # {"intent": ChoiceAnswer(...)}
 response.nouls / .choices / .scores   # filtered views
-response.usage                 # input_tokens, output_tokens, reasoning_tokens, n_calls, n_retries, latency
+response.usage                 # input_tokens, output_tokens, reasoning_tokens, cached_tokens, n_calls, n_retries, latency
 response.reasoning             # tuple[ReasoningContentPart, ...]
 response.debug                 # per-attempt requests/responses, retry reasons, normalization notes
 ```
@@ -181,6 +181,34 @@ response.debug                 # per-attempt requests/responses, retry reasons, 
 `POST /v1/systemone`. Token counts are `None` when any constituent call omitted them; `n_calls` counts the
 provider calls that returned a result, including analysis passes and corrective retries, while `n_retries`
 counts transient-failure retries only. A failed attempt appears in `debug["llm_attempts"]` but not in `usage`. See [docs/api.md](https://github.com/zhulinchng/jevper/blob/main/docs/api.md) for the full reference.
+
+## Prompt caching
+
+Every provider that serves these calls caches the *prefix* of a prompt and reuses it for the next request
+that starts the same way, and jevper is shaped for it: the state comes last, so the system prompt, the
+few-shot examples and the question block are identical across every state classified with one rubric.
+
+```python
+client = SystemOneClient(OpenAI(), model="gpt-5.6")
+
+client.system_one(state=record_a, questions=rubric)
+client.system_one(state=record_b, questions=rubric)   # the shared prefix is reused
+```
+
+Two things make it steerable and observable:
+
+- **`prompt_cache_key`** is sent with every request, derived per question from the parts of the prompt that do
+  not change between calls — model, examples, question block — so a rubric's requests are routed together.
+  Pass your own to group or account for them your way, on the client (`prompt_cache_key="tenant-42"`) or per
+  call. A server that refuses the field gets it dropped and the call re-asked, like the other optional fields.
+- **`usage.cached_tokens`** is the prompt tokens the provider read from its cache, summed over the call.
+  `None` means the provider said nothing — vLLM needs `--enable-prompt-tokens-details`, and SGLang's Chat
+  Completions route needs `--enable-cache-report` — while a reported `0` means a cold or disabled cache.
+
+Measured on one 2388-token prompt carrying two examples, second call differing only in the state: reused
+tokens went from 40 — the system prompt alone — to 1010 on llama.cpp, 528 on vLLM and 896 on SGLang once the
+state moved to the end. Per-server flags, what each server accepts or ignores, and how to isolate a cache with
+`cache_salt`: [docs/local-servers.md](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md#prompt-caching).
 
 ## Failures
 

@@ -26,6 +26,7 @@ def chat_body(
     input_tokens: int | None = 10,
     output_tokens: int | None = 3,
     reasoning_tokens: int | None = 0,
+    cached_tokens: int | None = None,
 ) -> dict[str, Any]:
     """A ``chat.completion`` body. ``logprobs`` is the generated token stream for the answer, first
     entry first; the answer token's ``top_logprobs`` is the whole sequence unless ``alternatives``
@@ -59,6 +60,8 @@ def chat_body(
         usage["total_tokens"] = input_tokens + output_tokens
     if reasoning_tokens is not None:
         usage["completion_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
+    if cached_tokens is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
     return {
         "id": "chatcmpl-stub",
         "object": "chat.completion",
@@ -88,6 +91,7 @@ def responses_body(
     input_tokens: int | None = 10,
     output_tokens: int | None = 3,
     reasoning_tokens: int | None = 0,
+    cached_tokens: int | None = 0,
 ) -> dict[str, Any]:
     """A ``response`` body with one assistant message and any reasoning items."""
     output_text: dict[str, Any] = {"type": "output_text", "text": text, "annotations": []}
@@ -113,9 +117,9 @@ def responses_body(
             "content": [output_text],
         }
     ]
-    usage: dict[str, Any] = {
-        "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
-    }
+    usage: dict[str, Any] = {}
+    if cached_tokens is not None:
+        usage["input_tokens_details"] = {"cached_tokens": cached_tokens, "cache_write_tokens": 0}
     if input_tokens is not None:
         usage["input_tokens"] = input_tokens
     if output_tokens is not None:

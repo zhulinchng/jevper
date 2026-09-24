@@ -27,6 +27,7 @@ from jevper import (
     SystemOneClient,
     reasoning_text,
 )
+from jevper.transport import SURFACES
 
 FIXTURES = Path(__file__).parent / "fixtures" / "providers"
 SERVERS = ("ollama", "llamacpp", "vllm", "sglang")
@@ -360,3 +361,58 @@ def test_a_long_run_that_hits_the_budget_says_so(stub_server):
     message = str(error.value)
     assert "'Thinking'" in message
     assert "output tokens" in message
+
+
+@pytest.mark.parametrize("server", SERVERS)
+def test_a_recorded_cache_hit_is_read(server):
+    """The same prompt twice, and whatever the server said about reuse.
+
+    These captures are plain requests — no logprobs, so no readout can consume the answer text — which
+    is why this asserts where the count is read: the normalizer ``system_one`` itself calls. ollama,
+    llama.cpp, vLLM and SGLang all reported a real reuse here (1985, 1985, 1584 and 1984 of ~1989
+    prompt tokens), and a server that reported nothing would leave the count ``None``.
+    """
+    usage = (recorded(server)["chat-cache-warm"]["body"] or {}).get("usage") or {}
+    reported = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    normalize = SURFACES["chat_completions"][1]
+
+    result = normalize(recorded(server)["chat-cache-warm"]["body"], {})
+
+    assert result.cached_tokens == reported
+    assert reported is not None and reported > 0
+
+
+@pytest.mark.parametrize("server", SERVERS)
+def test_a_recorded_responses_cache_is_read(server):
+    """The Responses surface reports reuse under ``usage.input_tokens_details``, not the chat path.
+
+    llama.cpp's Responses shim answers this request with a 400, so that capture has nothing to read.
+    """
+    record = recorded(server)["responses-cache-warm"]
+    if record["status"] != 200:
+        pytest.skip(f"{server} answered {record['status']} on the Responses surface for this capture")
+    usage = (record["body"] or {}).get("usage") or {}
+    reported = (usage.get("input_tokens_details") or {}).get("cached_tokens")
+    normalize = SURFACES["responses"][1]
+
+    result = normalize(record["body"], {})
+
+    assert result.cached_tokens == reported
+    assert reported is not None and reported > 0
+
+
+def test_a_server_that_reports_nothing_is_not_a_reported_zero():
+    """SGLang sends ``prompt_tokens_details: null`` when nothing was cached, and a count when it was.
+
+    Both bodies are from the same server and the same prompt, so the pair is what proves the
+    distinction: silence has to stay ``None``, because a reported ``0`` means a cold or disabled cache.
+    """
+    normalize = SURFACES["chat_completions"][1]
+
+    cold = normalize(recorded("sglang")["chat-cache-key"]["body"], {})
+    warm = normalize(recorded("sglang")["chat-cache-warm"]["body"], {})
+
+    assert "prompt_tokens_details" in cold.response["usage"]
+    assert cold.response["usage"]["prompt_tokens_details"] is None
+    assert cold.cached_tokens is None
+    assert warm.cached_tokens and warm.cached_tokens > 0

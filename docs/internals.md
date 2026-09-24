@@ -136,7 +136,11 @@ two-step mode — and use the JSON wording for `structured`/`discrete`, the labe
 ## Accounting
 
 `Usage` counts are summed across every call of the request, and a count is `None` when any constituent call
-omitted it (a reported `0` is preserved). `_CallLog.add_result` implements exactly that rule.
+omitted it (a reported `0` is preserved). `_CallLog.add_result` implements exactly that rule, over
+`TOKEN_FIELDS` — `input_tokens`, `output_tokens`, `reasoning_tokens` and `cached_tokens`. The last of those is
+the only one the provider chooses to send: OpenAI, OpenRouter, ollama and llama.cpp always report it, vLLM
+needs `--enable-prompt-tokens-details`, SGLang needs `--enable-cache-report` on its Chat Completions route,
+and a server that says nothing leaves the total `None` rather than a flattering `0`.
 
 `debug` is assembled once, in `_assemble`, with all eight keys always present:
 
@@ -166,8 +170,12 @@ Worth keeping when editing:
   API limit of 255.
 - `examples` never reaches the wire: `Field(exclude=True)` keeps question dumps and `SystemOneResponse` dumps
   at the Jev shape.
-- The caller's state turns are preserved verbatim and the question block is the final turn; the state is never
-  repeated.
+- The caller's state turns are preserved verbatim, and they come last — after the question block — so the
+  prefix every call about one rubric shares is the whole prompt except the state. The state is never repeated.
+  A state's own `system`/`developer` turns are folded into the leading system prompt by
+  `prompts.hoist_instructions` — llama.cpp's template raises `System message must be at the beginning.` for
+  one that is not first, and vLLM and SGLang answer `400` with the same words — so the rest of the state is
+  always last and always cacheable.
 - The provider client is never closed by jevper. `close()` shuts down the thread pool only, and
   `AsyncSystemOneClient.aclose()` is a no-op.
 - Readouts raise `LabelReadoutError`/`MalformedAnswerError` for recoverable shapes and never guess; the client
@@ -207,12 +215,18 @@ Worth keeping when editing:
   is below the default) and a 5xx that survived the retries are `capability=False` and are *not* cached: the
   question is answered with a logprob-free method, but the next call tries logprobs again.
 - A request field jevper added for capability is dropped, not fatal. A 4xx that refuses structured output, the
-  reasoning parameters or the Responses `include` list moves that field one step down its ladder —
-  `json_schema` → `json_object` → nothing — and the same call is re-asked, with the limit remembered per
-  surface and reported in `debug["server_limits"]`. None of the three is needed to answer, so the question is
-  answered instead of failing. The ladder is finite, so a server that refuses everything still ends in a
-  `ProviderError`, and a rejection that names the logprob fields belongs to the readout fallback instead and
-  never reaches it.
+  reasoning parameters, the Responses `include` list or the cache key moves that field one step down its ladder
+  — `json_schema` → `json_object` → nothing, then reasoning, then include, then the key — and the same call is
+  re-asked, with the limit remembered per surface and reported in `debug["server_limits"]`. None of the four is
+  needed to answer, so the question is answered instead of failing. The ladder is finite, so a server that
+  refuses everything still ends in a `ProviderError`, and a rejection that names the logprob fields belongs to
+  the readout fallback instead and never reaches it.
+- The derived cache key is a function of the prefix, not of the request. `prompts.derived_cache_key` hashes the
+  model, the example turns and the question block — everything that determines what a provider can reuse — and
+  never the state, so every state classified with one rubric keys alike. The two reasoning passes of a
+  two-step call therefore share a key even though their system prompts differ, and a fallback to another
+  method does not: another method's examples and prompt are another prefix. A caller's own key replaces the
+  derived one everywhere, including in the re-asks the ladder performs.
 - An answer that never arrived says why. `CallResult.stop` carries the provider's own reason — `finish_reason`
   on Chat Completions, `incomplete_details.reason` on the Responses surface — and the readouts append it to
   the error raised for a missing or unparseable answer. A reasoning model that spends the whole output budget

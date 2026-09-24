@@ -42,6 +42,7 @@ from .prompts import (
     assemble,
     build_parts,
     correction_message,
+    derived_cache_key,
     example_answer_label,
     render_state_messages,
     structured_correction_message,
@@ -123,6 +124,10 @@ _REASONING_MARKERS = ("reasoning_effort", "reasoning")
 # expected one of "file_search_call.results"|...`` for ``path: ["include", 0]``. This vocabulary is
 # only read next to ``include``, where it is the refusal of the field rather than of a value.
 _INCLUDE_REJECTION_MARKERS = ("invalid option", "invalid_value", "expected one of")
+# Text that names the cache key rather than a bad value. A server that does not know the field may say
+# so either way — vLLM's request models reject unknown fields outright — and the key is optional, so it
+# is dropped and the call re-asked like the other capability fields.
+_CACHE_KEY_MARKERS = ("prompt_cache_key", "prompt cache key", "cache key")
 # A 404 that names the model *and* talks about a model is about the model: the other surface would
 # answer the same way, so switching would only hide the real problem. Both halves are required —
 # an unrelated message can easily contain a short model name, and a server that does not implement
@@ -139,7 +144,11 @@ FALLBACK_METHOD: Method = "structured"  # what it answers with when logprobs are
 # response with unreadable logprobs is a bad minute; two are a pattern.
 AUTO_ABSENCES_BEFORE_REMEMBERING = 2
 MAX_TOP_LOGPROBS = 20
-TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens")
+MAX_PROMPT_CACHE_KEY = 256
+"""The provider cap jevper enforces on a cache key. OpenRouter documents 256 characters for the
+``session_id`` that shares this routing role, and a key that is too long is a caller mistake worth
+catching before a request is spent on it."""
+TOKEN_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens")
 
 Examples = Sequence[Example] | Mapping[str, Sequence[Example]]
 
@@ -201,6 +210,32 @@ def _require_top_logprobs(method: Method, top_logprobs: int) -> None:
             f"top_logprobs must be at least 2 for method={method!r}: a distribution needs the sampled "
             f"token and at least one alternative, got {top_logprobs!r}"
         )
+
+
+def _require_prompt_cache_key(key: Any) -> None:
+    """A cache key is an opaque routing label: any non-blank string within the provider's cap."""
+    if not isinstance(key, str) or not key.strip():
+        raise JevperError(f"prompt_cache_key must be a non-empty string, got {key!r}")
+    if len(key) > MAX_PROMPT_CACHE_KEY:
+        raise JevperError(
+            f"prompt_cache_key must be at most {MAX_PROMPT_CACHE_KEY} characters, got {len(key)}"
+        )
+
+
+def _add_count(current: int | None, value: Any) -> int | None:
+    """Add one provider's count to a running total; a count nobody can read counts as unreported.
+
+    A token count arrives as whatever the provider put in its JSON. ``int`` already accepts a numeric
+    string and truncates a float, which is as much tolerance as the shape deserves; anything else — a
+    nested object, a word, a boolean — is a provider bug, and reporting the total as ``None`` says "not
+    reported" rather than inventing a number. The raw body is still in ``debug["llm_attempts"]``.
+    """
+    if value is None or isinstance(value, bool) or current is None:
+        return None
+    try:
+        return current + int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _error_evidence(exc: BaseException) -> str:
@@ -320,6 +355,8 @@ class _CallContext:
     api_auto: bool = False
     """``api="auto"``: the surface was chosen here, so this call may re-choose it. An explicit
     ``api="responses"`` is a decision: its 404 belongs to the caller, not to a fallback."""
+    prompt_cache_key: str | None = None
+    """The caller's cache key, or ``None`` to derive one per question from the prefix it can reuse."""
 
 
 @dataclass
@@ -356,9 +393,7 @@ class _CallLog:
     def add_result(self, result: CallResult) -> None:
         self.n_calls += 1
         for name in TOKEN_FIELDS:
-            value = getattr(result, name)
-            current = self.tokens[name]
-            self.tokens[name] = None if value is None or current is None else current + int(value)
+            self.tokens[name] = _add_count(self.tokens[name], getattr(result, name))
 
 
 @dataclass
@@ -396,6 +431,7 @@ class _BaseClient:
         temperature: float | None = None,
         extra_body: Mapping[str, Any] | None = None,
         extra_headers: Mapping[str, str] | None = None,
+        prompt_cache_key: str | None = None,
     ) -> None:
         if method not in METHOD_SELECTIONS:
             raise JevperError(f"method must be one of {METHOD_SELECTIONS!r}, got {method!r}")
@@ -415,6 +451,8 @@ class _BaseClient:
             raise JevperError(f"extra_body must be a mapping, got {type(extra_body).__name__}")
         if extra_headers is not None and not isinstance(extra_headers, Mapping):
             raise JevperError(f"extra_headers must be a mapping, got {type(extra_headers).__name__}")
+        if prompt_cache_key is not None:
+            _require_prompt_cache_key(prompt_cache_key)
         if method in ("logprobs", "grammar"):
             _require_top_logprobs(method, top_logprobs)
         policy = retry or RetryPolicy()
@@ -442,6 +480,7 @@ class _BaseClient:
         self.temperature = temperature
         self.extra_body = extra_body
         self.extra_headers = extra_headers
+        self.prompt_cache_key = prompt_cache_key
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._executor_lock = threading.Lock()
         # What method="auto" has learned about this provider, per (model, surface).
@@ -552,6 +591,10 @@ class _BaseClient:
             return replace(limits, reasoning=False)
         if spec.reasoning is not None and limits.include and "include" in evidence:
             return replace(limits, include=False)
+        if spec.prompt_cache_key is not None and limits.cache_key and any(
+            marker in evidence for marker in _CACHE_KEY_MARKERS
+        ):
+            return replace(limits, cache_key=False)
         return None
 
     def _logprob_surface_alternative(
@@ -665,12 +708,15 @@ class _BaseClient:
         api: Api | None,
         reasoning: ReasoningConfig | None,
         temperature: float | None,
+        prompt_cache_key: str | None = None,
     ) -> tuple[_CallContext, dict[str, Question]]:
         if not questions:
             raise InvalidQuestionError("at least one question is required")
         if reasoning is not None and not isinstance(reasoning, ReasoningConfig):
             # Without this the mode lookup dereferences a string and the caller sees an AttributeError.
             raise JevperError(f"reasoning must be a ReasoningConfig, got {type(reasoning).__name__}")
+        if prompt_cache_key is not None:
+            _require_prompt_cache_key(prompt_cache_key)
         # Fail fast, before any provider call, and reuse the rendered turns for every question.
         state_messages = tuple(render_state_messages(state))
         parsed = {question_id: parse_question(question_id, raw) for question_id, raw in questions.items()}
@@ -719,6 +765,7 @@ class _BaseClient:
             temperature=temperature if temperature is not None else self.temperature,
             examples=examples,
             state_messages=state_messages,
+            prompt_cache_key=prompt_cache_key if prompt_cache_key is not None else self.prompt_cache_key,
             answer_reasoning=effective_reasoning if mode == "native" else None,
             analysis_reasoning=(
                 effective_reasoning if mode == "two_step" and surface == "responses" else None
@@ -818,11 +865,16 @@ class _BaseClient:
         examples = self._resolve_examples(question, labels, question_id, context.examples)
         parts = build_parts(context.state_messages, question, labels, examples, method=method)
         messages = assemble(parts, system=system_prompt(method))
+        # One key per question, stable across the states it is asked about: a provider routes requests
+        # that share a prefix by this key, and jevper's varying part is the state, never the rubric.
+        cache_key = context.prompt_cache_key or derived_cache_key(context.model, parts)
         native_reasoning: tuple[ReasoningContentPart, ...] = ()
         trace: str | None = None
         if context.mode == "two_step":
             analysis = assemble(parts, system=ANALYSIS_SYSTEM_PROMPT)
-            result = yield CallSpec(messages=analysis, reasoning=context.analysis_reasoning)
+            result = yield CallSpec(
+                messages=analysis, reasoning=context.analysis_reasoning, prompt_cache_key=cache_key
+            )
             native_reasoning = result.reasoning
             # A model that reasons without writing output leaves `text` empty; its reasoning items are
             # then the analysis. An empty assistant turn is never sent: several OpenAI-compatible
@@ -849,6 +901,7 @@ class _BaseClient:
                 top_logprobs=self.top_logprobs,
                 temperature=context.temperature,
                 reasoning=context.answer_reasoning,
+                prompt_cache_key=cache_key,
             )
             result = yield spec
             try:
@@ -1001,6 +1054,7 @@ class _BaseClient:
                 "structured": limits.structured,
                 "reasoning": limits.reasoning,
                 "include": limits.include,
+                "cache_key": limits.cache_key,
             }
         return SystemOneResponse(
             model=context.model,
@@ -1100,9 +1154,12 @@ class SystemOneClient(_BaseClient):
         api: Api | None = None,
         reasoning: ReasoningConfig | None = None,
         temperature: float | None = None,
+        prompt_cache_key: str | None = None,
     ) -> SystemOneResponse:
         start = time.perf_counter()
-        context, parsed = self._prepare(state, questions, examples, model, method, api, reasoning, temperature)
+        context, parsed = self._prepare(
+            state, questions, examples, model, method, api, reasoning, temperature, prompt_cache_key
+        )
         outcomes: dict[str, _QuestionOutcome] = {}
         failure: BaseException | None = None
         if len(parsed) == 1:
@@ -1223,9 +1280,12 @@ class AsyncSystemOneClient(_BaseClient):
         api: Api | None = None,
         reasoning: ReasoningConfig | None = None,
         temperature: float | None = None,
+        prompt_cache_key: str | None = None,
     ) -> SystemOneResponse:
         start = time.perf_counter()
-        context, parsed = self._prepare(state, questions, examples, model, method, api, reasoning, temperature)
+        context, parsed = self._prepare(
+            state, questions, examples, model, method, api, reasoning, temperature, prompt_cache_key
+        )
         semaphore = asyncio.Semaphore(self.max_concurrency)
 
         async def run(question_id: str, question: Question) -> _QuestionOutcome:

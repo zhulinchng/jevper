@@ -116,6 +116,77 @@ Three of these decide behaviour jevper implements rather than documents:
   carries the full distribution; `api="auto"` moves the label readout there, marks the surface, and later
   calls start where the distribution is.
 
+## Prompt caching
+
+Every one of these servers caches the prefix of a prompt and reuses it for the next request that starts the
+same way. None of them needs to be asked: prefix caching is on by default on all four (llama.cpp's
+`--cache-prompt`, vLLM's `enable_prefix_caching`, SGLang's RadixAttention, ollama's runner cache), and the
+request fields the hosted APIs use to steer it — `prompt_cache_key`, `prompt_cache_retention`, `cache_salt`,
+`session_id`, `prompt_cache_options`, `prompt_cache_breakpoint` — are accepted with `200` and ignored by all
+four. Sending one costs nothing; expecting it to do anything here does.
+
+What they do *not* agree on is telling you it happened:
+
+| | ollama 0.34.3 | llama.cpp b11139 | vLLM 0.30.1 | SGLang 0.5.20 |
+| --- | --- | --- | --- | --- |
+| `usage.prompt_tokens_details.cached_tokens` | always | always | needs `--enable-prompt-tokens-details` | needs `--enable-cache-report` |
+| `usage.input_tokens_details.cached_tokens` (Responses) | always | always | always | always |
+| other fields | `prompt_eval_cached_count` on native `/api/chat` | `timings.cache_n` (same number) | — | — |
+| cache inspection | — | `GET /slots` | `/metrics` (`vllm:prefix_cache_hits`) | `/metrics` (`sglang:cache_hit_rate`) |
+| cache flush | unload the model | `POST /slots/{id}?action=erase` | `/reset_prefix_cache` (dev mode) | `POST /flush_cache` |
+
+jevper reads both usage paths into `Usage.cached_tokens` and leaves it `None` when the server says nothing —
+which is why turning the flag on matters if you want to see the number on vLLM or SGLang. A server that
+reports a plain `0` is reporting a cold or disabled cache, and that is preserved as `0`.
+
+### Message order is what decides the reuse
+
+A cached prefix is reused up to the first token that differs, so the part of a jevper prompt that changes
+between calls — the state — has to come last for a rubric's calls to share anything. Measured on one 2388-token
+prompt (two examples, a ~1300-token state), second call differing only in the state:
+
+| Message order | ollama | llama.cpp | vLLM | SGLang |
+| --- | --- | --- | --- | --- |
+| `state, examples, question` (jevper ≤ 0.3.0) | 0 | 40 | 0 | — |
+| `examples, state, question` | 0 | 40 | 0 | 192 |
+| `examples, question, state` (jevper ≥ 0.4.0) | 0 | **1010** | **528** | **896** |
+| identical repeat of any of them | 2384 | 2384 | 2112 | 2368 |
+
+Latency agrees with the counts: only in the last row is the state-varied second call faster than the first
+(llama.cpp 1.04 s against 1.13 s, vLLM 0.85 s against 1.48 s, SGLang 0.46 s against 0.68 s). ollama reports the
+field but credited no part of a state-varied prefix here, though it reported the full 2384 for an identical
+repeat; its own cache is per loaded model runner, so `keep_alive` (native API only — its OpenAI route ignores
+the field) is what keeps it warm.
+
+Three of these servers also constrain *where* a system message can go: vLLM and SGLang answer
+`400 System message must be at the beginning.` when one follows a `user` turn, and llama.cpp's Qwen template
+*raises* the same sentence as a 500. jevper's own prompt always leads, so a chat-list state carrying a
+`system`/`developer` turn has that content folded into the system prompt instead of being sent late — the same
+request has to work on every server.
+
+Two consequences worth knowing:
+
+- **On a hosted API this is the difference between caching at all and not.** OpenAI's minimum cacheable prefix
+  is 1024 tokens, so a prompt that reuses only its system message never caches there; with the state last, a
+  prompt carrying a few examples crosses the threshold and the derived `prompt_cache_key` has something to
+  route.
+- **Two-step reasoning keys both passes alike.** The analysis and answer passes have different system prompts,
+  so they cannot share a cache entry, but `prompt_cache_key` puts them on the same machine, which is what
+  routing is for.
+
+### Isolating a cache
+
+`cache_salt` is the one cache field two of these servers do implement: vLLM and SGLang group reuse by salt, so
+requests with the same salt share cached prefixes and requests with different salts cannot see each other's.
+It is an isolation control, not a routing one, and jevper does not send it — pass it per deployment when
+tenants share a server:
+
+```python
+SystemOneClient(client, model="qwen3.5-9b", extra_body={"cache_salt": tenant_id})
+```
+
+vLLM caps the salt at 128 characters and rejects `@`, `/`, `\` and NUL; llama.cpp and ollama ignore the field.
+
 ## Sizing a 12 GB card
 
 A 9B model at 4-bit is 5.5-8.5 GB of weights, which leaves room for a small KV cache but not much else. What

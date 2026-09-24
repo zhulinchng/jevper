@@ -42,8 +42,8 @@ def test_choice_logprobs_distribution_and_confidence(stub_server):
     assert "max_tokens" not in sent and "max_completion_tokens" not in sent
     assert "stop" not in sent
     assert sent["messages"][0]["role"] == "system"
-    assert "I was charged twice this month" in sent["messages"][1]["content"]
-    assert "A: billing" in sent["messages"][-1]["content"]
+    assert "I was charged twice this month" in sent["messages"][-1]["content"]
+    assert "A: billing" in sent["messages"][-2]["content"]
 
 
 def test_noul_logprobs_has_no_confidence(stub_server):
@@ -55,7 +55,7 @@ def test_noul_logprobs_has_no_confidence(stub_server):
     answer = response.answers["yes"]
     assert answer.noul == pytest.approx(0.950263488, abs=1e-9)
     assert "confidence" not in answer.model_dump()
-    question = stub.bodies("/chat/completions")[0]["messages"][-1]["content"]
+    question = stub.bodies("/chat/completions")[0]["messages"][-2]["content"]
     assert "A: Yes" in question and "B: No" in question
 
 
