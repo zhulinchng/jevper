@@ -114,6 +114,7 @@ methods does not change your types; only the label alphabet differs (`logprobs` 
 single-letter labels, so they cap at 26 options).
 
 | Method | Request | Readout | Needs |
+| --- | --- | --- | --- |
 | `auto` (default) | `logprobs`, or `structured` where the provider cannot return logprobs | whichever method it resolved to | a provider that returns logprobs, or JSON-schema structured output |
 | `logprobs` | `logprobs=true, top_logprobs=20` | softmax over the labels' logprobs of the first answer token | a provider that returns chat logprobs, or the Responses surface with `include` logprobs. A surface that refuses the carrier hands the readout to the other OpenAI surface, method intact; with nowhere left to go, the refusal is reported |
 | `grammar` | the same plus a GBNF `grammar` in `extra_body` | same as `logprobs` | a Chat Completions server that accepts `grammar` (llama.cpp and friends) |
