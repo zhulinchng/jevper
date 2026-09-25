@@ -59,6 +59,32 @@ back the same way the blocking client returns them.
 missing — or answers without carrying logprobs through — it re-asks on Chat Completions and remembers the
 verdict. Passing `api="chat_completions"` skips the discovery entirely.
 
+### What a label readout costs on a wide question
+
+A `Choice` of 26 options is the widest a label readout can be asked for (past 26 the labels are two
+letters and `method="auto"` answers in JSON instead). At 26, a 4B model on vLLM or LM Studio answers the
+label prompt with prose — the first token came back as `no` — and jevper reports that as
+`LabelReadoutError` rather than reading a label out of a sentence, after the corrective retry has had its
+turn. SGLang answers the same 26-label question with a label and jevper reads all 26 probabilities from it,
+so this is the model, not the width. `method="structured"` is the safer method for a question that wide: it
+asks for a probability per option and reads the distribution, and a 26-option question answered that way
+came back with all 26 keys on SGLang and on OpenRouter. The same held for the score method wherever it was asked live: the reported `score` is exactly the
+expectation over the distribution the model reported (`{0: 0.1, 1: 0.9}` → `0.9`;
+`{2: 0.2, 3: 0.7, 4: 0.1}` → `2.9`), with `normalize_probabilities=False` so nothing was rescaled first.
+
+A `Noul` answer has the other half of the same contract: a number in `[0, 1]`, or nothing. ollama answered
+one probe `{"noul": 521304}` — a real generation, plainly out of range — and the caller was told
+`'noul' must be in [0, 1.0], got 521304.0` rather than handed a probability that is not one; the
+`discrete` form of the same question, asked immediately afterwards, answered `true`.
+
+### A cache key longer than OpenAI's cap
+
+`prompt_cache_key` is capped at 64 characters by OpenAI and by the OpenResponses schema, and jevper
+enforces 256 locally. None of these five servers refuses a longer one: vLLM answered with a 64-, a 72-
+and a 256-character key (one request each), and OpenRouter — which has no such cap to enforce — answered
+a 72-character key too. The field is the provider's to validate; jevper's own bound is there so a typo
+cannot become an unbounded string on the wire.
+
 ## Thinking is the one decision you must make
 
 `logprobs` and `grammar` read a **one-token answer**, and every one of these servers reports logprobs for
@@ -69,7 +95,7 @@ a whole reasoning pass to produce one JSON object, so turn it off for classifica
 
 | Server | Request field that turns it off | Also available |
 | --- | --- | --- |
-| ollama | `reasoning_effort: "none"` | `OLLAMA_CONTEXT_LENGTH`, per-model `think` on the native API |
+| ollama | `reasoning_effort: "none"` on Chat Completions; on the **Responses route** that field is ignored and `reasoning: {"effort": "none"}` is what turns it off — measured, with the wrong one the answers arrive carrying the trace and sometimes with no answer text at all | `OLLAMA_CONTEXT_LENGTH`, per-model `think` on the native API |
 | llama.cpp | `chat_template_kwargs: {"enable_thinking": false}` | `reasoning_effort: "none"` works too, since `--jinja` runs the model's own template; `reasoning_budget: 0`; `--reasoning-format deepseek` splits the trace into `reasoning_content` |
 | vLLM | `chat_template_kwargs: {"enable_thinking": false}` | `reasoning_effort` — but only with the values its parser accepts |
 | SGLang | `chat_template_kwargs: {"enable_thinking": false}` | `reasoning_effort` — but only with the values its parser accepts |
@@ -87,8 +113,10 @@ up to two trailing tokens that cannot be part of the answer are dropped before t
 
 Unknown fields are accepted and dropped by all five, so a field that does not apply is not an error:
 
-- `grammar` (jevper's `method="grammar"`) is a llama.cpp convention. ollama, vLLM and SGLang ignore it, so
-  the model answers unconstrained and the label readout reports a non-label first token instead of a grammar
+- `grammar` (jevper's `method="grammar"`) is a llama.cpp convention, and llama.cpp is the one server that
+  takes it: measured there, the GBNF label grammar is honoured and the readout returns a real distribution
+  (confidence above 0.9999 on a clean state). ollama, vLLM, SGLang and LM Studio ignore the field, so the
+  model answers unconstrained and the label readout reports a non-label first token instead of a grammar
   failure. Use `logprobs` or `structured` there.
 - `strict: true` inside `json_schema` is ignored by ollama and honoured by vLLM and SGLang.
 - `reasoning_effort` reaches the chat template on llama.cpp, ollama and SGLang; vLLM validates it against its
@@ -97,6 +125,12 @@ Unknown fields are accepted and dropped by all five, so a field that does not ap
   `max_tokens`.
 - `n` is rejected outright by llama.cpp (`1 <= value <= 1`); the others accept it, and vLLM and SGLang then
   return two choices where jevper reads the first.
+- A body field the caller's own types strictly is the caller's own business, and three of the five say so in
+  their own words about `extra_body={"stream": 0}`: llama.cpp answers `400 Field 'stream': type must be
+  boolean, but is number`, ollama `400 invalid stream value: json: cannot unmarshal number into Go value of
+  type bool`, LM Studio `400 Expected boolean, received number`. vLLM takes it, because its request model
+  coerces `0` to `false`. jevper refuses a truthy `stream` itself and reports those 400s as the caller's own
+  field being refused; omit the field, or send `false`.
 - A `developer` message is a `400` (`Unexpected message role.`) on SGLang, so keep `state` to
   `system`/`user`/`assistant` roles. jevper's own turns never use another role.
 - LM Studio's Responses route accepts `text.format` with a strict `json_schema` and **ignores it** — structured
@@ -194,6 +228,12 @@ asked for with `reasoning: {"effort": "none"}` and the logprob carrier with
 | unknown model id | `404` naming it | ignored, `200` | ignored, `200` | `404` naming it | `404`, `invalid_request_error`, `code: 404` |
 | `reasoning.encrypted_content` in `include` | 200 | 200 | 200 | 200 | 200 |
 | reasoning items | `summary` absent, `content: [{"type": "reasoning_text"}]` | the same, plus `status: "completed"` | not returned | `summary: []`, `content: [{"type": "reasoning_text"}]` | `summary` absent, `content: [{"type": "reasoning_text"}]` |
+
+Enforcing a schema is not the same as answering with it, and the difference is visible in the numbers: on
+SGLang's Responses route with `qwen3.5-9b`, the shape is enforced and the model answers a **uniform**
+distribution over the options — `{billing: 0.333…, technical: 0.333…, sales: 0.333…}` and therefore a
+`confidence` of 0.0 — measured identically in the 0.7.0 and 0.7.1 sweeps. jevper reports the distribution the
+model sent; the label readout, not the schema, is what puts a judgement in the answer.
 
 Three of these decide what jevper does rather than what it documents:
 
