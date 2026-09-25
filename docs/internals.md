@@ -19,7 +19,10 @@
 
 The dependency direction is one-way: `client → {methods, prompts, transport, types, normalize, labels,
 reasoning}`, `types → {errors, labels, reasoning}` and `labels → errors`. `labels.py` deliberately never
-imports `types.py` at runtime (it is duck-typed on `question.type`) so the graph stays acyclic.
+imports `types.py` at runtime (it is duck-typed on `question.type`) so the graph stays acyclic, and
+`types.validate_question` reaches `prompts` through one function-level import: an example's answer and its
+own numbers can only be checked against the question that carries it, and that check lives with the
+renderer. It runs after the module is loaded, so nothing changes for an importer.
 
 ## Call flow
 

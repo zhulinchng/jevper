@@ -167,10 +167,14 @@ Unknown fields are accepted and dropped by all five, so a field that does not ap
   The Messages route returns Anthropic-shaped `thinking` blocks when asked with an explicit
   `budget_tokens` (1542 characters of it here), and reports `cache_read_input_tokens`.
 - `top_logprobs: 20` — the documented maximum — is taken by all five and answered with twenty
-  alternatives for the answer token, so a label readout does not have to settle for five. `n: 2` is a
-  different story: vLLM and SGLang return two choices, ollama and LM Studio accept the field and answer
-  once, and llama.cpp refuses it outright when it is serving a single slot (`400 n must be between 1 <=
-  value <= 1`), which the recipe above does.
+  alternatives for the answer token, so a label readout does not have to settle for five. A
+  *smaller* `top_logprobs` can leave the labels out of the list altogether: ollama asked for 5 on
+  a five-option question and returned five alternatives, none of them a label, which jevper
+  reports as "none of which was an alternative among the options" rather than reading a label out
+  of a token that is not one. The default is 20 for exactly this reason. `n: 2` is a different
+  story: vLLM and SGLang return two choices, ollama and LM Studio accept the field and answer
+  once, and llama.cpp refuses it outright when it is serving a single slot (`400 n must be between
+  1 <= value <= 1`), which the recipe above does.
 
 ## What each server actually answers
 
@@ -181,7 +185,7 @@ tolerate, and the fixture tests replay them on every change.
 | | ollama 0.34.3 | llama.cpp b11139 | vLLM 0.30.1 | SGLang 0.5.20 |
 | --- | --- | --- | --- | --- |
 | `/v1/responses` route | yes | yes | yes | yes |
-| `/v1/messages` route | yes, since 0.14.0 | yes, since Nov 2025 | yes, since 0.12.0 | yes, since 0.5.9 |
+| `/v1/messages` route | yes, since 0.14.0 | yes, since Nov 2025 | yes, since 0.11.1 ([release notes](https://github.com/vllm-project/vllm/releases/tag/v0.11.1)) | yes, since 0.5.9 |
 | logprobs on Chat Completions | yes | yes | yes | yes |
 | logprobs on Responses | **empty list** | **`400`** | yes, with `include` | yes, with `top_logprobs` |
 | `top_logprobs` above 20 | `400` (`must be between 0 and 20`) | accepted | `400` | accepted |
@@ -366,6 +370,12 @@ answer to read and the call raises `IncompleteAnswerError` when the route also r
 (`stop_reason: "max_tokens"`), naming the limit to raise. Disable thinking per call, exactly as on the other
 surfaces: `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` — with that, every scenario on
 vLLM's Messages route answers, on both the non-thinking and the thinking model.
+
+ollama is the one server here whose Messages route does not take the OpenAI-style thinking-off field:
+`reasoning_effort: "none"` leaves the trace running there (2368 characters of it on one measured
+call), and a thinking model then spends jevper's 1024-token default before the answer begins, which
+is reported as `IncompleteAnswerError` naming the limit to raise. Answering there takes
+`extra_body={"max_tokens": 4096}` — the one knob that route reads.
 
 SGLang needs one more decision, on the server side. With `--reasoning-parser qwen3` and a *non-thinking*
 model — whose template has no `enable_thinking` to set, so the parser never sees the closing thinking marker

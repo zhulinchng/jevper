@@ -54,6 +54,17 @@ def render_content(value: JSONContent) -> str:
         return value
     try:
         return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+    except RecursionError as deep:
+        # CPython's encoder nests as it writes, so a structure past the interpreter's own limit
+        # has no encoding at all — and where that limit falls is a property of the runtime, not of
+        # the caller's data: the same state is refused on 3.12 and encoded on 3.14. The walk that
+        # validates it is iterative, so this is the first place the depth shows up. It is the
+        # caller's state and the caller's problem, reported as one, rather than a RecursionError
+        # escaping a public call.
+        raise JevperError(
+            "content is nested too deeply for this interpreter's JSON encoder, which is a property "
+            "of the runtime rather than of the content: flatten it, or hand the state over as text"
+        ) from deep
     except (TypeError, ValueError) as exc:
         raise JevperError(f"content must be JSON-serializable with finite numbers: {exc}") from exc
 

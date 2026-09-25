@@ -15,8 +15,9 @@ client object is duck-typed. Any object exposing `responses.create` or `chat.com
 including a self-hosted llama.cpp server.
 
 The `responses` surface speaks both OpenAI's Responses API and the [OpenResponses](https://www.openresponses.org)
-specification served at the same `/v1/responses` path — LM Studio (0.3.39+), llama.cpp, vLLM and SGLang all
-implement it, and what each one does with the fields jevper sends is measured in
+specification, and both live at the same `/v1/responses` path — LM Studio has implemented the
+OpenResponses dialect since 0.3.39, vLLM says its route "aligns with" it, and what each of the five
+local servers does with the fields jevper sends is measured in
 [docs/local-servers.md](docs/local-servers.md).
 
 ```python
@@ -302,7 +303,7 @@ unusable `state`, a `model` that is not a non-empty string, a count option that 
 
 | Error | Raised when |
 | --- | --- |
-| `InvalidQuestionError` | question or few-shot example is locally invalid |
+| `InvalidQuestionError` | question or few-shot example is locally invalid — including on the construction path, so one `except JevperError` covers a rubric written in Python and one loaded from data |
 | `UnsupportedMethodError` | `method="grammar"` on the Responses surface, or `method="logprobs"`/`"grammar"` on the Messages surface — that API has no logprobs at all |
 | `ClientCapabilityError` | the client lacks the attribute the chosen surface needs, or the response carried no choices and no explanation of why |
 | `LabelReadoutError` | the first answer token is not a label, or the provider returned no logprobs (or no alternatives, or no logprob for that token). The provider-side cases are not corrective-retried, and `method="auto"` answers them with `structured` |

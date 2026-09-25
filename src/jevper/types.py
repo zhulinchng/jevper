@@ -37,7 +37,33 @@ SCORE_MIN_LEVELS = 2
 SCORE_MAX_LEVELS = 10  # Jev API limit
 
 
-class Example(BaseModel):
+def _validation_message(exc: ValidationError) -> str:
+    """Every problem pydantic found, as ``field.path: what is wrong``."""
+    return "; ".join(
+        f"{'.'.join(str(part) for part in error['loc']) or 'body'}: {error['msg']}"
+        for error in exc.errors(include_url=False)
+    )
+
+
+class _CallerModel(BaseModel):
+    """A model the caller builds, so an invalid one fails as ``InvalidQuestionError``.
+
+    Pydantic's ``ValidationError`` is the right error for a pydantic model, but a caller of this
+    library catches ``JevperError`` — and these models are the library's own types, so what
+    pydantic rejects here is exactly what the library documents it rejects: a question that is
+    locally invalid. A question passed as a mapping already fails this way (``parse_question``),
+    so this is what makes the two documented paths — building a question, and handing one over
+    as data — fail alike, with the same fields named.
+    """
+
+    def __init__(self, **data: Any) -> None:
+        try:
+            super().__init__(**data)
+        except ValidationError as exc:
+            raise InvalidQuestionError(f"{type(self).__name__}: {_validation_message(exc)}") from None
+
+
+class Example(_CallerModel):
     """One few-shot demonstration, rendered as a user/assistant turn pair.
 
     ``answer`` is the option key (choice), the level index (score) or a bool (noul); a label such as
@@ -59,7 +85,7 @@ class NoulCriteria(BaseModel):
     false: JSONContent | None = None
 
 
-class Noul(BaseModel):
+class Noul(_CallerModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["noul"] = "noul"
@@ -78,8 +104,13 @@ class Noul(BaseModel):
                 )
         return value
 
+    @model_validator(mode="after")
+    def _check_question(self) -> Noul:
+        validate_question(self)
+        return self
 
-class Choice(BaseModel):
+
+class Choice(_CallerModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["choice"] = "choice"
@@ -93,7 +124,7 @@ class Choice(BaseModel):
         return self
 
 
-class Score(BaseModel):
+class Score(_CallerModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["score"] = "score"
@@ -202,6 +233,29 @@ def validate_question(question: Question, question_id: str | None = None) -> Non
         )
     except JevperError as exc:
         raise InvalidQuestionError(str(exc)) from None
+    _check_examples(question, where)
+
+
+def _check_examples(question: Question, where: str) -> None:
+    """The examples a question carries, checked against that question, wherever it was built.
+
+    An example's answer and its own numbers only mean something next to the question they
+    demonstrate, which is why the check needs both — and why it belongs here, where the
+    question is available however the caller spelled it. ``prompts`` imports this module, so the
+    helpers are imported here rather than at the top.
+    """
+    from .labels import labels_for
+    from .prompts import example_answer_label, validate_example_probabilities
+
+    count = 2 if question.type == "noul" else len(question.criteria)
+    labels = labels_for(count)
+    for index, example in enumerate(question.examples):
+        try:
+            example_answer_label(question, labels, example.answer, index)
+            if example.probabilities is not None:
+                validate_example_probabilities(question, example.probabilities, index)
+        except JevperError as exc:
+            raise InvalidQuestionError(f"{where}: {exc}") from None
 
 
 QuestionAdapter = TypeAdapter(Annotated[Noul | Choice | Score, Field(discriminator="type")])
@@ -220,12 +274,15 @@ def parse_question(question_id: str, raw: Question | Mapping[str, Any]) -> Quest
         return raw
     try:
         question = QuestionAdapter.validate_python(raw)
+    except InvalidQuestionError as exc:
+        # The question's own validators run inside the adapter, before this function can name the
+        # question it came from — and a service with a rubric of thirty questions needs to be told
+        # which one it is.
+        raise InvalidQuestionError(f"question {question_id!r} is invalid: {exc}") from None
     except ValidationError as exc:
-        problems = "; ".join(
-            f"{'.'.join(str(part) for part in error['loc']) or 'body'}: {error['msg']}"
-            for error in exc.errors(include_url=False)
-        )
-        raise InvalidQuestionError(f"question {question_id!r} is invalid: {problems}") from exc
+        raise InvalidQuestionError(
+            f"question {question_id!r} is invalid: {_validation_message(exc)}"
+        ) from exc
     validate_question(question, question_id)
     return question
 

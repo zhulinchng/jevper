@@ -6,7 +6,6 @@ import json
 
 import pytest
 from fakes import chat_body, openai_client
-from pydantic import ValidationError
 
 from jevper import (
     Choice,
@@ -172,12 +171,18 @@ def test_example_answers_are_validated_against_the_question(stub_server):
     stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
     client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
 
+    # A question built in Python is checked where it is built, and the same question handed
+    # over as data is checked on the way in: both refuse it, both name the example.
+    with pytest.raises(InvalidQuestionError) as error:
+        Choice(criteria=CRITERIA, examples=[Example(state="s", answer="nope")])
+    assert "example 0" in str(error.value)
+    assert "answer 'nope'" in str(error.value)
+
     with pytest.raises(InvalidQuestionError) as error:
         client.system_one(
             state="s",
-            questions={"q": Choice(criteria=CRITERIA, examples=[Example(state="s", answer="nope")])},
+            questions={"q": {"type": "choice", "criteria": CRITERIA, "examples": [{"state": "s", "answer": "nope"}]}},
         )
-
     assert "question 'q'" in str(error.value)
     assert "example 0" in str(error.value)
     assert "answer 'nope'" in str(error.value)
@@ -209,34 +214,54 @@ def test_example_answer_forms_resolve_to_labels(stub_server):
 
 def test_example_probabilities_must_match_the_question(stub_server):
     stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
-    client = SystemOneClient(
-        openai_client(stub), model="stub", method="structured", api="chat_completions"
-    )
 
     wrong_keys = Example(state="s", answer="billing", probabilities={"billing": 0.6, "sales": 0.4})
     with pytest.raises(InvalidQuestionError) as error:
-        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA, examples=[wrong_keys])})
+        Choice(criteria=CRITERIA, examples=[wrong_keys])
     assert "example 0" in str(error.value) and "must have exactly the keys" in str(error.value)
 
     negative = Example(
         state="s", answer="billing", probabilities={"billing": 1.2, "technical": -0.1, "sales": -0.1}
     )
     with pytest.raises(InvalidQuestionError) as error:
-        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA, examples=[negative])})
+        Choice(criteria=CRITERIA, examples=[negative])
     assert "must be >= 0" in str(error.value)
 
-    noul = Noul(examples=[Example(state="s", answer=True, probabilities={"yes": 0.9})])
     with pytest.raises(InvalidQuestionError) as error:
-        client.system_one(state="s", questions={"verdict": noul})
+        Noul(examples=[Example(state="s", answer=True, probabilities={"yes": 0.9})])
     assert "True or False key" in str(error.value)
 
     assert stub.requests == []
 
 
-def test_non_finite_example_probabilities_are_rejected_at_construction():
-    with pytest.raises(ValidationError):
+def test_example_probabilities_are_refused_by_a_question_handed_over_as_data(stub_server):
+    """The mapping path checks the same numbers, and names the question it arrived with."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions"
+    )
+
+    with pytest.raises(InvalidQuestionError) as error:
+        client.system_one(
+            state="s",
+            questions={
+                "verdict": {
+                    "type": "noul",
+                    "examples": [{"state": "s", "answer": True, "probabilities": {"yes": 0.9}}],
+                }
+            },
+        )
+
+    assert "question 'verdict'" in str(error.value)
+    assert "True or False key" in str(error.value)
+    assert stub.requests == []
+
+
+def test_non_finite_example_probabilities_are_refused_as_an_invalid_example():
+    with pytest.raises(InvalidQuestionError) as error:
         Example(state="s", answer="billing", probabilities={"billing": float("nan")})
-    with pytest.raises(ValidationError):
+    assert "finite" in str(error.value)
+    with pytest.raises(InvalidQuestionError):
         Example(state="s", answer=True, probabilities={True: float("inf")})
 
 
@@ -279,29 +304,27 @@ def test_examples_reach_both_two_step_passes(stub_server):
     assert answer["messages"][-2]["content"] == "analysis"
 
 
-def test_example_probabilities_are_validated_for_every_method(stub_server):
-    """Only structured renders the numbers, but a bad distribution fails before any request anyway."""
-    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
-    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+def test_example_probabilities_are_checked_whatever_the_method():
+    """Only ``structured`` renders the numbers, and the check does not wait to find that out.
 
+    The question is refused where it is built — before a method is resolved, before a prompt is
+    rendered, and before any client could spend a request on it.
+    """
     wrong_keys = Example(state="s", answer="billing", probabilities={"billing": 0.6, "sales": 0.4})
     with pytest.raises(InvalidQuestionError) as error:
-        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA, examples=[wrong_keys])})
+        Choice(criteria=CRITERIA, examples=[wrong_keys])
     assert "must have exactly the keys" in str(error.value)
 
     negative = Example(
         state="s", answer="billing", probabilities={"billing": 1.2, "technical": -0.1, "sales": -0.1}
     )
     with pytest.raises(InvalidQuestionError) as error:
-        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA, examples=[negative])})
+        Choice(criteria=CRITERIA, examples=[negative])
     assert "must be >= 0" in str(error.value)
 
-    out_of_range = Noul(examples=[Example(state="s", answer=True, probabilities={True: 1.4})])
     with pytest.raises(InvalidQuestionError) as error:
-        client.system_one(state="s", questions={"verdict": out_of_range})
+        Noul(examples=[Example(state="s", answer=True, probabilities={True: 1.4})])
     assert "noul probability must be in [0, 1]" in str(error.value)
-
-    assert stub.requests == []
 
 
 def test_example_answer_prefers_an_exact_key_over_a_label(stub_server):

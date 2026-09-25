@@ -631,6 +631,30 @@ def test_a_self_referential_state_is_refused_too(stub_server):
     assert stub.requests == []
 
 
+def test_a_state_nested_past_the_encoder_limit_is_reported_not_crashed(stub_server):
+    """CPython's encoder nests as it writes, and where it gives out differs by runtime.
+
+    The same 2000-level state is refused on 3.12 and encoded on 3.14, so a test that asserted an
+    answer would be testing the interpreter. What must hold everywhere is the contract: a state
+    that cannot be encoded is the caller's problem, reported as the library's own error, before a
+    request — never a ``RecursionError`` out of a public call.
+    """
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+    state: object = "leaf"
+    for _ in range(2000):
+        state = {"nested": state}
+    client = chat_client(stub)
+
+    try:
+        response = client.system_one(state=state, questions={"q": question()})
+    except JevperError as exc:
+        assert "too deeply" in str(exc)
+        assert stub.requests == []
+        return
+
+    assert response.answers["q"].type == "choice"
+
+
 def test_a_header_mapping_edited_after_construction_is_not_what_gets_sent(stub_server):
     """What was validated is what is sent: the client keeps a copy, so a later edit cannot slip past."""
     stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))

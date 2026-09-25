@@ -27,6 +27,7 @@ from jevper import (
     AsyncSystemOneClient,
     Choice,
     ClientCapabilityError,
+    Example,
     IncompleteAnswerError,
     InvalidQuestionError,
     JevperError,
@@ -108,6 +109,60 @@ def test_question_limits_are_enforced_at_construction():
     with pytest.raises(InvalidQuestionError) as error:
         Noul(criteria={"maybe": "unsure"})  # type: ignore[arg-type]
     assert "'true'/'false'" in str(error.value)
+
+
+def test_a_question_built_in_python_fails_as_an_invalid_question():
+    """The caller's error type is the library's, on the construction path as on the mapping one.
+
+    ``Choice`` and its siblings are the library's own types, and what pydantic rejects in them is
+    what the library documents it rejects. A service that catches ``JevperError`` around its
+    rubric has to be able to catch this one too, and the field that was wrong has to be named.
+    """
+    with pytest.raises(InvalidQuestionError) as error:
+        Choice(criteria=CRITERIA, weight=2)  # type: ignore[call-arg]
+    assert "weight" in str(error.value) and "Choice" in str(error.value)
+
+    with pytest.raises(InvalidQuestionError) as error:
+        Score(criteria={"not": "a list of levels"})  # type: ignore[arg-type]
+    assert "criteria" in str(error.value)
+
+    with pytest.raises(InvalidQuestionError) as error:
+        Noul(instructions=object())  # type: ignore[arg-type]
+    assert "instructions" in str(error.value)
+
+    with pytest.raises(InvalidQuestionError):
+        Example(state="s", answer="billing", probabilities={"billing": float("nan")})
+
+    # A JevperError, so one `except` covers a rubric built in Python and one loaded from data.
+    for build in (
+        lambda: Choice(criteria=CRITERIA, weight=2),  # type: ignore[call-arg]
+        lambda: Choice(criteria=CRITERIA, examples=[Example(state="s", answer="nope")]),
+        lambda: Noul(criteria={"maybe": "unsure"}),  # type: ignore[arg-type]
+    ):
+        with pytest.raises(JevperError):
+            build()
+
+
+def test_a_question_handed_over_as_data_names_the_question_it_came_from(stub_server):
+    """The same checks, reached through ``system_one``, and the id is the caller's own key."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    with pytest.raises(InvalidQuestionError) as error:
+        client.system_one(
+            state="s",
+            questions={
+                "intent": {
+                    "type": "choice",
+                    "criteria": CRITERIA,
+                    "examples": [{"state": "s", "answer": "billing", "probabilities": {"sales": 1.0}}],
+                }
+            },
+        )
+
+    assert "question 'intent'" in str(error.value)
+    assert "must have exactly the keys" in str(error.value)
+    assert stub.requests == []
 
 
 def test_label_readout_methods_stop_at_26_options(stub_server):

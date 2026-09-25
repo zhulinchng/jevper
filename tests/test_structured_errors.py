@@ -417,71 +417,49 @@ def test_a_truncation_error_names_the_surfaces_own_budget_field(stub_server, sur
 # --- an example's own distribution -----------------------------------------------------------------
 
 
-def test_probability_keys_that_collide_after_normalization_are_refused(stub_server):
+def test_probability_keys_that_collide_after_normalization_are_refused():
     """``{1: 0.9, "1": 0.1}`` are two keys in Python and one in JSON, so the demonstration would lie.
 
     The rendered assistant turn can only carry one number per option; picking either silently drops
-    the other, and the model is then shown a distribution its caller never wrote.
+    the other, and the model is then shown a distribution its caller never wrote. The question is
+    refused where it is built — before a prompt is rendered, and long before a request.
     """
-    stub = stub_server(chat=lambda _: (200, chat_body(content="{}")))
-    client = SystemOneClient(openai_client(stub), model="stub", method="structured")
-    question = Choice(
-        criteria={"1": None, "2": None},
-        examples=[
-            Example(state="s", answer="1", probabilities={1: 0.9, "1": 0.1, 2: 0.8})
-        ],
-    )
-
     with pytest.raises(InvalidQuestionError) as raised:
-        client.system_one(state=STATE, questions={"q": question})
+        Choice(
+            criteria={"1": None, "2": None},
+            examples=[Example(state="s", answer="1", probabilities={1: 0.9, "1": 0.1, 2: 0.8})],
+        )
 
     assert "use one spelling" in str(raised.value)
-    assert stub.requests == []
 
 
-def test_an_empty_noul_probability_mapping_is_refused(stub_server):
+def test_an_empty_noul_probability_mapping_is_refused():
     """A Noul example that carries no distribution renders a demonstration the renderer cannot read."""
-    stub = stub_server(chat=lambda _: (200, chat_body(content="{}")))
-    client = SystemOneClient(openai_client(stub), model="stub", method="structured")
-    question = Noul(examples=[Example(state="s", answer=True, probabilities={})])
-
     with pytest.raises(InvalidQuestionError) as raised:
-        client.system_one(state=STATE, questions={"q": question})
+        Noul(examples=[Example(state="s", answer=True, probabilities={})])
 
     assert "True or False key" in str(raised.value)
 
 
-def test_noul_keys_that_collide_after_normalization_are_refused(stub_server):
+def test_noul_keys_that_collide_after_normalization_are_refused():
     """``{True: 0.2, "true": 0.8}`` are two keys in Python and one answer, so one number would vanish."""
-    stub = stub_server(chat=lambda _: (200, chat_body(content="{}")))
-    client = SystemOneClient(openai_client(stub), model="stub", method="structured")
-    question = Noul(
-        examples=[Example(state="s", answer=True, probabilities={True: 0.2, "true": 0.8})]
-    )
-
     with pytest.raises(InvalidQuestionError) as raised:
-        client.system_one(state=STATE, questions={"q": question})
+        Noul(examples=[Example(state="s", answer=True, probabilities={True: 0.2, "true": 0.8})])
 
     assert "one spelling" in str(raised.value)
-    assert stub.requests == []
 
 
 @pytest.mark.parametrize("key", ["True", "FALSE", "yes", 2])
-def test_a_noul_key_the_renderer_cannot_find_is_refused(stub_server, key):
+def test_a_noul_key_the_renderer_cannot_find_is_refused(key):
     """Only the spellings the demonstration renderer looks up are answers: booleans, 0/1, 'true'/'false'.
 
     ``{"True": 0.9}`` used to pass validation and then raise a ``KeyError`` while the prompt was
     being rendered — after the questions ahead of it had already spent provider calls.
     """
-    stub = stub_server(chat=lambda _: (200, chat_body(content="{}")))
-    client = SystemOneClient(openai_client(stub), model="stub", method="structured")
-    question = Noul(examples=[Example(state="s", answer=True, probabilities={key: 0.9})])
-
     with pytest.raises(InvalidQuestionError) as raised:
-        client.system_one(state=STATE, questions={"q": question})
+        Noul(examples=[Example(state="s", answer=True, probabilities={key: 0.9})])
 
     assert "True or False key" in str(raised.value)
-    assert stub.requests == []
 
 
 @pytest.mark.parametrize(

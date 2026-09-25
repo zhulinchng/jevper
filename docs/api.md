@@ -24,11 +24,13 @@ Anthropic SDK's, pointed at any server that implements the Messages API); it sta
 (`close()` only shuts down jevper's own thread pool).
 
 The `responses` surface speaks both OpenAI's Responses API and the [OpenResponses](https://www.openresponses.org)
-specification, which LM Studio (0.3.39 and later), llama.cpp, vLLM and SGLang serve at the same
-`/v1/responses` path: every input turn carries the item `type` that spec's union requires, and the reader
-accepts its content parts, reasoning part types, per-item statuses and message phases alongside OpenAI's
-own shapes. What jevper does with the two dialects is measured per server in
-[local-servers.md](local-servers.md).
+specification, and both are served at the same `/v1/responses` path — LM Studio has implemented the
+OpenResponses dialect since 0.3.39 and vLLM says its route "aligns with" it, while the others serve
+OpenAI's own dialect at that path. So the request is the portable form both accept: every input turn
+carries the item `type` the spec's union requires, with its content as a plain string, which that union
+also allows. The reader answers in either dialect — OpenAI's own shapes and the spec's content parts,
+reasoning part types, per-item statuses and message phases alike. What each server does with the two is
+measured per server in [local-servers.md](local-servers.md).
 
 Two rules about the client object itself. A client with a retry loop of its own — the official SDKs retry
 twice by default — is used through a copy with that loop off, so `RetryPolicy` is the only retry loop and
@@ -176,9 +178,15 @@ Score(instructions=None, criteria=["level description"], examples=())
   rejected (`extra="forbid"`).
 - `examples` is a tuple of `Example` and is excluded from `model_dump()`, so dumps keep exactly the Jev wire
   keys `{"type", "instructions", "criteria"}`.
-- Validation runs on construction and again in `system_one`, so both paths fail identically. A mapping passed
-  as a question is parsed with a discriminated union; a malformed mapping raises `InvalidQuestionError` with
-  the field path of every problem.
+- A question is validated where it is built *and* again in `system_one`, and both paths fail the same
+  way: building one raises `InvalidQuestionError` — pydantic's own `ValidationError` is reported as the
+  library's error, with the offending field named — and a mapping handed to `system_one` is parsed with a
+  discriminated union and refused the same way, with the question id in the message. One `except
+  JevperError` around a rubric therefore covers a rubric written in Python and one loaded from data.
+- A question's own `examples` are checked against that question where the question is built: the answer
+  has to resolve to one of its options, and the probabilities have to carry exactly its keys. `examples`
+  passed to the constructor or to `system_one` have no question to be checked against until the call
+  pairs them with one, so those are checked there — still before any request.
 
 ```python
 Example(state=..., answer="billing" | "B" | 2 | True, probabilities={"billing": 0.6, ...} | None = None)
@@ -196,8 +204,7 @@ model is asked to imitate:
   (`"true"`/`"false"`) key for a `Noul` — a wrong key set raises `InvalidQuestionError` naming the example
   index, and so does a `Noul` mapping with no key at all, or two keys that name the same answer
   (`{1: 0.9, "1": 0.1}`), because the rendered demonstration can carry only one of them;
-- values must be finite (rejected by the `Example` model itself) and `>= 0`, and a `Noul` value must be in
-  `[0, 1]`.
+- values must be finite (refused by `Example` itself) and `>= 0`, and a `Noul` value must be in `[0, 1]`.
 
 A non-finite number or a non-JSON-serializable `state` is refused rather than rendered: `NaN`/`Infinity` are
 not valid JSON, so they would put an unparseable example in front of the model.
@@ -273,8 +280,12 @@ SGLang's `--enable-cache-report` for its Chat Completions route. See
 | `server_limits_by_api` | The same per-surface limits as `server_limits`, for a call whose questions used more than one surface. A limit is remembered per (model, surface): a refusal of a request field is usually about the model that earned it, so a second model on the same client is still sent the field it asked for |
 | `labels_missing` | Labels the provider did not report a logprob for, per question |
 
-Every key is always present — except `methods`, and `reasoning_modes` beside `apis`, which only a
-multi-surface call adds — and the last three are empty mappings when nothing applies. `request` holds the
+`method`, `api`, `reasoning_mode`, `llm_attempts`, `retry_reasons`, `probability_errors`,
+`original_probabilities` and `labels_missing` are always present, the last three as empty mappings
+when nothing applies. The rest are conditional and should be read with `.get()`: `methods` only for
+`method="auto"`; `apis`, `server_limits_by_api` and `reasoning_modes` only for a call answered on
+more than one surface; and `server_limits` only once a server has refused a capability field, so
+its absence means the server has refused nothing yet. `request` holds the
 kwargs sent to the provider — for a failed call, the kwargs that were about to be sent, so the shape is the
 same either way — `response` holds the provider object dumped with `model_dump(mode="json")` when available,
 `error` is a `"Type: message"` string, and `readout` is the parsed readout: `source`, `probabilities` (string

@@ -73,7 +73,7 @@ What lands on a span, all observed on real calls:
 
 | Attribute | Value |
 | --- | --- |
-| `mlflow.llm.model` | The model jevper sent |
+| `mlflow.llm.model` | The model the provider reported — on every server here the served name, which is the one jevper sent; a gateway or a stub that renames it is the exception, and the request's own `model` is in `mlflow.spanInputs` either way |
 | `mlflow.llm.provider` | `anthropic` on the Messages route (absent on the OpenAI routes) |
 | `mlflow.message.format` | `openai` or `anthropic` |
 | `mlflow.chat.tokenUsage` | `{"input_tokens", "output_tokens", "total_tokens"}`, plus `cache_read_input_tokens` on the Responses route. It is *absent* when the provider sent no `usage` at all, and holds `null` for each token when the provider sent a usage object with those fields missing — so a test asserting one of those shapes fails on the other |
