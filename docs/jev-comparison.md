@@ -130,6 +130,33 @@ step that renormalises a score distribution that arrived off 1 — moved no prob
 (`0.00e+00`). A noul carries no confidence on either side, matching the service, which documents
 that only Choice and Score answers have one.
 
+The service publishes its own contract: `https://api.typesafe.ai/openapi.json`, an OpenAPI 3.1
+document (`info.version` 0.2.0) that the server validates against, and the most authoritative source
+here — more so than the prose docs, and more so than the limits below, which are the server's runtime
+rules and are not in the schema at all. What it settles:
+
+| In the schema | What it says |
+| --- | --- |
+| `state` | a string, an object, or an array — the three shapes the table above measured |
+| `instructions` | a string, an object, or an array, on all three question types |
+| `ChoiceQuestion.criteria` | required, an object; a value may be a string, an object, an array, or `null` |
+| `ScoreQuestion.criteria` | required, an array, `minItems: 1` — no `maxItems` anywhere |
+| `NoulQuestion.criteria` | optional, `{"true": …, "false": …}`, each side nullable |
+| `SystemOneResponse` | `model`, `answers` and `usage` all required; `model` "may differ from the alias supplied in the request" |
+| `ModelMetadata` | all three of `name`, `description`, `release_date` required — jevper defaults the last two, so a terser gateway is still read |
+| Errors | only `200` and `422` are declared; the `400`s, `401` and `402` below are the runtime's own, and the 422 body is the pydantic `detail` list |
+
+Two consequences for jevper. The 255-option and 10-level limits are not in the schema, so a client
+built from it alone would send them and be rejected at the server — which is what `typesafe-sdk` does,
+and why jevper refuses them locally. And the schema's `minItems: 1` for a score rubric is why the
+service answers a single level while jevper, judging the answer degenerate, refuses to ask.
+
+One field the schema documents and jevper does not expose: the service's own `model` in the response
+names what answered, which for an alias like `jev-latest` is the concrete build. jevper reports the
+model the call asked for, on every surface including this one, because that is the one it validated
+and keyed its state on; the service's answer to the question "which build was that" is not on the
+wire jevper hands back.
+
 ## Where the two disagree about input
 
 jevper validates client-side and the service validates again on arrival, so the interesting column

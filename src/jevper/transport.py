@@ -1171,9 +1171,15 @@ def build_systemone_kwargs(
     ``openai`` client needs to hand back the parsed body rather than a model it expects to know the
     shape of, and ``path`` is passed by keyword so a duck client with the same three-parameter shape
     works unchanged.
+
+    The caller's ``extra_body`` is merged the way the other three surfaces merge it — its value is
+    the value on the wire — except for the two fields ``_caller_body`` refuses everywhere: a
+    ``model`` there would put a different model on the wire than the one this call reports, and a
+    ``stream`` would arrive as an event stream jevper has no way to read.
     """
     if spec.systemone is None:  # pragma: no cover - the System One runner always sets it
         raise ClientCapabilityError("a System One request needs a payload")
+    caller = _caller_body(extra_body, limits)
     body: dict[str, Any] = {
         "state": spec.systemone.state,
         "model": model,
@@ -1181,13 +1187,15 @@ def build_systemone_kwargs(
             question_id: question_on_wire(question)
             for question_id, question in spec.systemone.questions.items()
         },
+        **caller,
     }
-    if extra_body:
-        # The caller's own fields, merged the way the other surfaces merge them: its value is the
-        # value on the wire. The service ignores a field it does not know, so this is a way to send
-        # what a deployment in front of it understands.
-        body.update(extra_body)
-    return {"path": SYSTEMONE_PATH, "body": body, "cast_to": dict}
+    kwargs: dict[str, Any] = {"path": SYSTEMONE_PATH, "body": body, "cast_to": dict}
+    if extra_headers:
+        # A low-level ``post`` takes its headers in ``options``; an SDK method with a typed field
+        # for them is not the same method. Left out when there is nothing to send, so a duck client
+        # taking the three parameters still works unchanged.
+        kwargs["options"] = {"headers": dict(extra_headers)}
+    return kwargs
 
 
 def _systemone_result(response: Any, request: dict[str, Any]) -> CallResult:
@@ -1195,8 +1203,21 @@ def _systemone_result(response: Any, request: dict[str, Any]) -> CallResult:
 
     There is no text, no logprob list and no stop reason to read — the service returns decisions,
     not a generation — so those stay empty rather than carrying a value that would read as one.
+
+    A body that is not an object has not answered. The ``cast_to=dict`` the request asks for passes
+    a JSON string, list or number through unchanged, so a gateway that answers with one of those
+    would otherwise reach the answer reader as an empty body and be reported there as a malformed
+    answer — blaming the question instead of the route, and outside the retry that would have been
+    the right verdict. An event stream gets the stream reader, as on the other three surfaces.
     """
+    if isinstance(response, (str, bytes)):
+        raise _event_stream_failure(response, "System One")
     body = response if isinstance(response, Mapping) else _as_mapping(response)
+    if not body and not isinstance(response, Mapping):
+        raise ClientCapabilityError(
+            "the provider's System One response is not an object; the answers are read from one, "
+            f"got {type(response).__name__}"
+        )
     failure = _embedded_error(body)
     if failure is not None:
         raise failure
@@ -1477,6 +1498,31 @@ def select_surface(client: Any, api: str, method: Method) -> Surface:
     )
 
 
+def _models_get(client: Any, *, asynchronous: bool) -> Any:
+    """The client's ``get``, or why this client cannot list models.
+
+    The mismatch is decided from the callable rather than from what it returns, because the answer
+    comes back only after a request has been made: a blocking client asked from the async facade
+    would otherwise do the whole ``GET`` on the event loop and have its answer thrown away, and an
+    async client asked from the blocking one would hand an un-awaited coroutine to the model-list
+    reader, which would report the service's shape as wrong when the service was never asked. The
+    SDK's own retry loop is switched off here for the reason it is switched off everywhere else: the
+    caller's retry policy is the one that applies to a request jevper makes.
+    """
+    get = getattr(client, "get", None)
+    if not callable(get):
+        raise ClientCapabilityError(
+            "listing models needs a client with get(path, cast_to=...), which an OpenAI client has"
+        )
+    if asynchronous and not inspect.iscoroutinefunction(get):
+        raise ClientCapabilityError(
+            "this client answers synchronously; use SystemOneClient for it"
+        )
+    # Reached through the copy with the SDK's own retry loop switched off, so a 429 or a 5xx on this
+    # request is the caller's policy's decision rather than a second, invisible one.
+    return _without_sdk_retries(client).get
+
+
 def fetch_models(client: Any) -> Any:
     """``GET /v1/models`` through the same client object, returning the parsed body.
 
@@ -1484,37 +1530,29 @@ def fetch_models(client: Any) -> Any:
     needs ``get`` as well as ``post``: a caller who wants to know which models the deployment offers
     before naming one in ``model=`` should not have to leave jevper to ask.
     """
-    get = getattr(client, "get", None)
-    if not callable(get):
-        raise ClientCapabilityError(
-            "listing models needs a client with get(path, cast_to=...), which an OpenAI client has"
-        )
+    get = _models_get(client, asynchronous=False)
     try:
-        return get(path=MODELS_PATH, cast_to=dict)
+        result = get(path=MODELS_PATH, cast_to=dict)
     except Exception as exc:  # noqa: BLE001 - re-raised below, carrying the provider's own error
         raise _provider_error_from(exc) from None
+    if inspect.isawaitable(result):
+        # No request was made and the coroutine would otherwise be left un-awaited.
+        close = getattr(result, "close", None)
+        if callable(close):
+            close()
+        raise ClientCapabilityError(
+            "this client answers asynchronously; use AsyncSystemOneClient for it"
+        )
+    return result
 
 
 async def afetch_models(client: Any) -> Any:
     """``fetch_models`` for a client whose ``get`` is a coroutine function."""
-    get = getattr(client, "get", None)
-    if not inspect.iscoroutinefunction(get) and not callable(get):
-        raise ClientCapabilityError(
-            "listing models needs a client with get(path, cast_to=...), which an OpenAI client has"
-        )
+    get = _models_get(client, asynchronous=True)
     try:
-        result = get(path=MODELS_PATH, cast_to=dict)
-        if inspect.isawaitable(result):
-            result = await result
-        elif not inspect.iscoroutinefunction(get):
-            # A blocking client in the async facade, called without a request being made: the
-            # coroutine is never produced, so there is nothing to await and nothing to report.
-            raise ClientCapabilityError(
-                "this client answers synchronously; use SystemOneClient for it"
-            )
+        return await get(path=MODELS_PATH, cast_to=dict)
     except Exception as exc:  # noqa: BLE001 - re-raised below, carrying the provider's own error
         raise _provider_error_from(exc) from None
-    return result
 
 
 def make_transport(

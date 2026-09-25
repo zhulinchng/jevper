@@ -231,8 +231,13 @@ def question_on_wire(question: Question) -> dict[str, Any]:
     if criteria is None:
         return wire
     if isinstance(criteria, NoulCriteria):
-        wire["criteria"] = criteria.model_dump(exclude_none=True)
-    elif isinstance(criteria, Mapping):
+        sides = criteria.model_dump(exclude_none=True)
+        # An object with nothing in it says no more than leaving the key off, and the service's own
+        # answer to a noul with no criteria is the same 400 either way — so the key is left off.
+        if sides:
+            wire["criteria"] = sides
+        return wire
+    if isinstance(criteria, Mapping):
         wire["criteria"] = dict(criteria)
     else:
         wire["criteria"] = list(criteria)
@@ -441,13 +446,37 @@ def parse_answer(question_id: str, question: Question, payload: Any) -> Answer:
             f"{kind!r}"
         )
     if question.type == "score":
-        unknown = sorted(
-            str(key) for key in payload.get("probabilities", {}) if str(key) not in _level_texts(question)
-        )
+        levels = _level_texts(question)
+        raw = payload.get("probabilities", {})
+        if not isinstance(raw, Mapping):
+            # Read before pydantic gets it, so a null here is a jevper error naming the question
+            # rather than the ``TypeError`` an unguarded iteration of it would raise.
+            raise MalformedAnswerError(
+                f"question {question_id!r}: the service's score distribution must be an object of "
+                f"level probabilities, got {type(raw).__name__}"
+            )
+        unknown = sorted(str(key) for key in raw if str(key) not in levels)
         if unknown:
             raise MalformedAnswerError(
                 f"question {question_id!r}: the service answered with levels {unknown}, which are "
-                f"not this rubric's {_level_texts(question)}"
+                f"not this rubric's {sorted(levels)}"
+            )
+    if question.type == "choice":
+        # The same check the score branch makes, for the same reason: a choice naming an option the
+        # caller never offered is a decision about a question that was not asked, and the caller
+        # indexes their own criteria with it.
+        options = {str(option) for option in question.criteria}
+        probabilities = payload.get("probabilities")
+        unknown = sorted(
+            str(key)
+            for key in (probabilities if isinstance(probabilities, Mapping) else {})
+            if str(key) not in options
+        )
+        chosen = payload.get("choice")
+        if unknown or (chosen is not None and str(chosen) not in options):
+            raise MalformedAnswerError(
+                f"question {question_id!r}: the service answered with "
+                f"{unknown or [chosen]!r}, which are not this question's {sorted(options)}"
             )
     try:
         return _ANSWER_TYPES[kind].model_validate(payload)
@@ -486,10 +515,11 @@ def parse_models(payload: Any) -> list[ModelMetadata]:
     be a release date.
     """
     if not isinstance(payload, Mapping) or not isinstance(payload.get("models"), list):
+        # What arrived is the point of this message: the reader is deciding whether a gateway
+        # answered a different API, a proxy dropped a field, or the service is not what it claims.
         raise MalformedAnswerError(
             "the model list must be an object with a 'models' array, as GET /v1/models documents; "
-            f"got {type(payload).__name__}"
-            + ("" if isinstance(payload, Mapping) else f" {payload!r:.100}")
+            f"got {type(payload).__name__} {payload!r:.100}"
         )
     models: list[ModelMetadata] = []
     for index, entry in enumerate(payload["models"]):

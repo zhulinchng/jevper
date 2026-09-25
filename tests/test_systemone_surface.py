@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fakes import openai_client
+from fakes import async_openai_client, openai_client
 
 from jevper import (
     AsyncSystemOneClient,
@@ -33,12 +33,17 @@ from jevper import (
     ClientCapabilityError,
     Example,
     InvalidQuestionError,
+    JevperError,
     MalformedAnswerError,
     Noul,
+    NoulCriteria,
     ProviderError,
+    ReasoningConfig,
+    RetryPolicy,
     Score,
     SystemOneClient,
 )
+from jevper.types import parse_models
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "jev-1.13-free.json"
 STATE = "The invoice total does not match the amount I was charged."
@@ -568,3 +573,500 @@ def test_the_real_service_answers_through_this_surface():
     assert 0.0 <= response.answers["severity"].score <= 2.0
     assert response.usage.n_calls == 1
     assert response.usage.input_tokens and response.usage.input_tokens > 0
+
+
+# --- what the caller may not put in the request --------------------------------------------------
+#
+# The three prompt surfaces route the caller's own request fields through ``_caller_body``, which
+# refuses a ``model`` (it would put a different model on the wire than the one jevper reports) and a
+# ``stream`` (it would arrive as an event stream jevper cannot read). This surface carried the merge
+# without either refusal, so the whole contract the other three had was open on the fourth.
+
+
+@pytest.mark.parametrize(
+    "extra", [{"model": "someone-elses-model"}, {"stream": True}], ids=["model", "stream"]
+)
+def test_extra_body_cannot_replace_what_jevper_set(stub_server, extra):
+    """The body above the merge is the call; a caller's key that contradicts it is not sent."""
+    stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.5}}))
+
+    with pytest.raises(JevperError, match="extra_body"):
+        client_for(stub, extra_body=extra).system_one(state=STATE, questions={"n": NOUL})
+
+    assert stub.requests == []
+
+
+def test_extra_body_still_carries_a_field_of_the_callers_own(stub_server):
+    """What ``extra_body`` is for: a field a deployment in front of the service understands."""
+    stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.5}}))
+
+    client_for(stub, extra_body={"tenant": "acme"}).system_one(state=STATE, questions={"n": NOUL})
+
+    assert stub.requests[0]["tenant"] == "acme"
+    assert stub.requests[0]["model"] == MODEL
+
+
+def test_extra_headers_reach_the_system_one_request(stub_server):
+    """A low-level ``post`` takes its headers in ``options``, which the builder has to say.
+
+    Merged and then dropped is worse than not accepting them: the caller reads a header trace that
+    the deployment never received, and a gateway in front of the service never sees its tenant.
+    """
+    stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.5}}))
+
+    client_for(stub, extra_headers={"x-trace-id": "abc123"}).system_one(
+        state=STATE, questions={"n": NOUL}
+    )
+
+    assert stub.headers[0].get("x-trace-id") == "abc123"
+
+
+def test_no_options_key_when_there_are_no_headers():
+    """A duck client taking ``(path, body, cast_to)`` is the documented shape, so the key stays out."""
+    seen: list[dict[str, Any]] = []
+
+    class Duck:
+        def post(self, **kwargs: Any) -> dict[str, Any]:
+            seen.append(kwargs)
+            return systemone_body({"n": {"type": "noul", "noul": 0.5}})
+
+    SystemOneClient(Duck(), model=MODEL, api="systemone").system_one(
+        state=STATE, questions={"n": NOUL}
+    )
+
+    assert sorted(seen[0]) == ["body", "cast_to", "path"]
+
+
+# --- a body that is not an answer ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "body", ["boom", b"<html>oops</html>", [1, 2], 5, None], ids=["str", "bytes", "list", "int", "null"]
+)
+def test_a_response_that_is_not_an_object_is_a_provider_failure(stub_server, body):
+    """``cast_to=dict`` passes a JSON string, list or number through unchanged.
+
+    Read as an empty body it reached the answer reader, which reported a malformed answer for a
+    question that was never asked — blaming the question, outside the retry that the verdict the
+    route actually produced belongs to.
+    """
+    stub = stub_server(systemone=lambda _: (200, body))
+
+    with pytest.raises((ProviderError, ClientCapabilityError)) as raised:
+        client_for(stub).system_one(state=STATE, questions={"n": NOUL})
+
+    assert "malformed" not in str(raised.value).lower()
+
+
+def test_a_transient_failure_while_reading_the_answers_is_retried(stub_server):
+    """A 5xx here is the provider's own failure, so it is retried like one anywhere else."""
+    calls: list[int] = []
+
+    def handler(_: Any) -> tuple[int, Any]:
+        calls.append(1)
+        if len(calls) == 1:
+            return (503, {"error": {"message": "overloaded"}})
+        return (200, systemone_body({"n": {"type": "noul", "noul": 0.7}}))
+
+    stub = stub_server(systemone=handler)
+    client = client_for(stub, retry=RetryPolicy(n_retries=1, base_delay=0, max_delay=0))
+
+    response = client.system_one(state=STATE, questions={"n": NOUL})
+
+    assert response.answers["n"].noul == 0.7
+    assert response.usage.n_retries == 1
+    assert len(calls) == 2
+
+
+def test_a_score_answer_whose_distribution_is_null_is_a_jevper_error(stub_server):
+    """``probabilities: null`` reached the level check as ``None`` and raised ``TypeError``.
+
+    Every other malformed body on this path arrives as a ``MalformedAnswerError`` naming the
+    question; this one escaped the hierarchy entirely, so a caller catching ``JevperError`` for an
+    unusable service body did not catch it.
+    """
+    stub = stub_server(
+        systemone=answering(
+            {
+                "s": {
+                    "type": "score",
+                    "score": 1.0,
+                    "confidence": 0.5,
+                    "legend": {"0": "fine", "1": "broken"},
+                    "probabilities": None,
+                }
+            }
+        )
+    )
+
+    with pytest.raises(MalformedAnswerError, match="score distribution"):
+        client_for(stub).system_one(state=STATE, questions={"s": SCORE})
+
+
+def test_a_choice_answer_naming_an_option_the_question_never_offered(stub_server):
+    """A decision about an option that was not asked about, which the caller then indexes with."""
+    stub = stub_server(
+        systemone=answering(
+            {
+                "c": {
+                    "type": "choice",
+                    "choice": "ghost",
+                    "confidence": 0.9,
+                    "probabilities": {"ghost": 0.9},
+                }
+            }
+        )
+    )
+
+    with pytest.raises(MalformedAnswerError, match="not this question's"):
+        client_for(stub).system_one(state=STATE, questions={"c": CHOICE})
+
+
+def test_a_choice_answer_over_the_options_it_was_asked_about_is_kept(stub_server):
+    """The check that refuses an invented option must not refuse the ones the caller declared."""
+    stub = stub_server(
+        systemone=answering(
+            {
+                "c": {
+                    "type": "choice",
+                    "choice": "billing",
+                    "confidence": 0.6,
+                    "probabilities": {"billing": 0.6, "technical": 0.4},
+                }
+            }
+        )
+    )
+
+    response = client_for(stub).system_one(state=STATE, questions={"c": CHOICE})
+
+    assert response.answers["c"].choice == "billing"
+
+
+def test_a_noul_with_both_criteria_sides_unset_sends_no_criteria_object(stub_server):
+    """``criteria: {}`` says no more than leaving the key off.
+
+    The service's answer to a noul with no criteria is the same 400 either way, so the wire does not
+    carry an object that says nothing.
+    """
+    stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.5}}))
+    question = Noul(instructions="Do they disagree?", criteria=NoulCriteria())
+
+    client_for(stub).system_one(state=STATE, questions={"n": question})
+
+    assert "criteria" not in stub.requests[0]["questions"]["n"]
+
+
+# --- refusals that were not refusals --------------------------------------------------------------
+
+
+def test_a_method_pinned_on_the_constructor_is_refused_too(stub_server):
+    """Only the per-call value was checked, so a client built with ``method="logprobs"`` made a call
+    it cannot honour and reported the service's own method without a word about it."""
+    stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.5}}))
+
+    with pytest.raises(ClientCapabilityError, match="method='logprobs'"):
+        client_for(stub, method="logprobs").system_one(state=STATE, questions={"n": NOUL})
+
+    assert stub.requests == []
+
+
+def test_examples_for_another_question_do_not_refuse_the_call(stub_server):
+    """Resolved per question, the way the prompt surfaces resolve them.
+
+    An example set keyed to a question that is not in this call never reaches this wire, and refusing
+    the call over one leaves the caller no way to clear it but rebuilding the client.
+    """
+    stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.5}}))
+    examples = {"other": (Example(state="s", answer="a"),)}
+
+    response = client_for(stub, examples=examples).system_one(state=STATE, questions={"n": NOUL})
+
+    assert response.answers["n"].noul == 0.5
+
+
+def test_examples_that_would_reach_this_call_are_still_refused(stub_server):
+    """The narrower test above must not have widened the refusal: these keys do match a question."""
+    stub = stub_server(systemone=answering({}))
+
+    with pytest.raises(ClientCapabilityError, match="examples"):
+        client_for(stub, examples={"n": (Example(state="s", answer=True),)}).system_one(
+            state=STATE, questions={"n": NOUL}
+        )
+
+    assert stub.requests == []
+
+
+def test_a_failed_batch_attributes_its_trail_to_every_question(stub_server):
+    """Three questions, one request, three attempts: the error named only the first.
+
+    The request was asked for all three, so a trail that names one of them reads as though the other
+    two were never asked — which is the unattributed case ``_attempts_for`` exists to prevent.
+    """
+    stub = stub_server(systemone=lambda _: (503, {"error": {"message": "overloaded"}}))
+    client = client_for(stub, retry=RetryPolicy(n_retries=0))
+    questions = {name: NOUL for name in ("a", "b", "cc")}
+
+    with pytest.raises(ProviderError) as raised:
+        client.system_one(state=STATE, questions=questions)
+
+    assert len(raised.value.attempts) == 3
+    assert [record["question_id"] for record in raised.value.attempts] == ["a", "b", "cc"]
+
+
+# --- the model list ------------------------------------------------------------------------------
+
+MODELS = {"models": [{"name": "jev-1.13-free", "description": "General-purpose.", "release_date": "2026-09-15"}]}
+
+
+def test_the_model_list_error_names_what_arrived():
+    """``got dict`` names the type of the thing, not the thing.
+
+    The reader of this message is deciding whether a gateway answered a different API, a proxy
+    dropped a field, or the service is not what it says — and the payload is the whole of that.
+    """
+    with pytest.raises(MalformedAnswerError) as raised:
+        parse_models({"data": [{"id": "jev-1.13-free"}]})
+
+    assert "data" in str(raised.value)
+
+
+def test_a_provider_failure_while_listing_models_is_a_provider_error(stub_server):
+    """The SDK's own exception type does not escape a method documented to return a list.
+
+    ``system_one`` on the same client reports the identical 404 as a ``ProviderError`` with the
+    status; a caller wrapping both calls in one ``except ProviderError`` caught one of them.
+    """
+    stub = stub_server(models=(404, {"error": {"message": "no models here"}}))
+
+    with pytest.raises(ProviderError) as raised:
+        client_for(stub).list_models()
+
+    assert raised.value.status_code == 404
+
+
+def test_a_transient_failure_while_listing_models_is_retried(stub_server):
+    """It is jevper's request, so the caller's policy is the one that applies to it."""
+    stub = stub_server(models=(503, {"error": {"message": "overloaded"}}))
+    client = client_for(stub, retry=RetryPolicy(n_retries=1, base_delay=0, max_delay=0))
+
+    with pytest.raises(ProviderError) as raised:
+        client.list_models()
+
+    assert len(stub.paths) == 2
+    assert raised.value.status_code == 503
+
+
+def test_listing_models_leaves_the_sdks_own_retry_loop_off():
+    """Two SDK tries inside each of jevper's is nine requests for one call, none of them visible.
+
+    The SDK is switched off on a copy for every request jevper makes; this one used the caller's
+    client unchanged, so its retries ran on a schedule the caller could neither see nor change.
+    """
+
+    class Official:
+        def __init__(self) -> None:
+            self.copies: list[dict[str, Any]] = []
+
+        def with_options(self, **kwargs: Any) -> Official:
+            self.copies.append(kwargs)
+            return self
+
+        def get(self, *, path: str, cast_to: Any) -> dict[str, Any]:
+            return MODELS
+
+    client = Official()
+
+    models = SystemOneClient(client, model=MODEL).list_models()
+
+    assert [model.name for model in models] == ["jev-1.13-free"]
+    assert client.copies == [{"max_retries": 0}]
+
+
+def test_the_sync_client_refuses_an_async_client_before_the_request(stub_server):
+    """The un-awaited coroutine was handed to the model-list reader.
+
+    It reported the service's shape as wrong for a body the service never sent, and the coroutine
+    was abandoned with a warning nobody asked for.
+    """
+    stub = stub_server(models=(200, MODELS))
+    client = SystemOneClient(async_openai_client(stub), model=MODEL)
+
+    with pytest.raises(ClientCapabilityError, match="asynchronously"):
+        client.list_models()
+
+    assert stub.paths == []
+
+
+def test_the_async_twin_refuses_a_blocking_client_before_the_request(stub_server):
+    """The blocking ``get`` was called, the whole request spent on the event loop, and the parsed
+    answer then thrown away in favour of the error — which the check on the callable can raise first."""
+    stub = stub_server(models=(200, MODELS))
+    client = AsyncSystemOneClient(openai_client(stub), model=MODEL)
+
+    with pytest.raises(ClientCapabilityError, match="synchronously"):
+        asyncio.run(client.alist_models())
+
+    assert stub.paths == []
+
+
+def test_the_async_twin_retries_and_reads_the_model_list(stub_server):
+    """The same policy and the same schema on the async path."""
+    stub = stub_server(models=(503, {"error": {"message": "overloaded"}}))
+    client = AsyncSystemOneClient(
+        async_openai_client(stub), model=MODEL, retry=RetryPolicy(n_retries=1, base_delay=0, max_delay=0)
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        asyncio.run(client.alist_models())
+
+    assert raised.value.status_code == 503
+    assert len(stub.paths) == 2
+
+
+# --- what the constructor can refuse --------------------------------------------------------------
+#
+# Every refused option is consulted at both levels, because a client built with one of them makes
+# the same call a per-call value would. These are the constructor's four; `method` is above.
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({"temperature": 0.0}, "temperature="),
+        ({"reasoning": ReasoningConfig(effort="high")}, "reasoning="),
+        ({"prompt_cache_key": "k"}, "prompt_cache_key="),
+        ({"examples": (Example(state="s", answer="a"),)}, "examples="),
+    ],
+    ids=["temperature", "reasoning", "prompt_cache_key", "examples"],
+)
+def test_an_option_the_constructor_carries_is_refused_too(stub_server, kwargs, expected):
+    """A client that cannot honour it fails every call it makes, so the constructor is the right place
+    to be told — before the first request rather than on the first call."""
+    stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.5}}))
+
+    with pytest.raises(ClientCapabilityError, match=expected):
+        client_for(stub, **kwargs).system_one(state=STATE, questions={"n": NOUL})
+
+    assert stub.requests == []
+
+
+def test_every_refused_option_is_named_in_one_error(stub_server):
+    """One complaint, not one per attempt: the caller fixes the call in a single edit."""
+    stub = stub_server(systemone=answering({}))
+    client = client_for(
+        stub, temperature=0.0, prompt_cache_key="k", reasoning=ReasoningConfig(effort="high")
+    )
+
+    with pytest.raises(ClientCapabilityError) as raised:
+        client.system_one(state=STATE, questions={"n": NOUL})
+
+    message = str(raised.value)
+    assert "temperature=" in message and "reasoning=" in message and "prompt_cache_key=" in message
+
+
+def test_the_async_twin_refuses_what_the_blocking_one_refuses(stub_server):
+    """Same refusals, same order, before any request."""
+    stub = stub_server(systemone=answering({}))
+    client = AsyncSystemOneClient(
+        async_openai_client(stub), model=MODEL, api="systemone", temperature=0.0
+    )
+
+    with pytest.raises(ClientCapabilityError, match="temperature="):
+        asyncio.run(client.system_one(state=STATE, questions={"n": NOUL}))
+
+    assert stub.paths == []
+
+
+# --- answers that do not add up -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        ({"usage": {"input_tokens": 1, "output_tokens": 1}}, "no answer for it"),
+        ({"answers": {}, "usage": {}}, "answered"),
+        ({"answers": {"other": {"type": "noul", "noul": 0.5}}, "usage": {}}, "no answer for it"),
+    ],
+    ids=["no-answers-key", "empty-answers", "wrong-key"],
+)
+def test_a_response_that_does_not_answer_the_question_is_reported(stub_server, body, expected):
+    """A partial or miskeyed response is a failure naming the question, not a silent subset.
+
+    Every question in a batch came from one request, so an answer the caller cannot map back to a
+    question is a failed call rather than a response with fewer entries — that is the price of the
+    single request, and it is paid in an error rather than in a wrong answer.
+    """
+    stub = stub_server(systemone=lambda _: (200, body))
+
+    with pytest.raises(MalformedAnswerError, match=expected):
+        client_for(stub).system_one(state=STATE, questions={"n": NOUL})
+
+
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        ({"model": MODEL, "answers": {"n": {"type": "noul", "noul": 0.5}}}, (None, None)),
+        (
+            {"model": MODEL, "answers": {"n": {"type": "noul", "noul": 0.5}},
+             "usage": {"input_tokens": 7}},
+            (7, None),
+        ),
+        (
+            {
+                "model": MODEL,
+                "answers": {"n": {"type": "noul", "noul": 0.5}},
+                "usage": {"input_tokens": 7, "output_tokens": 3, "reasoning_tokens": 2},
+            },
+            (7, 3),
+        ),
+    ],
+    ids=["absent", "partial", "extra-field"],
+)
+def test_usage_is_read_as_it_arrives(stub_server, body, expected):
+    """A server that reports less than the full pair is not a failure, and one that reports more is
+    not truncated: the two counts jevper publishes are read as they arrived, and the rest is left to
+    the caller. The OpenAPI requires both, so these are gateway shapes rather than the service's."""
+    stub = stub_server(systemone=lambda _: (200, body))
+
+    response = client_for(stub).system_one(state=STATE, questions={"n": NOUL})
+
+    assert (response.usage.input_tokens, response.usage.output_tokens) == expected
+
+
+def test_a_batch_that_is_retried_counts_the_request_once(stub_server):
+    """A 429 then a 200: one request is two attempts, and the usage of the successful one is counted
+    once for the whole batch rather than once per question it answered."""
+    calls: list[int] = []
+
+    def handler(_: Any) -> tuple[int, Any]:
+        calls.append(1)
+        if len(calls) == 1:
+            return (429, {"error": {"message": "slow down"}})
+        return (
+            200,
+            systemone_body(
+                {
+                    "a": {"type": "noul", "noul": 0.6},
+                    "b": {"type": "noul", "noul": 0.4},
+                    "cc": {"type": "noul", "noul": 0.2},
+                }
+            ),
+        )
+
+    stub = stub_server(systemone=handler)
+    client = client_for(stub, retry=RetryPolicy(n_retries=1, base_delay=0, max_delay=0))
+    questions = {name: NOUL for name in ("a", "b", "cc")}
+
+    response = client.system_one(state=STATE, questions=questions)
+
+    assert response.usage.n_calls == 1
+    assert response.usage.n_retries == 1
+    assert response.usage.input_tokens == 40
+    assert response.usage.output_tokens == 12
+    for name in questions:
+        attempts = [
+            record
+            for record in response.debug["llm_attempts"]
+            if record["question_id"] == name
+        ]
+        assert len(attempts) == 2, name

@@ -12,7 +12,7 @@ import contextvars
 import math
 import threading
 import time
-from collections.abc import Generator, Iterable, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from datetime import timezone
@@ -69,6 +69,7 @@ from .transport import (
     Surface,
     Transport,
     _has_attribute,
+    _provider_error_from,
     afetch_models,
     fetch_models,
     make_transport,
@@ -1471,6 +1472,44 @@ class _BaseClient:
             status_code=_status_code(exc),
         )
 
+    def _models_failure(self, exc: BaseException, attempt: int) -> BaseException | None:
+        """The failure to report for a model-list request, or ``None`` to try it again.
+
+        A jevper error is already the verdict — a provider failure with the provider's own status,
+        or a capability refusal naming the caller's client, neither of which is the other and
+        neither of which repeating the request would change. Anything else is the SDK's exception
+        type, which is re-raised the way every other request jevper makes reports one: a
+        ``ProviderError`` carrying the status the provider gave.
+        """
+        failure = _provider_error_from(exc)
+        if isinstance(failure, JevperError):
+            if isinstance(failure, ProviderError):
+                failure.attempts = []
+            return failure
+        if _is_transient(failure) and attempt < self.retry.n_retries:
+            return None
+        return ProviderError(self._scrub(_describe(failure)), status_code=_status_code(failure))
+
+    def _fetch_models_retrying(self, fetch: Callable[[], Any]) -> Any:
+        """One model-list request under the caller's retry policy, or the provider's own failure.
+
+        This is jevper's request, so the policy that applies to it is the caller's and the SDK's own
+        loop is off (see ``transport.fetch_models``). It is not an evaluation, so there is no attempt
+        history to report — but a provider failure is still reported the way one is everywhere else,
+        as a ``ProviderError`` carrying the status, rather than as the SDK's own exception type
+        escaping a method documented to return a list.
+        """
+        attempt = 0
+        while True:
+            try:
+                return fetch()
+            except Exception as exc:  # noqa: BLE001 - re-raised below, carrying the provider's status
+                failure = self._models_failure(exc, attempt)
+                if failure is not None:
+                    raise failure from None
+                _sleep_before_retry(_retry_delay(self.retry, attempt, exc), self.retry)
+                attempt += 1
+
     def _question_method(self, question: Question, context: _CallContext) -> Method:
         """The method one question is answered with."""
         if not context.auto:
@@ -1535,7 +1574,6 @@ class _BaseClient:
                 examples,
                 effective_model,
                 requested,
-                method,
                 reasoning,
                 temperature,
                 prompt_cache_key,
@@ -1614,7 +1652,6 @@ class _BaseClient:
         examples: Examples,
         model: str,
         requested: Method,
-        method: Method | None,
         reasoning: ReasoningConfig | None,
         temperature: float | None,
         prompt_cache_key: str | None,
@@ -1636,11 +1673,19 @@ class _BaseClient:
                     "API answers 400 for one with neither"
                 )
         refused: list[str] = []
-        if method is not None and requested != "auto":
+        if requested != "auto":
             refused.append(f"method={requested!r} (the service picks its own method here)")
         if reasoning is not None or self.reasoning is not None:
             refused.append("reasoning= (this wire format has no thinking field)")
-        if examples or self.examples or any(question.examples for question in parsed.values()):
+        if any(
+            question.examples
+            or _pick_examples(examples, question_id)
+            or _pick_examples(self.examples, question_id)
+            for question_id, question in parsed.items()
+        ):
+            # Asked per question, the way ``_resolve_examples`` asks: an example set keyed to other
+            # questions never reaches this wire either, and refusing the call over one would leave
+            # the caller no way to clear it but rebuilding the client.
             refused.append("examples= (the System One request has no examples field)")
         effective_temperature = temperature if temperature is not None else self.temperature
         if effective_temperature is not None:
@@ -2093,16 +2138,26 @@ class SystemOneClient(_BaseClient):
         """Every question in one request, which is the shape the service is built for.
 
         Measured against the live endpoint on 2026-09-26: eleven questions came back from one request
-        in 1.08 s, where the per-question path spends a round trip each. This is the default there,
-        and the price is granularity — a transient failure re-asks the whole batch, and a missing or
-        mistyped answer fails the call rather than one question of it — which is what ``batch=False``
-        buys back. The usage comes back with the outcomes because they all share one request: counted
-        per question it would report N times what the service charged.
+        in 1.08 s, where the per-question path spends a round trip each. The price is granularity: a
+        transient failure re-asks the whole batch, and a missing or mistyped answer fails the call
+        rather than one question of it. The usage comes back with the outcomes because they all share
+        one request: counted per question it would report N times what the service charged.
         """
         log = _CallLog()
         question_ids = list(parsed)
         spec = _systemone_spec(state, parsed, question_ids)
-        result = self._call(log, question_ids[0], spec, context)
+        try:
+            result = self._call(log, question_ids[0], spec, context)
+        except Exception as exc:  # re-raised below, with the trail reattributed
+            # The request was asked for every question in the batch, so its failure is theirs: a
+            # trail naming only the first would read as though the rest were never asked.
+            if getattr(exc, "attempts", None):
+                exc.attempts = [
+                    record
+                    for question_id in question_ids
+                    for record in _attempts_for(log, question_id)
+                ]
+            raise
         totals = (log.tokens, log.n_calls, log.n_retries)
         outcomes = {
             question_id: _systemone_outcome(
@@ -2268,7 +2323,7 @@ class SystemOneClient(_BaseClient):
         "release_date"}]}`` — so a gateway that answers the path with its own list is reported as the
         wrong shape rather than half-read.
         """
-        return parse_models(fetch_models(self.client))
+        return parse_models(self._fetch_models_retrying(lambda: fetch_models(self.client)))
 
 
 class AsyncSystemOneClient(_BaseClient):
@@ -2352,7 +2407,16 @@ class AsyncSystemOneClient(_BaseClient):
         log = _CallLog()
         question_ids = list(parsed)
         spec = _systemone_spec(state, parsed, question_ids)
-        result = await self._call(log, question_ids[0], spec, context)
+        try:
+            result = await self._call(log, question_ids[0], spec, context)
+        except Exception as exc:  # re-raised below, with the trail reattributed
+            if getattr(exc, "attempts", None):
+                exc.attempts = [
+                    record
+                    for question_id in question_ids
+                    for record in _attempts_for(log, question_id)
+                ]
+            raise
         totals = (log.tokens, log.n_calls, log.n_retries)
         outcomes = {
             question_id: _systemone_outcome(
@@ -2417,9 +2481,29 @@ class AsyncSystemOneClient(_BaseClient):
             raise failure
         return self._assemble(context, parsed, outcomes, time.perf_counter() - start)
 
+    async def _afetch_models_retrying(self, fetch: Callable[[], Any]) -> Any:
+        """``_fetch_models_retrying`` for a coroutine request.
+
+        The wait between tries is handed to the executor rather than slept on the loop, so a retry
+        does not stall the tasks sharing it.
+        """
+        attempt = 0
+        while True:
+            try:
+                return await fetch()
+            except Exception as exc:  # noqa: BLE001 - re-raised below, carrying the provider's status
+                failure = self._models_failure(exc, attempt)
+                if failure is not None:
+                    raise failure from None
+                delay = _retry_delay(self.retry, attempt, exc)
+                await asyncio.get_running_loop().run_in_executor(
+                    None, _sleep_before_retry, delay, self.retry
+                )
+                attempt += 1
+
     async def alist_models(self) -> list[ModelMetadata]:
         """The async twin of ``list_models``; the same request, awaited."""
-        return parse_models(await afetch_models(self.client))
+        return parse_models(await self._afetch_models_retrying(lambda: afetch_models(self.client)))
 
     async def aclose(self) -> None:
         """The async client holds no resources of its own; the caller owns ``client``."""

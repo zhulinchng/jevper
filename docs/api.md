@@ -182,7 +182,12 @@ same client object and parsed as the service's own OpenAPI declares it —
 `{"models": [{"name", "description", "release_date"}]}`. A gateway answering that path with a list of
 its own is reported as the wrong shape rather than half-read. `ModelMetadata.description` defaults to
 `""` and `release_date` to `None` when the service omits them. `alist_models()` is the async twin.
-No `api=` is needed: the path is the service's, and the client is the caller's own.
+No `api=` is needed: the path is the service's, and the client is the caller's own. It is jevper's
+request, so it follows the `retry` policy and arrives as a `ProviderError` carrying the provider's
+status, exactly as `system_one` reports the same failure; a client whose `get` is a coroutine (or is
+not) is refused before the request, naming the class to use instead. The SDK's own retry loop is
+switched off for it, as it is for every other request jevper makes, so one call is one policy rather
+than two nested ones.
 
 ### `close()` / `aclose()`
 
