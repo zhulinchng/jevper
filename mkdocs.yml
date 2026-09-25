@@ -8,6 +8,10 @@ edit_uri: edit/main/docs/
 extra_css:
   - stylesheets/extra.css
 
+# The footer version is asserted against jevper.__version__ by tests/test_release_hygiene.py; see
+# the "Claims and releases" section of docs/contributing.md.
+copyright: "Copyright © 2026 Zhu Lin · jevper 0.7.4"
+
 theme:
   name: material
   palette:

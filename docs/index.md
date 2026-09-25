@@ -12,6 +12,10 @@ Python 3.10 or newer is required. Install the package from PyPI:
 pip install jevper
 ```
 
+This site documents jevper 0.7.4. `python -c "import jevper; print(jevper.__version__)"` says
+which release your environment has; a different number means the site is ahead of, or behind, what
+you installed.
+
 The only runtime dependency is `pydantic>=2.7`. You provide a client object; jevper does not read credentials or provider configuration from the environment.
 
 ## First call

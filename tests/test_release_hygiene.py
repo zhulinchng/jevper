@@ -69,3 +69,27 @@ def test_a_changed_library_is_not_still_the_published_version() -> None:
         f"{jevper.__version__}; bump it so the published package and this branch stop claiming to be "
         "the same release"
     )
+
+
+def test_the_site_states_the_release_it_documents() -> None:
+    """The site says which release it describes, and that is the release this branch is.
+
+    A reader who installed 0.7.3 cannot otherwise tell whether the page in front of them is the one
+    that still advises ``max_tokens`` on Chat Completions or the one that advises
+    ``max_completion_tokens`` — the prose reads the same either way, which is what let the 0.7.3
+    divergence pass review. The number appears twice, in the footer and on the landing page, and
+    both are checked here because a stale one is as misleading as none.
+    """
+    landing = (REPO / "docs" / "index.md").read_text()
+    config = (REPO / "mkdocs.yml").read_text()
+
+    stated = re.findall(r"jevper (\d+\.\d+\.\d+)", landing)
+    assert stated, "docs/index.md does not say which release it documents"
+    footer = re.search(r'^copyright: "[^"]*?jevper (\d+\.\d+\.\d+)"', config, re.MULTILINE)
+    assert footer is not None, "mkdocs.yml footer states no version"
+
+    for number in (*stated, footer.group(1)):
+        assert number == jevper.__version__, (
+            f"the site says jevper {number} but the package is {jevper.__version__}; the pages and "
+            "the installed library have to be the same release for either to be worth reading"
+        )
