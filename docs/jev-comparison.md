@@ -12,7 +12,7 @@ Where something could not be measured, it says so rather than guessing — see
 | Service | `POST https://opencode.ai/zen/v1/systemone`, the Jev endpoint opencode Zen serves |
 | Model | `jev-1.13-free`; the paid `jev-1.13` answered HTTP 402 on this account |
 | Reference client | `typesafe-sdk` 0.7.1 from PyPI, installed and read for the contract it encodes |
-| jevper | 0.7.4 on this branch, `.venv` (Python 3.14, openai 3.19.0) |
+| jevper | 0.7.5 on this branch, `.venv` (Python 3.14, openai 3.19.0) — the measurements below were taken on 0.7.4, before the System One surface existed |
 | Published docs | TypeSafe's API reference, confidence page, and the `jev-1.13` jaggedness page (reviewed 2026-09-17) |
 
 ## jevper can call this endpoint
@@ -163,7 +163,7 @@ jevper validates client-side and the service validates again on arrival, so the 
 is where the two sets of rules differ. `typesafe-sdk` 0.7.1 is the third column because it is the
 reference client, and it turns out to enforce almost nothing:
 
-| Input | Real service | typesafe-sdk 0.7.1 | jevper 0.7.4 |
+| Input | Real service | typesafe-sdk 0.7.1 | jevper 0.7.5 |
 | --- | --- | --- | --- |
 | 255 options | accepted | accepted | accepted |
 | 256 options | 400 `Too many choices. Must have at most 255 choices.` | accepted, fails at the server | rejected at construction, naming 255 as the Jev limit |
