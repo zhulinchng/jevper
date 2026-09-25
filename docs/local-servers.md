@@ -125,6 +125,37 @@ That anchor is deliberately strict — anything else is reported rather than gue
 vLLM and SGLang append their own end-of-turn token (`<|im_end|>`) to the logprob stream after the answer, so
 up to two trailing tokens that cannot be part of the answer are dropped before the tail is tested.
 
+## Re-verified on 2026-09-26
+
+A second run over the same box, after the System One surface landed, to check that nothing about the
+prompt surfaces had moved. Ollama 0.34.3 with `qwen3.5:9b` and llama.cpp with
+`Qwen_Qwen3.5-9B-Q4_K_M.gguf`, driven through jevper's public API with a three-question call (a noul, a
+choice, a score), the method matrix, four `state` shapes, a 30-option choice with non-ASCII labels,
+examples, async parity, and the refusals:
+
+| Check | Ollama 0.34.3 | llama.cpp |
+| --- | --- | --- |
+| `api="auto"` | probes the Responses route, answers on Chat Completions: `method=logprobs`, 6 calls for 3 questions | — (probe aborted, see below) |
+| `api="chat_completions"` | `method=logprobs`, **3 calls for 3 questions**, 387 input tokens, all three answers correct | `method=logprobs`, 3 calls, all three correct |
+| `api="responses"` | answers with `method=structured` — consistent with the empty logprob list in the table below | — |
+
+The `api="auto"` cost is the documented one: ollama serves `/v1/responses` but its logprob list comes
+back empty there, so the ladder probes it, finds no distribution to read, and moves to Chat
+Completions. Six requests for three questions is three answers plus three probes, and the probes are
+in `debug["llm_attempts"]`; `usage.n_calls` counts the results, not the wire.
+
+One harness fact worth writing down, because it is a readiness trap rather than a jevper behaviour:
+**llama.cpp answers `GET /v1/models` with 200 while it is still loading weights**, and the completion
+that follows is `503 {"error": {"message": "Loading model", "type": "unavailable_error", "code": 503}}`.
+jevper reads that as a retryable `ProviderError` and the call succeeds on a later attempt — but a
+sweep that waits on `/v1/models` to decide the server is up will start a run against a server that is
+not serving yet. Wait on a real completion instead.
+
+Not covered by this run: vLLM and SGLang (the sweep was still on the GPU queue when the notes were
+written) and LM Studio (the only 27B model on the test machine was refused by LM Studio's own resource
+guardrail — "insufficient system resources" on a 32 GB laptop — so that row still rests on the
+2026-09-25 measurement above).
+
 ## What each server ignores, and what it rejects
 
 Unknown fields are accepted and dropped by all five, so a field that does not apply is not an error:
