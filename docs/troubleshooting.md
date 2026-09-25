@@ -8,6 +8,9 @@ What went wrong, what it cost, and what to change. Errors raised by jevper inher
 [API reference](api.md#errors) defines each error precisely, and
 [local-servers.md](local-servers.md) measures what each server does with the fields jevper sends.
 
+[Architecture](architecture.md#when-a-server-refuses-a-field) explains the decisions behind the
+refusals below: what jevper drops, in what order, and what it remembers.
+
 ## Start with the debug record
 
 For provider attempts, the request that produced the failure is in the response's `debug` or on the

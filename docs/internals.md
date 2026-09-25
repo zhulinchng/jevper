@@ -2,6 +2,9 @@
 
 *Independent implementation of the documented System One wire format — not affiliated with TypeSafe.*
 
+[Architecture](architecture.md) is the map of the layers and the decisions; this page is what is
+behind them.
+
 ## Module map
 
 | Module | Responsibility |

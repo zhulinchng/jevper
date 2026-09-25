@@ -9,6 +9,9 @@ label machinery: options are labelled `A`, `B`, `C`, … in criteria order, and 
 to the option key (`Choice`), the zero-based level index (`Score`) or `True`/`False` (`Noul`). Switching
 methods never changes your question or answer types — only the request body and the readout.
 
+For how a method fits into the layers around it — prompt, transport, surface — see
+[Architecture](architecture.md#two-decisions-made-once-per-call).
+
 Labels are single letters while a question has 26 options or fewer. Past that they become two letters (`AA`,
 `AB`, … `ZZ`), which only `structured` and `discrete` can use: they answer in JSON, where a label is just a
 string. `logprobs` and `grammar` read the label *token*, and the first token of `"AA"` is `"A"`, so they raise

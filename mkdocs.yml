@@ -67,6 +67,7 @@ nav:
   - Home: index.md
   - Getting started: getting-started.md
   - Complete example: complete-example.md
+  - Architecture: architecture.md
   - Guides:
       - Methods: methods.md
       - Reasoning: reasoning.md
@@ -77,4 +78,5 @@ nav:
   - Reference:
       - API: api.md
       - Internals: internals.md
+      - Glossary: glossary.md
   - Contributing: contributing.md

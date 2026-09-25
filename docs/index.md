@@ -48,6 +48,7 @@ print(answer.choice, answer.probabilities, answer.confidence)
 | --- | --- |
 | Install jevper and make the first sync or async call | [Getting started](getting-started.md) |
 | See every public option set at once, with a program that runs | [Complete example](complete-example.md) |
+| Understand how a call is built, and what each layer owns | [Architecture](architecture.md) |
 | Choose `logprobs`, `grammar`, `structured`, or `discrete` | [Methods](methods.md) |
 | Configure a local OpenAI-compatible server | [Local servers](local-servers.md) |
 | Inspect the complete public API and error contract | [API reference](api.md) |
@@ -56,6 +57,7 @@ print(answer.choice, answer.probabilities, answer.confidence)
 | Understand call flow, concurrency, retries, and tests | [Internals](internals.md) |
 | Trace calls or host jevper with MLflow | [MLflow](mlflow.md) |
 | Work out why a call failed and what to change | [Troubleshooting](troubleshooting.md) |
+| Look up what a term in the docs means | [Glossary](glossary.md)
 
 ## How a call is selected
 
