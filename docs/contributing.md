@@ -21,3 +21,16 @@ The documentation source lives in `docs/`. The generated `site/` directory is ig
    ```
 
 Open the local URL printed by MkDocs. The build must pass before a documentation change is submitted. For a focused change, update only the page that owns the information; keep the public API, provider caveats, and Mermaid examples in their existing canonical pages.
+
+## Claims and releases
+
+A sentence about what jevper sends, reads or raises is a claim about `src/jevper`, and the test that
+pins it is the proof: `ruff check src tests` and the suite run offline, so a claim that no test
+backs is a claim nothing will catch drifting. A sentence about a *released* version is a claim about
+that tag, not about the branch — read it with `git show v<version>:src/jevper/<module>.py` and say
+which one you read.
+
+Any change under `src/` changes the library, so it needs a version bump: a branch whose `src/` has
+moved since the last release tag must not carry that tag's number, or the documentation and
+`pip install jevper==<version>` describe different libraries. `tests/test_release_hygiene.py` fails
+the build when it does.
