@@ -1482,9 +1482,20 @@ class _BaseClient:
         ``ProviderError`` carrying the status the provider gave.
         """
         failure = _provider_error_from(exc)
+        if isinstance(failure, ProviderError):
+            failure.attempts = []
+            # Scrubbed the way ``_call_failure`` scrubs it: a provider can quote the credential it
+            # rejected, and this message is what every log line downstream will carry.
+            scrubbed = self._scrub(str(failure))
+            if scrubbed != str(failure) and type(failure) is ProviderError:
+                return ProviderError(
+                    scrubbed,
+                    status_code=failure.status_code,
+                    embedded=failure.embedded,
+                )
+            return failure
         if isinstance(failure, JevperError):
-            if isinstance(failure, ProviderError):
-                failure.attempts = []
+            # A capability verdict is about the caller's client, not the provider's answer.
             return failure
         if _is_transient(failure) and attempt < self.retry.n_retries:
             return None

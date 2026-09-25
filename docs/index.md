@@ -12,7 +12,7 @@ Python 3.10 or newer is required. Install the package from PyPI:
 pip install jevper
 ```
 
-This site documents jevper 0.7.5. `python -c "import jevper; print(jevper.__version__)"` says
+This site documents jevper 0.7.6. `python -c "import jevper; print(jevper.__version__)"` says
 which release your environment has; a different number means the site is ahead of, or behind, what
 you installed.
 

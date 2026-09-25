@@ -1070,3 +1070,25 @@ def test_a_batch_that_is_retried_counts_the_request_once(stub_server):
             if record["question_id"] == name
         ]
         assert len(attempts) == 2, name
+
+
+def test_a_credential_quoted_back_by_the_provider_is_scrubbed_while_listing_models():
+    """A provider can quote the credential it rejected, and this message goes to every log line.
+
+    The evaluation path scrubs it (``_call_failure``); the model-list path is jevper's request too,
+    so it carries the same guarantee rather than the one it started with.
+    """
+    secret = "sk-do-not-log-me"
+
+    class Quoting:
+        def get(self, *, path: str, cast_to: Any) -> Any:
+            raise ProviderError(f"upstream rejected the credential {secret}", status_code=401)
+
+    client = SystemOneClient(Quoting(), model=MODEL, extra_headers={"x-tenant-token": secret})
+
+    with pytest.raises(ProviderError) as raised:
+        client.list_models()
+
+    assert secret not in str(raised.value)
+    assert "<redacted>" in str(raised.value)
+    assert raised.value.status_code == 401
