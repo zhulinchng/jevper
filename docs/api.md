@@ -52,7 +52,10 @@ refuses a blocking one, before any request, naming the class to use instead.
 | `temperature` | `None` | Not sent unless set. `0.0` is recommended for `structured`/`discrete`; `logprobs` needs no setting. Left out of a Messages request that enables `thinking`, which the API refuses alongside a non-default temperature |
 | `prompt_cache_key` | `None` | The provider's cache-routing key. Unset, jevper derives one per question from the parts of the prompt that do not change between calls, so a rubric's requests are routed together; set it to group (or account for) requests your own way |
 | `extra_body` | `None` | Merged into every request body (the grammar field is merged here too). A key it names is the value that reaches the wire — the SDK merges `extra_body` *after* the typed parameters — so jevper leaves that field alone rather than sending a typed value the caller's own key would override. `response_format`/`text`/`output_config` named here therefore also puts the JSON Schema in the prompt, since no schema of jevper's is in the request. On the Messages surface, `max_tokens` comes from here — jevper always sends one there, defaulting to `DEFAULT_MAX_TOKENS` (1024), or 1024 plus `ReasoningConfig(budget_tokens=…)`; a `max_tokens` that cannot hold the thinking budget asked for raises `JevperError` locally, naming both numbers, rather than earning the API's own refusal. Every other key travels on all three surfaces, whether or not a temperature was set |
-| `extra_headers` | `None` | Sent with every request. A name spelled differently from the client's own (`authorization` against the SDK's `Authorization`) is renamed to the client's spelling, so it replaces the default header instead of joining it on the wire |
+| `extra_headers` | `None` | Sent with every request. A name spelled differently from the client's own (`authorization` against the SDK's `Authorization`) is renamed to the client's spelling, so it replaces the default header instead of joining it on the wire. Names and values must be what a header can carry — an HTTP token name and a printable-ASCII value, horizontal tabs allowed — and a name or value that is not is refused here, not by the SDK's encoder from inside the request |
+
+OpenAI and the OpenResponses schema cap `prompt_cache_key` at 64 characters, so a longer key is the
+server's to refuse; OpenRouter does not (measured 2026-09-25: a 72-character key answered normally).
 
 Two `extra_body` keys are refused outright, before any request: `model` (the wire model would disagree with
 the cache key, the learned verdicts and the public response — pass `model=` to the constructor or to
@@ -70,7 +73,16 @@ Text that cannot be encoded as UTF-8 is refused the same way, with the field nam
 which JSON can carry as a `\udXXX` escape, and which Python's `json` module decodes into a string no
 encoder accepts — in the `state`, a question's instructions or option keys, `prompt_cache_key`,
 `extra_body` or the model id raises before any request, rather than from inside the SDK's serializer where
-the only description on offer would be a provider failure.
+the only description on offer would be a provider failure. A header value is held to the stricter rule the
+SDKs impose on it: the official clients encode headers as ASCII, so a value that is not printable ASCII (or
+a horizontal tab) — a newline, a NUL, a `é`, a surrogate — is refused with the header named, and so is a name
+that is not an HTTP token. A CRLF in a value is the one that could otherwise become a second header on a
+client that forwards it.
+
+The default `prompt_cache_key` is a stable digest: the model, the method, the few-shot examples and the
+question block, and nothing about the state. The same rubric therefore sends the same key on every call —
+which is the point, and also means the key is a fingerprint of that material at the provider. Pass your own
+key when the examples or the question text are sensitive and that link is not wanted.
 
 ### `system_one`
 
@@ -244,7 +256,6 @@ leaves it `None`, which is not the same as a reported `0` — that is a server w
 off. Not every server reports it at all, and two need a flag to: vLLM's `--enable-prompt-tokens-details` and
 SGLang's `--enable-cache-report` for its Chat Completions route. See
 [local-servers.md](local-servers.md#prompt-caching).
-
 ### `debug`
 
 | Key | Content |
@@ -253,22 +264,39 @@ SGLang's `--enable-cache-report` for its Chat Completions route. See
 | `methods` | `{question_id: method}` — only for `method="auto"`, since the method is then chosen per question |
 | `api` | Surface actually used (`"chat_completions"`, `"responses"` or `"messages"`) |
 | `apis` | Only when the questions were answered on more than one surface — which concurrent questions on a shared context can arrange, one worker's 404 moving the client while another is still answering: `{question_id: surface}`. `api` is the surface the call ended on |
-| `reasoning_mode` | `"off"`, `"native"` or `"two_step"` |
+| `reasoning_mode` | `"off"`, `"native"` or `"two_step"` — the mode of the surface the call ended on; a call answered on more than one surface also gets `reasoning_modes`, `{question_id: mode}`, derived from each question's own last attempt the way `apis` is |
 | `llm_attempts` | One record per provider call: `question_id`, `surface`, `request`, `response`, `error`, `readout` |
 | `retry_reasons` | Corrective-retry messages, in order |
 | `probability_errors` | `{question_id: abs(sum − 1)}` for `structured` distributions outside `1e-6` |
 | `original_probabilities` | The model's raw distribution, only for questions that were rescaled |
 | `server_limits` | Only when the server refused a capability field: `structured` (`"schema"`/`"object"`/`"none"`), `output_config` (the Messages API's schema field), `reasoning`, `include`, `cache_key` and `thinking` as it last accepted them |
-| `server_limits_by_api` | The same per-surface limits as `server_limits`, for a call whose questions used more than one surface |
+| `server_limits_by_api` | The same per-surface limits as `server_limits`, for a call whose questions used more than one surface. A limit is remembered per (model, surface): a refusal of a request field is usually about the model that earned it, so a second model on the same client is still sent the field it asked for |
 | `labels_missing` | Labels the provider did not report a logprob for, per question |
 
-Every key is always present — except `methods`, which only `method="auto"` adds — and the last three are empty
-mappings when nothing applies. `request` holds the exact
+Every key is always present — except `methods`, and `reasoning_modes` beside `apis`, which only a
+multi-surface call adds — and the last three are empty mappings when nothing applies. `request` holds the
 kwargs sent to the provider — for a failed call, the kwargs that were about to be sent, so the shape is the
 same either way — `response` holds the provider object dumped with `model_dump(mode="json")` when available,
 `error` is a `"Type: message"` string, and `readout` is the parsed readout: `source`, `probabilities` (string
 keys), `missing_labels` and `observed_text`. `debug["llm_attempts"][-1]["readout"]` is set for the attempt
-that produced the final answer.
+that produced the final answer. `ProviderError.attempts` is the same list of records.
+
+The record is debugging evidence, not a data channel, and it is held to three rules so that logging a
+response can neither leak a credential nor fail to serialize:
+
+- A header whose name carries a credential — `authorization`, or anything with `token`, `api-key`, `secret`,
+  `cookie`, `credential`, `password` or `signature` in it — is recorded as `<redacted>`, name kept, value
+  dropped. The wire is untouched: this is the record, not the request. The same applies to
+  `ProviderError.attempts`, and the client's own auth headers are never recorded at all when the caller
+  passed no `extra_headers`.
+- Every string is escaped to printable UTF-8 (a lone surrogate is shown as the escape the wire carried) and
+  bounded to 64 KiB, with the length it had noted; mappings are walked 24 levels deep and anything deeper
+  is replaced by a marker. A provider object that cannot be dumped at all is recorded as
+  `{"undumpable": "<Type could not be dumped for debug>"}` rather than kept as the object itself, which
+  `model_dump_json()` would then have to serialize.
+- Provider text quoted in an error is bounded the same way: an `error` carried in a `200`, a status failure's
+  detail and an exception's own message all pass through one formatter, so a gateway answering with a
+  megabyte of HTML cannot put that megabyte into every message, attempt record and log line that quotes it.
 
 ## `RetryPolicy`
 

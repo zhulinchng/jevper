@@ -12,6 +12,7 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
 from .errors import (
@@ -24,7 +25,7 @@ from .errors import (
     UnsupportedMethodError,
     _LogprobsUnavailable,
 )
-from .labels import MAX_CHOICE_OPTIONS, MAX_LABEL_OPTIONS, label_to_key
+from .labels import MAX_CHOICE_OPTIONS, MAX_LABEL_OPTIONS, ascii_upper, label_to_key
 from .reasoning import ReasoningConfig
 from .transport import CallResult, CallSpec, TokenLogprob
 from .types import Method, Question
@@ -355,6 +356,7 @@ names label ``A``, and a check that stopped at the first non-letter would read t
 and let a sampled token that contradicts it through."""
 
 
+
 def _agree_with_answer_text(sampled: str, text: str, labels: Sequence[str]) -> None:
     """Refuse a sampled token that contradicts an answer text that names a different label.
 
@@ -371,10 +373,10 @@ def _agree_with_answer_text(sampled: str, text: str, labels: Sequence[str]) -> N
     stripped = text.strip()
     if not stripped:
         return
-    named = _LABEL_SHAPED.match(stripped.upper())
+    named = _LABEL_SHAPED.match(ascii_upper(stripped))
     if named is None or named.group(1) not in labels:
         return
-    token = _LABEL_SHAPED.match(sampled.strip().upper())
+    token = _LABEL_SHAPED.match(ascii_upper(sampled.strip()))
     if token is None or token.group(1) == named.group(1):
         return
     raise LabelReadoutError(
@@ -396,7 +398,7 @@ def first_answer_token(result: CallResult, labels: Sequence[str], *, method: Met
     for token in _answer_tokens(result):
         if not token.token.strip():
             continue
-        if token.token.strip().upper() in labels:
+        if ascii_upper(token.token.strip()) in labels:
             _agree_with_answer_text(token.token, result.text, labels)
             return token
         raise LabelReadoutError(
@@ -446,7 +448,7 @@ def _logprob_readout(
             evidence="readout",
             surface=result.surface,
         )
-    answer_label = token.token.strip().upper()
+    answer_label = ascii_upper(token.token.strip())
     logprobs: dict[str, float] = {label: float("-inf") for label in labels}
     logprobs[answer_label] = token.logprob
     rivals = 0
@@ -464,7 +466,7 @@ def _logprob_readout(
                 f"logprob for the alternative token {top_token!r} is positive ({top_logprob!r}), "
                 "which no log probability can be — the provider sent something other than logprobs"
             )
-        candidate = top_token.strip().upper()
+        candidate = ascii_upper(top_token.strip())
         if candidate in logprobs and candidate != answer_label:
             rivals += 1
             logprobs[candidate] = top_logprob
@@ -524,6 +526,14 @@ def parse_json_object(text: str, note: str = "") -> dict[str, Any]:
     """
     try:
         value = json.loads(text)
+    except RecursionError as deep:
+        # CPython's decoder refuses to nest past its own limit, and the answer is a generation the
+        # provider chose: a thousand opening braces is not an object jevper can read, and a
+        # RecursionError from the decoder is not an exception this contract has. The bounded
+        # correction path gets a turn at it instead.
+        raise MalformedAnswerError(
+            f"the answer's JSON is nested too deeply to parse{note}"
+        ) from deep
     except ValueError as first_error:  # JSONDecodeError, and the int-conversion limit it shares
         index = text.find("{")
         if index < 0:
@@ -536,6 +546,10 @@ def parse_json_object(text: str, note: str = "") -> dict[str, Any]:
         while index >= 0:
             try:
                 candidate, end = decoder.raw_decode(text[index:])
+            except RecursionError as deep:
+                raise MalformedAnswerError(
+                    f"the answer's JSON is nested too deeply to parse{note}"
+                ) from deep
             except ValueError as exc:
                 if first_failure is None:
                     first_failure = exc
@@ -577,14 +591,36 @@ def _number(value: Any, *, where: str, upper: float | None = None) -> float:
     return number
 
 
+def _require_root_keys(payload: Mapping[str, Any], expected: str, *, method: str) -> None:
+    """The answer object must carry exactly the field this method asks for, and nothing else.
+
+    The generated schema says ``additionalProperties: false`` and the docs call a missing or extra
+    key malformed, so a body that breaks the contract is not read with the offending keys quietly
+    dropped: ``{"probabilities": {...}, "choice": "technical"}`` is a model contradicting itself,
+    and the field jevper happened to read is not the one it can vouch for. The bounded correction
+    path gets a turn at it first.
+
+    The message names the keys and not the values: a provider that pads the answer with a megabyte
+    of its own text would otherwise put that megabyte into every error message, every attempt record
+    and every log line that quotes the failure.
+    """
+    keys = sorted(str(key) for key in payload)
+    if keys != [expected]:
+        raise MalformedAnswerError(
+            f"the {method} answer must be an object with exactly {expected!r}, got keys {keys}"
+        )
+
+
 def readout_structured(result: CallResult, question: Question) -> Readout:
     payload = parse_json_object(result.text, _stop_note(result))
+    _require_root_keys(payload, "probabilities" if question.type != "noul" else "noul", method="structured")
     if question.type == "choice":
         keys = list(question.criteria)
         raw = payload.get("probabilities")
         if not isinstance(raw, Mapping) or set(raw) != set(keys):
             raise MalformedAnswerError(
-                f"'probabilities' must have exactly the option keys {sorted(keys)}, got {payload!r}"
+                f"'probabilities' must have exactly the option keys {sorted(keys)}, got keys "
+                f"{sorted(str(key) for key in raw) if isinstance(raw, Mapping) else raw!r}"
             )
         return Readout(
             probabilities={key: _number(raw[key], where=f"probability for {key!r}") for key in keys},
@@ -600,7 +636,8 @@ def readout_structured(result: CallResult, question: Question) -> Readout:
     raw = payload.get("probabilities")
     if not isinstance(raw, Mapping) or set(raw) != set(expected):
         raise MalformedAnswerError(
-            f"'probabilities' must have exactly the level keys {expected}, got {payload!r}"
+            f"'probabilities' must have exactly the level keys {expected}, got keys "
+            f"{sorted(str(key) for key in raw) if isinstance(raw, Mapping) else raw!r}"
         )
     return Readout(
         probabilities={
@@ -612,19 +649,32 @@ def readout_structured(result: CallResult, question: Question) -> Readout:
 
 
 def _level_index(value: Any, levels: Sequence[int]) -> int | None:
-    """A level index given as an int, an integral float or an integral number in a string."""
+    """A level index given as an int, an integral float or an integral number in a string.
+
+    "Integral in a string" is decided on the string, not on the float it converts to: ``"2"``,
+    ``"2.0"`` and ``"2.000"`` are level 2, while ``"2.0000000000000000000001"`` is a number with a
+    fractional part that a binary float rounds away. Accepting it would answer a question the model
+    did not answer with a level it did not give.
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
         index = value
-    else:
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
+    elif isinstance(value, float):
+        if not value.is_integer():
             return None
-        if not number.is_integer():
+        index = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        try:
+            number = Decimal(text)
+        except InvalidOperation:
+            return None
+        if not number.is_finite() or number != number.to_integral_value():
             return None
         index = int(number)
+    else:
+        return None
     return index if index in levels else None
 
 
@@ -641,18 +691,25 @@ def _boolean(value: Any) -> bool | None:
 
 def readout_discrete(result: CallResult, question: Question, labels: Sequence[str]) -> Readout:
     payload = parse_json_object(result.text, _stop_note(result))
+    expected = {"choice": "choice", "noul": "noul", "score": "score"}[question.type]
+    _require_root_keys(payload, expected, method="discrete")
     if question.type == "choice":
         keys = list(question.criteria)
         raw = payload.get("choice")
         label = None
         if isinstance(raw, str):
-            candidate = raw.strip()
             # An exact option key wins over a label, the same way an example's answer does: a key that
-            # is also a label ("a" and "A") must not be read as the first option by accident.
-            if candidate in keys:
-                label = labels[keys.index(candidate)]
-            elif candidate.upper() in labels:
-                label = candidate.upper()
+            # is also a label ("a" and "A") must not be read as the first option by accident, and a
+            # key that is itself spelled with surrounding spaces (" billing ") is that key, not a
+            # misspelling of it — so the exact match is tried on the answer as it arrived.
+            if raw in keys:
+                label = labels[keys.index(raw)]
+            else:
+                candidate = raw.strip()
+                if candidate in keys:
+                    label = labels[keys.index(candidate)]
+                elif ascii_upper(candidate) in labels:
+                    label = ascii_upper(candidate)
         if label is None:
             raise MalformedAnswerError(
                 f"'choice' must be one of the labels {list(labels)!r} or the option keys {keys!r}, got {raw!r}"

@@ -7,9 +7,18 @@ import math
 import pytest
 from fakes import chat_body, openai_client
 
-from jevper import Choice, LabelReadoutError, Noul, Score, SystemOneClient
+from jevper import (
+    Choice,
+    Example,
+    InvalidQuestionError,
+    LabelReadoutError,
+    Noul,
+    Score,
+    SystemOneClient,
+)
 
 CHOICE_LOGS = [("A", -0.12), ("B", -2.47), ("C", -3.48)]
+CRITERIA = {"billing": None, "technical": None, "sales": None}
 
 
 def test_choice_logprobs_distribution_and_confidence(stub_server):
@@ -400,3 +409,76 @@ def test_non_finite_logprobs_raise_instead_of_poisoning_the_distribution():
 
     # -inf is a legitimate zero, not an error
     assert softmax_over_labels({"A": float("-inf"), "B": -1.0}) == {"A": 0.0, "B": 1.0}
+
+
+def test_a_unicode_lookalike_is_not_a_label(stub_server):
+    """``str.upper`` maps the dotless i to ``I``: a token that is not a label would name an option.
+
+    ``ı`` is its own letter, and a model that sampled it sampled something outside the alphabet
+    jevper allocated. Reading it as label ``I`` would hand the caller an option nobody sampled.
+    """
+    logs = [("ı", -0.12), ("B", -2.47)]
+    stub = stub_server(chat=lambda _: (200, chat_body(content="ı", logprobs=logs)))
+    client = SystemOneClient(openai_client(stub), model="stub", method="logprobs", api="chat_completions")
+
+    with pytest.raises(LabelReadoutError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "not one of the labels" in str(error.value)
+
+
+def body_for(token: str, rival: str):
+    """A stub script that sampled ``token`` with ``rival`` as its only alternative."""
+    logs = [(token, -0.12), (rival, -2.47)]
+    return lambda _: (200, chat_body(content=token, logprobs=logs))
+
+
+def test_a_long_s_is_not_a_label(stub_server):
+    """The long s upper-cases to ``S``; the Kelvin sign upper-cases to ``K``. Neither is a label."""
+    for token, rival in (("ſ", "B"), ("K", "B")):
+        stub = stub_server(chat=body_for(token, rival))
+        client = SystemOneClient(
+            openai_client(stub), model="stub", method="logprobs", api="chat_completions"
+        )
+        with pytest.raises(LabelReadoutError):
+            client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+
+def test_an_ascii_lowercase_label_is_still_the_label(stub_server):
+    """The fold is ASCII case, and nothing else: a model that wrote ``a`` named label A."""
+    logs = [("a", -0.12), ("B", -2.47)]
+    stub = stub_server(chat=lambda _: (200, chat_body(content="a", logprobs=logs)))
+    client = SystemOneClient(openai_client(stub), model="stub", method="logprobs", api="chat_completions")
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+
+
+def test_an_example_answer_that_is_a_lookalike_is_refused(stub_server):
+    """The same rule on the few-shot path: an example's answer must be a label or an option key."""
+    nine = {f"option_{index}": None for index in range(9)}
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+
+    with pytest.raises(InvalidQuestionError) as error:
+        SystemOneClient(openai_client(stub), model="stub", method="logprobs").system_one(
+            state="s",
+            questions={"q": Choice(criteria=nine)},
+            examples=[Example(state="t", answer="ı")],
+        )
+
+    assert "does not match any option" in str(error.value)
+
+
+def test_an_ordinary_lowercase_example_answer_still_resolves(stub_server):
+    logs = [("A", -0.12), ("B", -2.47), ("C", -3.48)]
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=logs)))
+    client = SystemOneClient(openai_client(stub), model="stub", method="logprobs")
+
+    response = client.system_one(
+        state="s",
+        questions={"q": Choice(criteria=CRITERIA)},
+        examples=[Example(state="t", answer="a")],
+    )
+
+    assert response.answers["q"].choice == "billing"

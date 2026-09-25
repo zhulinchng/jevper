@@ -84,6 +84,7 @@ from .types import (
     ScoreAnswer,
     SystemOneResponse,
     Usage,
+    bounded_text,
     ensure_encodable,
     parse_question,
 )
@@ -171,6 +172,17 @@ _THINKING_MARKERS = ("thinking", "budget_tokens")
 # an unrelated message can easily contain a short model name, and a server that does not implement
 # the Responses route answers 404 there with a message about the route.
 _MODEL_404_MARKERS = ("model", "no such", "not exist")
+# A provider that says which field was wrong is believed: these codes name the model itself, and a
+# route that is missing says nothing of the kind. Read from the whole evidence, since the code can
+# arrive as the exception's ``code`` attribute or inside the body it carries.
+_MODEL_ERROR_CODES = (
+    "model_not_found",
+    "model_not_exist",
+    "model_does_not_exist",
+    "unknown_model",
+    "invalid_model",
+    "unsupported_model",
+)
 _SHOULD_RETRY = "x-should-retry"
 _TRANSIENT_EXCEPTION_CLASSES = frozenset(
     {
@@ -519,6 +531,43 @@ def _add_count(current: int | None, value: Any) -> int | None:
     return current + count
 
 
+_HEADER_NAME_CHARS = frozenset(
+    "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+)
+
+
+def _validate_headers(headers: Mapping[Any, Any], *, where: str) -> None:
+    """Refuse a header jevper cannot put on the wire, before any provider sees the client.
+
+    The official SDKs hand the mapping to httpx, which encodes a header as ASCII and raises from
+    inside the request when it cannot — so a value with a newline, a NUL, a DEL, a non-ASCII
+    character or an unpaired surrogate arrives as a ``ProviderError`` about a provider that never
+    answered. A header that can inject a second one is worse than a crash, on a duck client that
+    forwards it. All of these are the caller's own mistake and are reported as one, with the header
+    named. RFC 9110's own rule is the one applied: a field name is a token, and a field value is
+    printable ASCII with horizontal tabs.
+    """
+    for name, value in headers.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise JevperError(
+                f"{where} names and values must be strings, got {name!r}: {value!r}"
+            )
+        if not name or not set(name) <= _HEADER_NAME_CHARS:
+            raise JevperError(
+                f"{where} name {name!r} is not a valid HTTP header name (letters, digits and "
+                "!#$%&'*+-.^_`|~ only)"
+            )
+        for position, char in enumerate(value):
+            code = ord(char)
+            if code == 0x09 or 0x20 <= code <= 0x7E:
+                continue
+            raise JevperError(
+                f"{where}[{name!r}] contains {char!r} at position {position}, which a header value "
+                "cannot carry: the SDKs encode header values as ASCII, and a value may hold only "
+                "printable ASCII and horizontal tabs"
+            )
+
+
 def _exception_text(exc: BaseException, limit: int = 500) -> str:
     """The exception's own text, bounded, and without letting its ``__str__`` fail the call.
 
@@ -532,11 +581,7 @@ def _exception_text(exc: BaseException, limit: int = 500) -> str:
         text = str(exc)
     except Exception:  # noqa: BLE001 - an exception that cannot describe itself is still an exception
         return f"<{type(exc).__name__} raised while formatting its own message>"
-    # A provider message can carry a lone surrogate (a body with a ``\udXXX`` escape decodes into
-    # one), and an error message the caller cannot print is a second failure on top of the first:
-    # ``backslashreplace`` keeps the characters visible as the escapes the wire carried.
-    text = text.encode("utf-8", "backslashreplace").decode("utf-8")
-    return text if len(text) <= limit else text[:limit] + f"… (+{len(text) - limit} chars)"
+    return bounded_text(text, limit)
 
 
 def _describe(exc: BaseException) -> str:
@@ -559,17 +604,23 @@ def _route_missing(exc: BaseException, *, surface: Surface, model: str) -> bool:
 
     An OpenAI-compatible server that does not implement a surface's route answers 404 for it, and the
     ``openai`` client object exposes ``responses.create`` either way. A 404 that names the model is
-    about the model — the same error would come back from the other surface — so it is left alone.
+    about the model — the same error would come back from the other surface — so it is left alone,
+    and so is one that says so in the only field a provider can be relied on to fill in: the code.
+    ``{"error": {"message": "Unknown model", "code": "model_not_found"}}`` names no id at all, and
+    treating it as a missing route would answer the question on another surface — or write the
+    route off for the rest of the client's life — over a model that is simply not there.
     """
     if _status_code(exc) != 404:
         return False
     evidence = _error_evidence(exc)
-    names_the_model = model.lower() in evidence
     if getattr(exc, "embedded", False):
         # The status came from the body of a ``200``, not from the status line: a body that says
         # ``404`` is the provider reporting a failure inside a successful response, and treating it
         # as a missing route would answer the question on another surface and hide the error.
         return False
+    if any(marker in evidence for marker in _MODEL_ERROR_CODES):
+        return False
+    names_the_model = model.lower() in evidence
     return not (names_the_model and any(marker in evidence for marker in _MODEL_404_MARKERS))
 
 
@@ -667,6 +718,14 @@ def _value_refused(evidence: str) -> bool:
     """
     return any(marker in evidence for marker in _VALUE_MARKERS)
 
+# A recorded request or response is debugging evidence, not a data channel: the answers carry what
+# the caller asked for. These bounds keep a hostile or careless body from making one response
+# unserializable or unprintable — a provider that pads a field with megabytes, or nests a value
+# deeper than the interpreter's own recursion limit, cannot decide whether
+# ``SystemOneResponse.model_dump_json()`` works.
+MAX_DEBUG_STRING = 1 << 16
+MAX_DEBUG_DEPTH = 24
+
 
 def _dump_model(obj: Any) -> Any:
     """The provider object as plain data for ``debug``, without the provider's typing noise.
@@ -676,6 +735,10 @@ def _dump_model(obj: Any) -> Any:
     every ``model_dump`` with a ``PydanticSerializationUnexpectedValue`` warning. The value survives
     the dump either way, and the dump exists for ``debug``, so the warning is noise the caller never
     asked for; ``warnings=False`` keeps it out of their logs without touching global warning state.
+
+    A duck client that answers with a plain mapping is sanitized like a typed model, and an object
+    that cannot be dumped at all leaves a name behind rather than itself: the provider's own object
+    in ``debug`` is exactly the thing ``model_dump_json`` then has to serialize.
     """
     dump = getattr(obj, "model_dump", None)
     if callable(dump):
@@ -685,25 +748,80 @@ def _dump_model(obj: Any) -> Any:
             except TypeError:
                 continue  # this dump does not take those keywords; try the next spelling
             except Exception:  # noqa: BLE001 - debug data never decides whether a call succeeded
-                return obj
+                return {"undumpable": f"<{type(obj).__name__} could not be dumped for debug>"}
+    if isinstance(obj, (Mapping, list, tuple)):
+        return _sanitize_debug(obj)
     return obj
 
 
-def _sanitize_debug(value: Any) -> Any:
-    """The dumped provider object with every string printable, for a response that must serialize.
+def _debug_key(key: Any) -> Any:
+    """A mapping key as JSON can write it: text bounded and escaped, anything else as its name."""
+    if isinstance(key, str):
+        return bounded_text(key, MAX_DEBUG_STRING)
+    if isinstance(key, (int, float, bool)) or key is None:
+        return key
+    return bounded_text(str(key), MAX_DEBUG_STRING)
+
+
+def _sanitize_debug(value: Any, depth: int = 0) -> Any:
+    """The dumped provider object with every string printable and bounded, for a response that must
+    serialize.
 
     A body can carry an escaped lone surrogate, which the SDK decodes into a Python string no UTF-8
     encoder accepts; left in ``debug`` it would make ``SystemOneResponse.model_dump_json()`` raise
     long after the call succeeded. The escapes the wire carried are shown instead, so the debug
-    record still says what the provider sent.
+    record still says what the provider sent. Keys are text too, and a duck client's raw mapping
+    goes through here as well, so no path into ``debug`` skips the guarantee.
     """
     if isinstance(value, str):
-        return value.encode("utf-8", "backslashreplace").decode("utf-8")
+        return bounded_text(value, MAX_DEBUG_STRING)
+    if depth >= MAX_DEBUG_DEPTH:
+        return f"<{type(value).__name__} nested deeper than {MAX_DEBUG_DEPTH} levels>"
     if isinstance(value, Mapping):
-        return {key: _sanitize_debug(item) for key, item in value.items()}
+        return {_debug_key(key): _sanitize_debug(item, depth + 1) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_sanitize_debug(item) for item in value]
+        return [_sanitize_debug(item, depth + 1) for item in value]
     return value
+
+
+# A header whose name says it carries a credential is not recorded with its value: the attempt
+# history reaches ``debug`` on every response and onto every ``ProviderError``, and a bearer token
+# or tenant key does not belong in a structure callers log. The name is kept, because which header
+# was sent is the part a reader needs.
+_CREDENTIAL_HEADER_PARTS = (
+    "authorization",
+    "api-key",
+    "apikey",
+    "token",
+    "secret",
+    "cookie",
+    "credential",
+    "password",
+    "signature",
+)
+
+
+def _redact_headers(headers: Mapping[Any, Any]) -> dict[Any, Any]:
+    return {
+        name: (
+            "<redacted>"
+            if isinstance(name, str)
+            and any(part in name.casefold() for part in _CREDENTIAL_HEADER_PARTS)
+            else value
+        )
+        for name, value in headers.items()
+    }
+
+
+def _recorded_request(request: Any) -> Any:
+    """The request kwargs as they are kept: credential headers redacted, everything else bounded."""
+    if not isinstance(request, Mapping):
+        return _sanitize_debug(request)
+    recorded = {
+        key: _redact_headers(value) if key in ("extra_headers", "default_headers") else value
+        for key, value in request.items()
+    }
+    return _sanitize_debug(recorded)
 
 
 def _pick_examples(examples: Examples, question_id: str) -> Sequence[Example]:
@@ -760,7 +878,7 @@ class _CallLog:
         record = {
             "question_id": question_id,
             "surface": surface,
-            "request": request,
+            "request": _recorded_request(request),
             "response": response,
             "error": error,
             "readout": None,
@@ -829,8 +947,12 @@ class _BaseClient:
             raise JevperError(f"retry must be a RetryPolicy, got {type(retry).__name__}")
         if extra_body is not None and not isinstance(extra_body, Mapping):
             raise JevperError(f"extra_body must be a mapping, got {type(extra_body).__name__}")
-        if extra_headers is not None and not isinstance(extra_headers, Mapping):
-            raise JevperError(f"extra_headers must be a mapping, got {type(extra_headers).__name__}")
+        if extra_headers is not None:
+            if not isinstance(extra_headers, Mapping):
+                raise JevperError(
+                    f"extra_headers must be a mapping, got {type(extra_headers).__name__}"
+                )
+            _validate_headers(extra_headers, where="extra_headers")
         if prompt_cache_key is not None:
             _require_prompt_cache_key(prompt_cache_key)
         if method in ("logprobs", "grammar"):
@@ -868,8 +990,9 @@ class _BaseClient:
         self._auto_misses: dict[tuple[str, Surface], int] = {}
         # Surfaces this server has answered 404 for, learned by trying them once each.
         self._missing_surfaces: set[Surface] = set()
-        # Request fields this server has refused, per surface: structured output, reasoning, include.
-        self._limits: dict[Surface, Limits] = {}
+        # Request fields this server has refused, per (model, surface): structured output, reasoning,
+        # include. A refusal is usually about the model that earned it, so it is remembered there.
+        self._limits: dict[tuple[str, Surface], Limits] = {}
         self._auto_lock = threading.Lock()
 
     # -- shared helpers ----------------------------------------------------------------
@@ -970,13 +1093,22 @@ class _BaseClient:
         with self._auto_lock:
             return self._auto_methods.get((model, surface), AUTO_METHOD) == FALLBACK_METHOD
 
-    def _limits_for(self, surface: Surface) -> Limits:
-        """What this server has been observed to accept on this surface."""
-        with self._auto_lock:
-            return self._limits.get(surface, Limits())
+    def _limits_for(self, model: str, surface: Surface) -> Limits:
+        """What this server has been observed to accept for this model on this surface.
 
-    def _remember_limits(self, surface: Surface, base: Limits, limits: Limits) -> None:
-        """Remember a server's limit for the rest of this client's life, like any other verdict.
+        Keyed by the model as well as the surface, because a refusal of a request field is a fact
+        about a model far more often than about a server: ``reasoning_effort is not supported for
+        this model`` says so in as many words, and a strict-schema refusal is usually a particular
+        model's serving stack. Remembering it provider-wide would quietly switch off a field the
+        caller asked for on every other model this client ever names — and ``debug`` would still say
+        the field was requested. The cost of the narrower key is one refusal per (model, surface),
+        which is a request the caller would have spent anyway on a server that refuses it everywhere.
+        """
+        with self._auto_lock:
+            return self._limits.get((model, surface), Limits())
+
+    def _remember_limits(self, model: str, surface: Surface, base: Limits, limits: Limits) -> None:
+        """Remember a server's limit for this model on this surface, like any other verdict.
 
         A downgrade is computed from the snapshot its transport was built with, and the questions run
         concurrently, so writing that result wholesale would let a later write put back a field
@@ -984,15 +1116,16 @@ class _BaseClient:
         refusal again. Only the fields this downgrade actually changed are applied, onto whatever is
         remembered now.
         """
+        key = (model, surface)
         with self._auto_lock:
-            current = self._limits.get(surface, base)
+            current = self._limits.get(key, base)
             changed = {
                 entry.name: getattr(limits, entry.name)
                 for entry in dataclass_fields(Limits)
                 if getattr(limits, entry.name) != getattr(base, entry.name)
             }
             if changed:
-                self._limits[surface] = replace(current, **changed)
+                self._limits[key] = replace(current, **changed)
 
     def _downgrade(self, exc: Exception, spec: CallSpec, transport: Transport) -> Limits | None:
         """The next request shape to try when a server refuses a field jevper added for capability.
@@ -1117,7 +1250,7 @@ class _BaseClient:
             structured_outputs=self.structured_outputs,
             extra_body=self.extra_body,
             extra_headers=self.extra_headers,
-            limits=self._limits_for(surface),
+            limits=self._limits_for(context.model, surface),
         )
         if context.auto and moved:
             # The method verdict is keyed by surface, so a surface that just changed has its own:
@@ -1281,7 +1414,7 @@ class _BaseClient:
                 structured_outputs=self.structured_outputs,
                 extra_body=self.extra_body,
                 extra_headers=self.extra_headers,
-                limits=self._limits_for(surface),
+                limits=self._limits_for(effective_model, surface),
             ),
             model=effective_model,
             method=effective_method,
@@ -1550,7 +1683,8 @@ class _BaseClient:
             "observed_text": readout.observed_text,
         }
         if log.attempts:
-            log.attempts[-1]["readout"] = readout_debug
+            # The answer text is the provider's, and it is as unbounded as anything else it sent.
+            log.attempts[-1]["readout"] = _sanitize_debug(readout_debug)
         return _QuestionOutcome(
             answer=answer,
             reasoning=reasoning,
@@ -1623,21 +1757,29 @@ class _BaseClient:
                 for question_id, outcome in outcomes.items()
                 if outcome.attempts and isinstance(outcome.attempts[-1].get("surface"), str)
             }
-            # The limits are per surface, and a mixed call learned some on each; the scalar
+            # The limits are per (model, surface), and a mixed call learned some on each; the scalar
             # ``server_limits`` speaks for the surface the call ended on.
             debug["server_limits_by_api"] = {
                 name: {
-                    entry.name: getattr(self._limits_for(name), entry.name)
+                    entry.name: getattr(self._limits_for(context.model, name), entry.name)
                     for entry in dataclass_fields(Limits)
                 }
                 for name in sorted(surfaces)
+            }
+            # The mode follows from the surface a question was answered on — native on Responses,
+            # the two-step path elsewhere — so the scalar ``reasoning_mode`` cannot speak for a
+            # batch that used both. Derived from each question's own last attempt, the same way
+            # ``apis`` is, so it cannot disagree with what was sent.
+            debug["reasoning_modes"] = {
+                question_id: resolve_reasoning_mode(context.reasoning, surface)
+                for question_id, surface in debug["apis"].items()
             }
         if context.auto:
             # The method was chosen rather than pinned, so report what each question actually used.
             debug["methods"] = {
                 question_id: outcome.method for question_id, outcome in outcomes.items()
             }
-        limits = self._limits_for(context.transport.surface)
+        limits = self._limits_for(context.model, context.transport.surface)
         if limits != Limits():
             # The server refused a request field jevper added, and the answer came without it. Every
             # field of the limits is reported, so a new rung cannot be forgotten here.
@@ -1719,7 +1861,9 @@ class SystemOneClient(_BaseClient):
                         # with a fresh retry budget, because the attempts the old request shape spent
                         # say nothing about this one.
                         attempt = 0
-                        self._remember_limits(transport.surface, transport.limits, downgraded)
+                        self._remember_limits(
+                            context.model, transport.surface, transport.limits, downgraded
+                        )
                         self._switch_surface(context, transport.surface)
                         continue
                     failure = self._call_failure(exc, spec, context, transport, log)
@@ -1786,9 +1930,17 @@ class SystemOneClient(_BaseClient):
             for question_id, future in futures.items():
                 try:
                     outcomes[question_id] = future.result()
-                except BaseException as exc:  # noqa: BLE001 - collected, then re-raised in order
+                except Exception as exc:  # noqa: BLE001 - collected, then re-raised in order
                     if failure is None:
                         failure = exc
+                except BaseException:
+                    # A KeyboardInterrupt or a SystemExit from a worker is not one question failing:
+                    # the caller asked for the work to stop, so the questions still queued are
+                    # cancelled and this one is raised now, rather than held until a blocked sibling
+                    # finishes and then possibly dropped in favour of an earlier provider error.
+                    for pending in futures.values():
+                        pending.cancel()
+                    raise
         if failure is not None:
             raise failure
         return self._assemble(context, parsed, outcomes, time.perf_counter() - start)
@@ -1857,7 +2009,9 @@ class AsyncSystemOneClient(_BaseClient):
                         # The field is optional; the question is not. Remember the limit and re-ask —
                         # with a fresh retry budget for the new request shape.
                         attempt = 0
-                        self._remember_limits(transport.surface, transport.limits, downgraded)
+                        self._remember_limits(
+                            context.model, transport.surface, transport.limits, downgraded
+                        )
                         self._switch_surface(context, transport.surface)
                         continue
                     failure = self._call_failure(exc, spec, context, transport, log)
@@ -1907,6 +2061,12 @@ class AsyncSystemOneClient(_BaseClient):
         outcomes: dict[str, _QuestionOutcome] = {}
         failure: BaseException | None = None
         for (question_id, _), result in zip(parsed.items(), results):
+            if isinstance(result, BaseException) and not isinstance(result, Exception):
+                # A cancellation or an interrupt that reached a question is not that question's
+                # provider failing, and `return_exceptions` hands it back as data. It is raised here
+                # instead of being counted as a failure another question already reported — and
+                # before `_assemble`, which would otherwise be handed a response missing an answer.
+                raise result
             if isinstance(result, BaseException):
                 if failure is None:
                     failure = result

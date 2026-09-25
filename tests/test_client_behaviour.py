@@ -2865,3 +2865,139 @@ def test_an_incomplete_analysis_is_not_quoted_into_the_answer(stub_server):
 
     assert "max_output_tokens" in str(raised.value)
     assert len(stub.bodies("/responses")) == 1
+
+
+def test_a_refusal_one_model_earned_does_not_reach_another(stub_server):
+    """``reasoning_effort is not supported for this model`` is about that model, not about the server.
+
+    The learned limits used to be keyed by surface alone, so the second model on the same client
+    quietly lost a field the caller had asked for — while ``debug`` still said the reasoning mode it
+    was asked for. The verdict is now remembered per (model, surface), which costs one refusal per
+    model and never silently drops a requested field.
+    """
+    def script(body):
+        if "reasoning_effort" in body and body["model"] == "old":
+            return 400, {"error": {"message": "reasoning_effort is not supported for this model"}}
+        return 200, chat_body(content=json.dumps({"probabilities": {"billing": 0.7, "technical": 0.2, "sales": 0.1}}))
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="old",
+        api="chat_completions",
+        method="structured",
+        reasoning=ReasoningConfig(mode="native", effort="low"),
+        retry=RetryPolicy(n_retries=0),
+        n_retry_malformed=0,
+    )
+
+    old = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}, model="old")
+    assert old.debug["server_limits"]["reasoning"] is False
+    assert old.debug["server_limits"]["structured"] == "schema", "the schema itself was not refused"
+    assert "reasoning_effort" not in stub.bodies("/chat/completions")[-1]
+
+    new = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}, model="new")
+    assert new.debug.get("server_limits") is None
+    assert stub.bodies("/chat/completions")[-1]["reasoning_effort"] == "low"
+
+
+def test_the_same_model_still_keeps_its_own_refusal(stub_server):
+    """The narrower key does not forget: the same model is not asked again."""
+    def script(body):
+        if "reasoning_effort" in body:
+            return 400, {"error": {"message": "reasoning_effort is not supported for this model"}}
+        return 200, chat_body(content=json.dumps({"probabilities": {"billing": 0.7, "technical": 0.2, "sales": 0.1}}))
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="old",
+        api="chat_completions",
+        method="structured",
+        reasoning=ReasoningConfig(mode="native", effort="low"),
+        retry=RetryPolicy(n_retries=0),
+        n_retry_malformed=0,
+    )
+
+    for _ in range(2):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}, model="old")
+
+    # Three requests: the refusal and its re-ask on the first call, then one request for the second
+    # call because the downgrade is remembered for that model.
+    assert len(stub.bodies("/chat/completions")) == 3
+    assert "reasoning_effort" not in stub.bodies("/chat/completions")[-1]
+
+
+def test_a_model_error_code_is_not_a_missing_route(stub_server):
+    """``model_not_found`` without the id in the message is still about the model.
+
+    The route classifier only recognised a 404 that named the model, so a body that says
+    ``{"error": {"message": "Unknown model", "code": "model_not_found"}}`` was read as a server
+    without the route: the call moved to the other surface, and if that surface accepted the id the
+    caller got an answer for a model that does not exist.
+    """
+    def script(body):
+        return 404, {"error": {"message": "Unknown model", "code": "model_not_found"}}
+
+    stub = stub_server(chat=script, responses=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="missing",
+        api="auto",
+        method="structured",
+        retry=RetryPolicy(n_retries=0),
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(ProviderError) as caught:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "model_not_found" in str(caught.value) or "Unknown model" in str(caught.value)
+    assert stub.bodies("/responses"), "the Responses route was tried"
+    assert not stub.bodies("/chat/completions"), "the model error moved the call to another surface"
+
+
+def test_a_404_naming_the_model_is_still_not_a_missing_route(stub_server):
+    """The 0.7.0 rule is unchanged: a 404 that names the model belongs to the model."""
+
+    def script(body):
+        return 404, {"error": {"message": "The model 'missing' does not exist"}}
+
+    stub = stub_server(chat=script, responses=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="missing",
+        api="auto",
+        method="structured",
+        retry=RetryPolicy(n_retries=0),
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(ProviderError):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert not stub.bodies("/chat/completions")
+
+
+def test_a_route_404_still_rotates(stub_server):
+    """A plain 404 with nothing about the model is the route, and rotation still happens."""
+
+    def script(body):
+        if "input" in body:
+            return 404, {"error": {"message": "Unknown endpoint /v1/responses"}}
+        return 200, chat_body(content=json.dumps({"probabilities": {"billing": 0.7, "technical": 0.2, "sales": 0.1}}))
+
+    stub = stub_server(chat=script, responses=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="auto",
+        method="structured",
+        retry=RetryPolicy(n_retries=0),
+        n_retry_malformed=0,
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.debug["api"] == "chat_completions"
+    assert stub.bodies("/responses") and stub.bodies("/chat/completions")

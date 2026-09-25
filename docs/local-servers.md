@@ -37,13 +37,23 @@ response.answers["intent"].probabilities  # a real distribution, read from the s
 | Server | `base_url` | `model` | Thinking off | Notes |
 | --- | --- | --- | --- | --- |
 | ollama | `http://127.0.0.1:11434/v1` | the tag you pulled, e.g. `qwen3.5:9b` | `extra_body={"reasoning_effort": "none"}` | Chat Completions carries logprobs; the Responses route exists but returns an empty logprob list |
-| llama.cpp | `http://127.0.0.1:8080/v1` | the `--alias` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--jinja` for the model's own template; `grammar` is llama.cpp-only |
+| llama.cpp | `http://127.0.0.1:8080/v1` | the `--alias` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--jinja` for the model's own template; the only server of the five that takes jevper's GBNF `grammar` field, so `method="grammar"` answers there (measured) |
 | vLLM | `http://127.0.0.1:8000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; `top_logprobs` is capped by `--max-logprobs` (20) |
 | SGLang | `http://127.0.0.1:30000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; its Responses route needs `top_logprobs` sent explicitly, which jevper always does |
 | LM Studio | `http://127.0.0.1:1234/v1` | the id `lms ls` prints, e.g. `qwen3-4b-instruct-2507` | nothing does — load a non-thinking model | all three surfaces on one box, as do the other four now; `logprobs` arrives on both OpenAI surfaces; its Responses route accepts `text.format` and ignores it, so structured answers belong on Chat Completions |
 
 All five answer the Anthropic Messages route as well (`/v1/messages`), so `api="auto"` has all three to
 choose from on any of them; ollama, llama.cpp, SGLang and LM Studio were exercised through it directly.
+
+A caller-owned body field is the caller's own business, and a server that types it strictly will say so:
+`extra_body={"stream": 0}` is refused by llama.cpp with `400 Field 'stream': type must be boolean, but is
+number`, and jevper reports that refusal rather than reading a stream it did not ask for. Omit the field,
+or send `false`.
+
+Both facades have been run against every server here, and `AsyncSystemOneClient` has been run live against
+ollama's Responses route and against a hosted OpenAI-compatible endpoint (OpenRouter): a batch of three
+question types, two concurrent calls on two surfaces, a 26-option question and a `discrete` answer all come
+back the same way the blocking client returns them.
 
 `api="auto"` (the default) works against all five: it prefers the Responses surface, and when that route is
 missing — or answers without carrying logprobs through — it re-asks on Chat Completions and remembers the

@@ -781,3 +781,171 @@ def test_a_caller_who_turns_logprobs_off_sends_neither_field(stub_server):
     body = stub.bodies("/chat/completions")[0]
     assert "top_logprobs" not in body
     assert body["logprobs"] is False
+
+
+def test_a_structured_answer_with_an_extra_key_is_malformed(stub_server):
+    """A model that says both "billing" and "technical" has contradicted itself; the field jevper
+    happened to read is not the one it can vouch for, and the schema says no extra keys."""
+    answer = json.dumps(
+        {"probabilities": {"billing": 0.7, "technical": 0.2, "sales": 0.1}, "choice": "technical"}
+    )
+    stub = stub_server(chat=lambda _: (200, chat_body(content=answer)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(MalformedAnswerError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "'choice'" in str(error.value)
+    assert "exactly 'probabilities'" in str(error.value)
+
+
+def test_a_structured_answer_missing_its_key_is_malformed(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps({"noul": 0.5}))))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(MalformedAnswerError, match="exactly 'probabilities'"):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+
+def test_a_discrete_answer_with_an_extra_key_is_malformed(stub_server):
+    """``{"choice": "A", "probabilities": {...}}`` is the same contradiction in the other shape."""
+    answer = json.dumps({"choice": "A", "probabilities": {"billing": 0.1, "technical": 0.1, "sales": 0.8}})
+    stub = stub_server(chat=lambda _: (200, chat_body(content=answer)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="discrete", api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(MalformedAnswerError, match="exactly 'choice'"):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+
+def test_a_corrective_retry_gets_a_turn_at_an_extra_key(stub_server):
+    """The bounded correction is the documented answer to a malformed one: one more request."""
+    answers = [
+        json.dumps({"probabilities": {"billing": 0.7, "technical": 0.2, "sales": 0.1}, "choice": "sales"}),
+        json.dumps({"probabilities": {"billing": 0.7, "technical": 0.2, "sales": 0.1}}),
+    ]
+    stub = stub_server(chat=lambda _: (200, chat_body(content=answers.pop(0))))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions"
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+    assert len(stub.bodies("/chat/completions")) == 2
+    assert any("choice" in str(reason) for reason in response.debug["retry_reasons"])
+
+
+def test_an_option_key_with_spaces_is_the_option_the_model_named(stub_server):
+    """A key spelled with surrounding whitespace is that key; only an unmatched answer is stripped."""
+    options = {" billing ": None, "other": None}
+    answer = json.dumps({"choice": " billing "})
+    stub = stub_server(chat=lambda _: (200, chat_body(content=answer)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="discrete", api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=options)})
+
+    assert response.answers["q"].choice == " billing "
+
+
+def test_a_label_with_surrounding_whitespace_is_still_a_label(stub_server):
+    """Stripping is for the label form, which is where a model adds punctuation."""
+    answer = json.dumps({"choice": " A "})
+    stub = stub_server(chat=lambda _: (200, chat_body(content=answer)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="discrete", api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+
+
+def test_a_level_index_that_is_not_integral_is_malformed(stub_server):
+    """``"2.0000000000000000000001"`` is not level 2, even though a float would round it there."""
+    answer = json.dumps({"score": "2.0000000000000000000001"})
+    stub = stub_server(chat=lambda _: (200, chat_body(content=answer)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="discrete", api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(MalformedAnswerError, match="level indexes"):
+        client.system_one(
+            state="s", questions={"anger": Score(criteria=["Calm", "Frustrated", "Very angry"])}
+        )
+
+
+def test_a_written_integral_level_is_still_accepted(stub_server):
+    """The rule is integrality, not a spelling: trailing zeros are what a model writes."""
+    answers = [{"score": "2.000"}, {"score": 2.0}, {"score": "2"}]
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps(answers.pop(0)))))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="discrete", api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    for _ in range(3):
+        response = client.system_one(
+            state="s", questions={"anger": Score(criteria=["Calm", "Frustrated", "Very angry"])}
+        )
+        assert response.answers["anger"].score == 2.0
+
+
+def test_a_malformed_answer_message_does_not_quote_the_whole_payload(stub_server):
+    """A provider that pads its answer by a megabyte does not put that megabyte in every error."""
+    answer = json.dumps(
+        {"probabilities": {"billing": "not a number", "technical": 0.2, "sales": 0.1}, "pad": "x" * 900_000}
+    )
+    stub = stub_server(chat=lambda _: (200, chat_body(content=answer)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(MalformedAnswerError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert len(str(error.value)) < 1_000
+    assert "x" * 10_000 not in str(error.value)
+
+
+def test_deeply_nested_json_is_a_malformed_answer_not_a_recursion_error(stub_server):
+    """CPython's decoder refuses to nest past its limit; that is the answer's problem, not the caller's."""
+    answer = '{"a":' * 2000 + "1" + "}" * 2000
+    stub = stub_server(chat=lambda _: (200, chat_body(content=answer)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(MalformedAnswerError):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+
+def test_a_nested_object_beside_the_answer_is_still_malformed_by_its_keys(stub_server):
+    """A deep value inside an otherwise valid shape fails on the key set, not on the parser."""
+    deep: object = 1
+    for _ in range(2000):
+        deep = {"deeper": deep}
+    answer = json.dumps({"probabilities": {"billing": 0.7, "technical": 0.2, "sales": 0.1}, "extra": deep})
+    stub = stub_server(chat=lambda _: (200, chat_body(content=answer)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(MalformedAnswerError, match="exactly 'probabilities'"):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})

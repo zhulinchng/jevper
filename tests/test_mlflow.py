@@ -67,9 +67,7 @@ from jevper import (
 
 CHOICE_LOGS = [("A", -0.12), ("B", -2.47), ("C", -3.48)]
 CRITERIA = {"billing": None, "technical": None, "sales": None}
-STRUCTURED_ANSWER = json.dumps(
-    {"choice": "billing", "probabilities": {"billing": 0.9, "technical": 0.05, "sales": 0.05}}
-)
+STRUCTURED_ANSWER = json.dumps({"probabilities": {"billing": 0.9, "technical": 0.05, "sales": 0.05}})
 
 
 # -- helpers -------------------------------------------------------------------------------
@@ -983,9 +981,7 @@ def test_the_gateway_drops_reasoning_content(gateway):
 def test_non_ascii_labels_survive_the_gateway(gateway):
     """UTF-8 criteria, state and answer, through the gateway and back."""
     labels = {"請求書": None, "技術的な問題": None, "営業": None}
-    answer = json.dumps(
-        {"choice": "技術的な問題", "probabilities": {"請求書": 0.05, "技術的な問題": 0.9, "営業": 0.05}}
-    )
+    answer = json.dumps({"probabilities": {"請求書": 0.05, "技術的な問題": 0.9, "営業": 0.05}})
     gateway.backend.chat = lambda _: (200, chat_body(content=answer))
     try:
         client = SystemOneClient(
@@ -1055,7 +1051,7 @@ def label_script(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     label, letter = ("technical", "B") if "crashes" in text else ("billing", "A")
     if body.get("response_format", {}).get("type") == "json_schema":
         probabilities = {name: (0.9 if name == label else 0.05) for name in CRITERIA}
-        return 200, chat_body(content=json.dumps({"choice": label, "probabilities": probabilities}))
+        return 200, chat_body(content=json.dumps({"probabilities": probabilities}))
     # The readout reads the distribution, so the sampled token has to be the most likely one.
     others = [(name, -2.47) for name, _ in CHOICE_LOGS if name != letter]
     return 200, chat_body(

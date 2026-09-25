@@ -107,6 +107,23 @@ class Score(BaseModel):
         return self
 
 
+def bounded_text(value: str, limit: int = 500) -> str:
+    """A provider's own words, printable and no longer than ``limit``.
+
+    Two things go wrong when provider text reaches a caller as-is. A body can carry an escaped lone
+    surrogate, which decodes into a string no UTF-8 encoder accepts, and an error message the caller
+    cannot print is a second failure on top of the first — ``backslashreplace`` keeps the characters
+    visible as the escapes the wire carried. And a gateway that answers with a megabyte of HTML makes
+    every message, attempt record and log line that quotes it a megabyte too; the first few hundred
+    characters carry the status, the field and the reason, which is all a reader uses.
+
+    Every path that quotes a provider — an exception's message, an embedded error, a retry reason —
+    goes through this one function, so the bound cannot be forgotten on one surface.
+    """
+    text = value.encode("utf-8", "backslashreplace").decode("utf-8")
+    return text if len(text) <= limit else text[:limit] + f"… (+{len(text) - limit} chars)"
+
+
 def ensure_encodable(value: Any, *, where: str, error: type[JevperError] = JevperError) -> None:
     """Refuse text a request could never carry, before anything tries to send it.
 
@@ -117,22 +134,27 @@ def ensure_encodable(value: Any, *, where: str, error: type[JevperError] = Jevpe
     description on offer is a provider failure, and hashing one for the prompt-cache key raises the
     same error before a request is even built. Both are local mistakes, so they are reported as
     local ones, with the field named and nothing sent.
+
+    The walk keeps its own stack instead of recursing: a caller can hand over a structure nested
+    deeper than the interpreter's recursion limit, and a ``RecursionError`` from a local validation
+    pass is the one failure this function exists to prevent.
     """
-    if isinstance(value, str):
-        try:
-            value.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise error(
-                f"{where} contains a character that cannot be encoded as UTF-8 ({exc.reason} at "
-                f"position {exc.start}); replace it before handing it to jevper"
-            ) from None
-    elif isinstance(value, Mapping):
-        for key, item in value.items():
-            ensure_encodable(key, where=where, error=error)
-            ensure_encodable(item, where=where, error=error)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            ensure_encodable(item, where=where, error=error)
+    pending: list[Any] = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise error(
+                    f"{where} contains a character that cannot be encoded as UTF-8 ({exc.reason} at "
+                    f"position {exc.start}); replace it before handing it to jevper"
+                ) from None
+        elif isinstance(item, Mapping):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
 
 
 Question = Noul | Choice | Score

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .errors import InvalidQuestionError, JevperError
-from .labels import label_to_key
+from .labels import ascii_upper, label_to_key
 from .types import Example, JSONContent, Method, Question, ensure_encodable
 
 UNTRUSTED_STATE_NOTE = (
@@ -166,7 +166,7 @@ def example_answer_label(question: Question, labels: Sequence[str], answer: Any,
             for label, key in zip(labels, question.criteria):
                 if key == answer:
                     return label
-        candidate = answer.strip().upper()
+        candidate = ascii_upper(answer.strip())
         if candidate in labels:
             return candidate
         raise problem

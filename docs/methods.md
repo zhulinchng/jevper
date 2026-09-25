@@ -100,7 +100,7 @@ Provider support, as of this release — check your provider's docs, since this 
 | vLLM | yes | caps `top_logprobs` at its own `--max-logprobs` (20 by default); `/v1/responses` carries them through `include` |
 | SGLang | yes | its `/v1/responses` needs `top_logprobs` sent explicitly (it defaults to 0) — jevper always sends it |
 | Ollama | partial | local builds since Nov 2025 return logprobs on Chat Completions; its `/v1/responses` returns an empty logprob list, so `auto` re-asks on Chat Completions. Ollama Cloud and older builds report none at all |
-| OpenRouter | per model | it routes by price and, by default, sends your request to an endpoint that may ignore `logprobs` — the answer comes back with none, which `auto` reads as "no logprobs" and falls back on. Add `extra_body={"provider": {"require_parameters": True}}` to route only to endpoints that support every field you send. Its Responses API rejects the logprob includable outright (`400 Invalid option: expected one of …` at `path: ["include", 0]`), so an `auto` readout moves to Chat Completions, where the distribution arrives — verified live, with an explicit `method="logprobs"` as much as with `auto` |
+| OpenRouter | per model | it routes by price and, by default, sends your request to an endpoint that may ignore `logprobs` — the answer comes back with none, which `auto` reads as "no logprobs" and falls back on. Add `extra_body={"provider": {"require_parameters": True}}` to route only to endpoints that support every field you send. Its Responses API rejects the logprob includable outright (`400 Invalid option: expected one of …` at `path: ["include", 0]`), so an `auto` readout moves to Chat Completions, where the distribution arrives — verified live, with an explicit `method="logprobs"` as much as with `auto`. It also takes a `prompt_cache_key` longer than OpenAI's 64 characters without complaint, and answers an unknown model id with `400 is not a valid model ID` rather than a 404 |
 | everything else | unknown | reasoning models and thin compatibility layers are the ones that say no |
 
 With `auto` you do not have to know this table.
@@ -223,7 +223,8 @@ allowed). On the Responses surface the logprobs arrive through `include=["messag
 
 Readout:
 
-1. The first non-whitespace token of the answer must be a label (compared case-insensitively). A reasoning
+1. The first non-whitespace token of the answer must be a label, compared case-insensitively over ASCII only:
+   `a` is label `A`, and `ı` (which `str.upper` would fold to `I`) is not a label at all. A reasoning
    server reports logprobs for every generated token — vLLM, SGLang and ollama include the thinking span while
    `message.content` holds only the answer — so the answer's own tokens are located first, by matching the
    answer text against the tail of the token stream. The match is strict: without a separated trace, or without
@@ -325,9 +326,14 @@ Readout:
 
 1. Parse the answer as JSON: `json.loads`, falling back to decoding from the first `{` when the model wrapped
    the object in prose or fences. A non-object raises `MalformedAnswerError`.
-2. `choice` requires exactly the option keys, each a finite number `>= 0`; `noul` requires `noul` in `[0, 1]`
-   and expands to `{True: v, False: 1 − v}`; `score` requires exactly the level keys. Missing or extra keys,
-   booleans, `NaN` and negatives are malformed.
+2. The object must carry exactly the one field this method asks for — `probabilities`, or `noul` for a
+   `Noul` question. `choice` then requires exactly the option keys, each a finite number `>= 0`; `noul`
+   requires `noul` in `[0, 1]` and expands to `{True: v, False: 1 − v}`; `score` requires exactly the level
+   keys. A missing or extra key, a wrong key set, booleans, `NaN` and negatives are malformed — an object
+   that answers twice (`{"probabilities": …, "choice": "technical"}`) is a model contradicting itself, and
+   reading the field jevper happened to pick would report one of the two as the answer. The message names the
+   keys, never the values, so a body padded with a megabyte of its own text cannot put that megabyte into
+   every error and retry reason.
 3. Normalization (not part of the readout): when `abs(sum − 1) > 1e-6` and `normalize_probabilities=True` (the
    default), the distribution is rescaled to sum 1 and both the error and the model's original numbers are
    recorded in `debug["probability_errors"]` and `debug["original_probabilities"]`. A zero total becomes
@@ -359,11 +365,14 @@ Request: a strict JSON schema asking for one option and nothing else.
 | `noul` | `{"noul": {"type": "boolean"}}` |
 | `score` | `{"score": {"type": "integer", "enum": [0, 1, 2]}}` |
 
-Readout: one-hot over the chosen option. `choice` accepts a label (`"B"`, case-insensitive) or a criteria key
-(`"billing"`); an exact criteria key wins over a label spelled the same way, so an option keyed `"a"` is read as
-that option and not as the first label. `noul` requires a JSON boolean or its string form (`"true"`/`"false"`);
-`score` requires a level index — an integer, an integral float such as `2.0`, or a number in a string such as
-`"2"`. The string forms are what models tend to emit when the schema is only in the prompt
+Readout: the object must carry exactly `choice`, `noul` or `score`, one-hot over the chosen option. `choice`
+accepts a label (`"B"`, case-insensitively over ASCII) or a criteria key (`"billing"`); an exact criteria key
+wins over a label spelled the same way, so an option keyed `"a"` is read as that option and not as the first
+label, and a key that is itself spelled with surrounding spaces is that key rather than a stripped version of
+it. `noul` requires a JSON boolean or its string form (`"true"`/`"false"`); `score` requires a level index — an
+integer, an integral float such as `2.0`, or a number in a string such as `"2"` or `"2.000"`, decided on the
+string rather than on the float it converts to, so `"2.0000000000000000000001"` is malformed rather than
+rounded to level 2. The string forms are what models tend to emit when the schema is only in the prompt
 (`structured_outputs=False`). A bool is rejected as a score, since `true` would otherwise read as level 1.
 Anything else raises `MalformedAnswerError`.
 

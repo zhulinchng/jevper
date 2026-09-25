@@ -456,3 +456,66 @@ def test_ordinary_non_ascii_text_still_reaches_the_wire(stub_server):
 
     sent = stub.bodies("/chat/completions")[0]
     assert "café \U0001f600 中文" in json.dumps(sent, ensure_ascii=False)
+
+
+def test_a_header_value_that_cannot_be_encoded_fails_before_any_request(stub_server):
+    """A surrogate in a header is the caller's mistake, and httpx's encoder would say so late."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+
+    with pytest.raises(JevperError) as error:
+        chat_client(stub, extra_headers={"X-Tenant": "tenant \ud800"})
+
+    assert "X-Tenant" in str(error.value)
+    assert "ASCII" in str(error.value)
+    assert stub.requests == []
+
+
+def test_a_header_that_could_inject_another_is_refused(stub_server):
+    """CRLF in a value is a second header to any transport that does not check; httpx raises instead."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+
+    with pytest.raises(JevperError, match="X-Inject"):
+        chat_client(stub, extra_headers={"X-Inject": "one\r\nX-Admin: true"})
+
+    assert stub.requests == []
+
+
+def test_a_header_name_that_is_not_a_header_name_is_refused(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+
+    with pytest.raises(JevperError, match="not a valid HTTP header name"):
+        chat_client(stub, extra_headers={"X Probe": "1"})
+
+    assert stub.requests == []
+
+
+def test_a_non_string_header_value_is_refused(stub_server):
+    """httpx takes str or bytes; jevper takes the one a header can be written with, and says so."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+
+    with pytest.raises(JevperError, match="must be strings"):
+        chat_client(stub, extra_headers={"X-Count": 3})
+
+    assert stub.requests == []
+
+
+def test_an_ordinary_header_still_reaches_the_wire(stub_server):
+    """Validation is not a filter: a legal header is sent exactly as written."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+    client = chat_client(stub, extra_headers={"X-Trace-Id": "abc-123", "X-Tenant": "eu-1"})
+
+    client.system_one(state="s", questions={"q": question()})
+
+    sent = {name.lower(): value for name, value in stub.header_pairs[0]}
+    assert sent["x-trace-id"] == "abc-123"
+    assert sent["x-tenant"] == "eu-1"
+
+
+def test_a_header_with_non_ascii_text_is_refused(stub_server):
+    """httpx encodes a header as ASCII, so a non-ASCII value cannot be sent at all."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+
+    with pytest.raises(JevperError, match="X-Label"):
+        chat_client(stub, extra_headers={"X-Label": "café"})
+
+    assert stub.requests == []

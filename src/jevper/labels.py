@@ -39,6 +39,19 @@ def labels_for(count: int) -> tuple[str, ...]:
     )
 
 
+
+def ascii_upper(text: str) -> str:
+    """Upper-case the ASCII letters only, which is the only case a label can be written in.
+
+    The labels are the ASCII alphabet, so folding case is a courtesy to a model that wrote ``a`` for
+    ``A`` — and nothing wider. ``str.upper`` is not: it maps ``ı`` (dotless i) to ``I``, ``ſ`` (long
+    s) to ``S`` and the Kelvin sign to ``K``, so a token that is not a label at all would be read as
+    one and the caller handed an option nobody sampled. Folding the 26 ASCII letters leaves every
+    other code point exactly as the provider sent it.
+    """
+    return "".join(chr(ord(char) - 32) if "a" <= char <= "z" else char for char in text)
+
+
 def label_to_key(question: Question, labels: Sequence[str]) -> dict[str, Any]:
     """Map each label to the value the answer must report for that option.
 

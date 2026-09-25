@@ -14,7 +14,7 @@ from typing import Any, Literal
 
 from .errors import ClientCapabilityError, JevperError, ProviderError
 from .reasoning import ReasoningConfig, ReasoningContentPart, ReasoningTextPart
-from .types import Method
+from .types import Method, bounded_text
 
 Surface = Literal["chat_completions", "responses", "messages"]
 
@@ -623,13 +623,94 @@ def _embedded_error(response: Any) -> ProviderError | None:
         return None
     message = _get(error, "message")
     code = _get(error, "code")
-    detail = message if isinstance(message, str) and message else "no message"
+    detail = bounded_text(message if isinstance(message, str) and message else "no message")
     status: int | None = None
     if isinstance(code, int) and not isinstance(code, bool):
         status = code
     elif isinstance(code, str) and code.strip().isdigit():
         status = int(code.strip())
     return ProviderError(f"provider reported an error: {detail}", status_code=status, embedded=True)
+
+
+def _event_stream_error(text: str) -> ProviderError | None:
+    """The provider's own failure carried in an SSE frame, where a response object belongs.
+
+    A server that answers a non-streaming request with ``text/event-stream`` has gone wrong about the
+    request, but not always about the answer, and the two streaming dialects report a failure
+    differently. OpenResponses sends ``event: error`` with the status and message in the payload;
+    OpenAI sends a typed ``response.failed`` whose ``response`` object carries ``status: "failed"``
+    and the same ``error``. Both hold the one thing a caller needs — what failed, and with which
+    status, which is what decides whether retrying is worth anything — so both are read, and only a
+    stream that carries no failure of its own is reported as the protocol mismatch it is.
+    """
+    for frame in text.split("\n\n"):
+        lines = [line for line in frame.splitlines() if line.strip()]
+        if not lines:
+            continue
+        event = ""
+        payloads: list[str] = []
+        for line in lines:
+            name, separator, value = line.partition(":")
+            if not separator:
+                continue
+            value = value.removeprefix(" ")
+            if name.strip() == "event":
+                event = value.strip()
+            elif name.strip() == "data":
+                payloads.append(value)
+        for payload in payloads:
+            if payload.strip() in ("[DONE]", ""):
+                continue
+            try:
+                body = json.loads(payload)
+            except ValueError:
+                continue
+            if not isinstance(body, Mapping):
+                continue
+            failure = _frame_failure(body, event=event)
+            if failure is not None:
+                return failure
+    return None
+
+
+def _frame_failure(body: Mapping[str, Any], *, event: str) -> ProviderError | None:
+    """The failure one decoded event frame carries, in either dialect, with its status if it had one."""
+    # OpenAI: {"type": "response.failed", "response": {"status": "failed", "error": {...}}}.
+    # OpenResponses: {"type": "error", "status": 429, "error": {...}}, and the plain proxy shape
+    # {"error": {...}} with no type at all.
+    candidates = [body]
+    nested = _get(body, "response")
+    if isinstance(nested, Mapping):
+        candidates.append(nested)
+    named_error = event == "error" or _get(body, "type") in ("error", "response.failed")
+    for candidate in candidates:
+        error = _get(candidate, "error")
+        if error is None and named_error and _get(candidate, "type") == "error":
+            error = candidate
+        if error is None:
+            continue
+        failure = _embedded_error({"error": error})
+        if failure is None:
+            continue
+        for source in candidates:
+            status = _get(source, "status") or _get(source, "code")
+            if failure.status_code is None and isinstance(status, int) and not isinstance(status, bool):
+                failure.status_code = status
+        return failure
+    return None
+
+
+def _event_stream_failure(response: str | bytes, surface: str) -> ProviderError:
+    """What to raise for a body that is an event stream, error frame or not."""
+    text = response.decode("utf-8", "backslashreplace") if isinstance(response, bytes) else response
+    failure = _event_stream_error(text)
+    if failure is not None:
+        return failure
+    return ProviderError(
+        f"the provider answered the {surface} request with a streaming event stream instead of a "
+        "response object; jevper reads the answer from one non-streaming response, so a streaming "
+        "route cannot be read here"
+    )
 
 
 def _stop_text(value: Any) -> str | None:
@@ -646,6 +727,11 @@ def _stop_text(value: Any) -> str | None:
 
 
 def _chat_result(response: Any, request: dict[str, Any]) -> CallResult:
+    if isinstance(response, (str, bytes)):
+        # A server that streams where a whole response belongs has not answered; an error frame
+        # inside that stream is the provider's own failure, and its status is what makes it
+        # retryable, so the frame is read before the mismatch is reported.
+        raise _event_stream_failure(response, "Chat Completions")
     failure = _embedded_error(response)
     if failure is not None:
         raise failure
@@ -790,13 +876,9 @@ def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
     if isinstance(response, (str, bytes)):
         # A server that answers a non-streaming request with an event stream (the OpenResponses
         # streaming dialect: ``event: response.completed`` with a ``data:`` line) is not sending a
-        # response object at all, and the SDK hands the raw text through. Reading that as an answer
-        # would spend every corrective retry on a protocol mismatch.
-        raise ProviderError(
-            "the provider answered with a streaming event stream instead of a response object; "
-            "jevper reads the answer from one non-streaming response, so a streaming route cannot "
-            "be read here"
-        )
+        # response object at all, and the SDK hands the raw text through. An ``event: error`` frame
+        # in that stream is the provider's own failure, status and all, so it is read first.
+        raise _event_stream_failure(response, "Responses")
     # An error carried in a 200 wins over anything the body also carries: a response that says both
     # "here is your answer" and "the upstream failed" is not an answer jevper can vouch for.
     failure = _embedded_error(response)
@@ -813,7 +895,7 @@ def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
         detail = _get(failure, "message") or failure
         raise ProviderError(
             f"the provider reported status={status!r} before the answer was complete"
-            + (f": {detail}" if isinstance(detail, str) and detail.strip() else "")
+            + (f": {bounded_text(detail)}" if isinstance(detail, str) and detail.strip() else "")
         )
     details = _get(usage, "output_tokens_details")
     input_details = _get(usage, "input_tokens_details")
@@ -838,7 +920,7 @@ def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
             raise ProviderError(
                 f"the provider left the answer item in status={item_status!r} before the answer "
                 "was complete"
-                + (f": {detail}" if isinstance(detail, str) and detail.strip() else "")
+                + (f": {bounded_text(detail)}" if isinstance(detail, str) and detail.strip() else "")
             )
     return CallResult(
         text=_responses_text(response),
@@ -1017,6 +1099,12 @@ def _messages_reasoning(response: Any) -> tuple[ReasoningContentPart, ...]:
 
 
 def _messages_result(response: Any, request: dict[str, Any]) -> CallResult:
+    if isinstance(response, (str, bytes)):
+        # The same mismatch the other two surfaces name: an event stream where a whole Message
+        # belongs. Reading it as an empty message would report a malformed answer and spend the
+        # corrective retries on a protocol problem, and an ``event: error`` frame inside it is the
+        # provider's own failure, which is worth reading before either verdict.
+        raise _event_stream_failure(response, "Messages")
     failure = _embedded_error(response)
     if failure is not None or _get(response, "type") == "error":
         raise failure or ClientCapabilityError("provider reported an error")
