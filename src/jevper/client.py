@@ -69,6 +69,8 @@ from .transport import (
     Surface,
     Transport,
     _has_attribute,
+    afetch_models,
+    fetch_models,
     make_transport,
     select_surface,
 )
@@ -79,13 +81,18 @@ from .types import (
     Example,
     Method,
     MethodSelection,
+    ModelMetadata,
     NoulAnswer,
     Question,
     ScoreAnswer,
+    SystemOnePayload,
     SystemOneResponse,
     Usage,
     bounded_text,
     ensure_encodable,
+    noul_carries_a_question,
+    parse_answer,
+    parse_models,
     parse_question,
 )
 
@@ -221,7 +228,7 @@ contains one of these words is somebody else's error, and retrying a programming
 caller's money to tell them nothing new."""
 METHODS: tuple[Method, ...] = ("logprobs", "grammar", "structured", "discrete")
 METHOD_SELECTIONS: tuple[MethodSelection, ...] = ("auto", *METHODS)
-APIS: tuple[Api, ...] = ("auto", "chat_completions", "responses", "messages")
+APIS: tuple[Api, ...] = ("auto", "chat_completions", "responses", "messages", "systemone")
 AUTO_METHOD: Method = "logprobs"  # what method="auto" tries first
 FALLBACK_METHOD: Method = "structured"  # what it answers with when logprobs are unavailable
 # Readout-level absences auto needs before it treats a provider as unable to return logprobs. One
@@ -947,6 +954,78 @@ class _QuestionOutcome:
     missing_labels: tuple[str, ...] = ()
 
 
+def _labels_for(question: Question) -> Sequence[str]:
+    """A question's labels: two for a noul, one per option or level otherwise."""
+    return labels_for(2 if question.type == "noul" else len(question.criteria))
+
+
+def _attempts_for(log: _CallLog, question_id: str) -> list[dict[str, Any]]:
+    """The one request's attempt records, attributed to the question being reported.
+
+    A batch answers N questions with a single request, and jevper records one attempt per question it
+    is answering: the request was the same, the question it was read for was not, and a trail naming
+    only the first would make the other answers look unattributed.
+    """
+    return [{**record, "question_id": question_id} for record in log.attempts]
+
+
+def _systemone_spec(
+    state: Any,
+    questions: Mapping[str, Question],
+    question_ids: Sequence[str],
+) -> CallSpec:
+    """The request for ``question_ids``, and only those: the service takes a map, and which
+    entries it carries is the batching decision rather than the wire format's."""
+    selected = {question_id: questions[question_id] for question_id in question_ids}
+    return CallSpec(messages=[], systemone=SystemOnePayload(state=state, questions=selected))
+
+def _systemone_outcome(
+    log: _CallLog,
+    result: CallResult,
+    question_id: str,
+    question: Question,
+    totals: tuple[dict[str, int | None], int, int] | None = None,
+    attempts: list[dict[str, Any]] | None = None,
+) -> _QuestionOutcome:
+    """One answer as the service sent it, as the outcome the rest of the library expects.
+
+    The service's own ``score``, ``confidence`` and ``choice`` are kept: it computed them from a
+    model trained for the decision, and jevper's formulas — which agree with it to within 0.015,
+    see ``docs/jev-comparison.md`` — are not a reason to replace them. ``totals`` carries the
+    request's usage when several questions shared one request, so that summing the outcomes
+    counts the call once rather than once per question it answered.
+    """
+    answers = result.response.get("answers") if isinstance(result.response, Mapping) else None
+    if not isinstance(answers, Mapping) or question_id not in answers:
+        raise MalformedAnswerError(
+            f"question {question_id!r}: the service's response carries no answer for it"
+            + (f"; it answered {sorted(answers)}" if isinstance(answers, Mapping) else "")
+        )
+    answer = parse_answer(question_id, question, answers[question_id])
+    tokens, n_calls, n_retries = (
+        totals if totals is not None else (log.tokens, log.n_calls, log.n_retries)
+    )
+    return _QuestionOutcome(
+        answer=answer,
+        reasoning=(),
+        tokens=tokens,
+        n_calls=n_calls,
+        n_retries=n_retries,
+        attempts=log.attempts if attempts is None else attempts,
+        retry_reasons=[],
+        readout_debug={
+            "source": "systemone",
+            "probabilities": {
+                str(key): float(value) for key, value in getattr(answer, "probabilities", {}).items()
+            },
+            "missing_labels": [],
+            "observed_text": None,
+        },
+        method="systemone",
+    )
+
+
+
 class _BaseClient:
     def __init__(
         self,
@@ -1130,7 +1209,7 @@ class _BaseClient:
             candidate = order[(start + step) % len(order)]
             if self._surface_missing(candidate):
                 continue
-            if not _has_attribute(self.client, f"{SURFACES[candidate][2]}.create"):
+            if not _has_attribute(self.client, SURFACES[candidate][2]):
                 continue
             if candidate == "messages" and method in ("logprobs", "grammar"):
                 continue
@@ -1293,7 +1372,7 @@ class _BaseClient:
             or resolve_reasoning_mode(reasoning, surface) == "native"
         ):
             return None
-        return other if _has_attribute(self.client, f"{SURFACES[other][2]}.create") else None
+        return other if _has_attribute(self.client, SURFACES[other][2]) else None
 
     def _note_surface_absence(
         self, model: str, surface: Surface, exc: _LogprobsUnavailable
@@ -1446,6 +1525,22 @@ class _BaseClient:
         effective_reasoning = reasoning if reasoning is not None else self.reasoning
         # The surface is picked for the method auto tries first; the fallback runs on either surface.
         surface = select_surface(self.client, effective_api, AUTO_METHOD if auto else requested)
+        if surface == "systemone":
+            # Everything below this line is about choosing how to ask a model a question in a prompt.
+            # This surface is the wire format itself: the questions go in the body, the service
+            # answers them, and none of the prompt machinery below applies.
+            return self._prepare_systemone(
+                state,
+                parsed,
+                examples,
+                effective_model,
+                requested,
+                method,
+                reasoning,
+                temperature,
+                prompt_cache_key,
+            ), parsed
+
         if api_auto and self._surface_missing(surface):
             # This server answered 404 for the route before: do not pay for the discovery again, and
             # start on the next surface in the documented order. When there is none — a messages-only
@@ -1512,6 +1607,76 @@ class _BaseClient:
         )
         return context, parsed
 
+    def _prepare_systemone(
+        self,
+        state: Any,
+        parsed: Mapping[str, Question],
+        examples: Examples,
+        model: str,
+        requested: Method,
+        method: Method | None,
+        reasoning: ReasoningConfig | None,
+        temperature: float | None,
+        prompt_cache_key: str | None,
+    ) -> _CallContext:
+        """A call on the System One surface, which is the wire format rather than a prompt.
+
+        Four of jevper's options have no field on this wire, and the service ignores what it does
+        not know — which is exactly why they are refused here rather than dropped in silence. One
+        error naming all of them, so a caller fixes the call in one go instead of one complaint per
+        attempt. ``method="auto"`` and no ``temperature`` are what this branch accepts, because they
+        are the values that ask for nothing.
+        """
+        for question_id, question in parsed.items():
+            # The one question rule the service itself enforces, mirrored where it is enforced: a
+            # prompt surface can render the question from a few-shot example, this wire format cannot.
+            if question.type == "noul" and not noul_carries_a_question(question):
+                raise InvalidQuestionError(
+                    f"question {question_id!r}: a noul must carry instructions or criteria; the Jev "
+                    "API answers 400 for one with neither"
+                )
+        refused: list[str] = []
+        if method is not None and requested != "auto":
+            refused.append(f"method={requested!r} (the service picks its own method here)")
+        if reasoning is not None or self.reasoning is not None:
+            refused.append("reasoning= (this wire format has no thinking field)")
+        if examples or self.examples or any(question.examples for question in parsed.values()):
+            refused.append("examples= (the System One request has no examples field)")
+        effective_temperature = temperature if temperature is not None else self.temperature
+        if effective_temperature is not None:
+            refused.append(f"temperature={effective_temperature!r} (this wire format takes none)")
+        effective_cache_key = (
+            prompt_cache_key if prompt_cache_key is not None else self.prompt_cache_key
+        )
+        if effective_cache_key is not None:
+            refused.append("prompt_cache_key= (there is no prompt here to cache)")
+        if refused:
+            raise ClientCapabilityError(
+                "api='systemone' cannot carry "
+                + ", ".join(refused)
+                + f"; drop {'it' if len(refused) == 1 else 'them'}, or use api='auto' with an "
+                "OpenAI-compatible client"
+            )
+        return _CallContext(
+            transport=make_transport(
+                self.client,
+                "systemone",
+                structured_outputs=self.structured_outputs,
+                extra_body=self.extra_body,
+                extra_headers=self.extra_headers,
+                limits=self._limits_for(model, "systemone"),
+            ),
+            model=model,
+            method="systemone",
+            mode="off",
+            reasoning=None,
+            temperature=None,
+            examples=(),
+            state_messages=(),
+            answer_reasoning=None,
+            analysis_reasoning=None,
+            prompt_cache_key=None,
+        )
     def _resolve_examples(
         self, question: Question, labels: Sequence[str], question_id: str, examples: Examples
     ) -> tuple[Example, ...]:
@@ -1785,7 +1950,14 @@ class _BaseClient:
         parsed: Mapping[str, Question],
         outcomes: Mapping[str, _QuestionOutcome],
         latency: float,
+        totals: tuple[dict[str, int | None], int, int] | None = None,
     ) -> SystemOneResponse:
+        """The call's response, from its per-question outcomes.
+
+        ``totals`` replaces the summed usage when every outcome came from one shared request — a
+        System One batch answers N questions with one request, and counting its tokens once per
+        question would report N times what the service charged.
+        """
         answers: dict[str, Answer] = {}
         reasoning: list[ReasoningContentPart] = []
         attempts: list[dict[str, Any]] = []
@@ -1814,6 +1986,11 @@ class _BaseClient:
                 value = outcome.tokens[name]
                 current = tokens[name]
                 tokens[name] = None if value is None or current is None else current + value
+        if totals is not None:
+            shared_tokens, shared_calls, shared_retries = totals
+            tokens = dict(shared_tokens)
+            n_calls = shared_calls
+            n_retries = shared_retries
         debug: dict[str, Any] = {
             "method": context.method,
             "api": context.transport.surface,
@@ -1907,6 +2084,39 @@ class SystemOneClient(_BaseClient):
         except StopIteration as stop:
             return stop.value
 
+    def _run_systemone_batch(
+        self,
+        state: Any,
+        parsed: Mapping[str, Question],
+        context: _CallContext,
+    ) -> tuple[dict[str, _QuestionOutcome], tuple[dict[str, int | None], int, int]]:
+        """Every question in one request, which is the shape the service is built for.
+
+        Measured against the live endpoint on 2026-09-26: eleven questions came back from one request
+        in 1.08 s, where the per-question path spends a round trip each. This is the default there,
+        and the price is granularity — a transient failure re-asks the whole batch, and a missing or
+        mistyped answer fails the call rather than one question of it — which is what ``batch=False``
+        buys back. The usage comes back with the outcomes because they all share one request: counted
+        per question it would report N times what the service charged.
+        """
+        log = _CallLog()
+        question_ids = list(parsed)
+        spec = _systemone_spec(state, parsed, question_ids)
+        result = self._call(log, question_ids[0], spec, context)
+        totals = (log.tokens, log.n_calls, log.n_retries)
+        outcomes = {
+            question_id: _systemone_outcome(
+                log,
+                result,
+                question_id,
+                parsed[question_id],
+                totals=totals,
+                attempts=_attempts_for(log, question_id),
+            )
+            for question_id in question_ids
+        }
+        return outcomes, totals
+
     def _call(
         self, log: _CallLog, question_id: str, spec: CallSpec, context: _CallContext
     ) -> CallResult:
@@ -1979,6 +2189,17 @@ class SystemOneClient(_BaseClient):
         context, parsed = self._prepare(
             state, questions, examples, model, method, api, reasoning, temperature, prompt_cache_key
         )
+        if context.transport.surface == "systemone":
+            # One request for every question, which is the shape the service is built to be asked:
+            # eleven questions came back from a single request in 1.08 s when measured on 2026-09-26.
+            # There is no per-question option here on purpose — on this surface the questions travel
+            # together because the service evaluates them together, and a caller who wants them apart
+            # is asking a different service.
+            outcomes, totals = self._run_systemone_batch(state, parsed, context)
+            return self._assemble(
+                context, parsed, outcomes, time.perf_counter() - start, totals=totals
+            )
+
         outcomes: dict[str, _QuestionOutcome] = {}
         failure: BaseException | None = None
         if len(parsed) == 1:
@@ -2036,6 +2257,18 @@ class SystemOneClient(_BaseClient):
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+    def list_models(self) -> list[ModelMetadata]:
+        """The models this deployment offers, from the System One endpoint's ``GET /v1/models``.
+
+        The one request on this library's account that is not an evaluation, and it needs no
+        ``api=``: the path is the service's, and the client object is the caller's own, so the same
+        object that answers a question lists the models it would answer with. The schema read here
+        is the one the service's OpenAPI declares — ``{"models": [{"name", "description",
+        "release_date"}]}`` — so a gateway that answers the path with its own list is reported as the
+        wrong shape rather than half-read.
+        """
+        return parse_models(fetch_models(self.client))
 
 
 class AsyncSystemOneClient(_BaseClient):
@@ -2110,6 +2343,30 @@ class AsyncSystemOneClient(_BaseClient):
             )
             return result
 
+    async def _run_systemone_batch(
+        self,
+        state: Any,
+        parsed: Mapping[str, Question],
+        context: _CallContext,
+    ) -> tuple[dict[str, _QuestionOutcome], tuple[dict[str, int | None], int, int]]:
+        log = _CallLog()
+        question_ids = list(parsed)
+        spec = _systemone_spec(state, parsed, question_ids)
+        result = await self._call(log, question_ids[0], spec, context)
+        totals = (log.tokens, log.n_calls, log.n_retries)
+        outcomes = {
+            question_id: _systemone_outcome(
+                log,
+                result,
+                question_id,
+                parsed[question_id],
+                totals=totals,
+                attempts=_attempts_for(log, question_id),
+            )
+            for question_id in question_ids
+        }
+        return outcomes, totals
+
     async def system_one(
         self,
         *,
@@ -2127,6 +2384,11 @@ class AsyncSystemOneClient(_BaseClient):
         context, parsed = self._prepare(
             state, questions, examples, model, method, api, reasoning, temperature, prompt_cache_key
         )
+        if context.transport.surface == "systemone":
+            outcomes, totals = await self._run_systemone_batch(state, parsed, context)
+            return self._assemble(
+                context, parsed, outcomes, time.perf_counter() - start, totals=totals
+            )
         semaphore = asyncio.Semaphore(self.max_concurrency)
 
         async def run(question_id: str, question: Question) -> _QuestionOutcome:
@@ -2154,6 +2416,10 @@ class AsyncSystemOneClient(_BaseClient):
         if failure is not None:
             raise failure
         return self._assemble(context, parsed, outcomes, time.perf_counter() - start)
+
+    async def alist_models(self) -> list[ModelMetadata]:
+        """The async twin of ``list_models``; the same request, awaited."""
+        return parse_models(await afetch_models(self.client))
 
     async def aclose(self) -> None:
         """The async client holds no resources of its own; the caller owns ``client``."""

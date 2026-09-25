@@ -42,11 +42,14 @@ not an SDK at all.
 A surface says *where* the request goes; a method says *how the decision is elicited*. They are
 independent, and each is resolved before the first request.
 
-**Surface** — the API dialect on the wire: `chat_completions`, `responses` or `messages`. With
-`api="auto"` the client is asked what it exposes, in that order: `responses.create`, then
-`chat.completions.create`, then `messages.create`. A pinned `api` is checked against the same three
-and refused with `ClientCapabilityError` before anything is sent. `grammar` is Chat-only, so it pins
-the surface itself.
+**Surface** — the API dialect on the wire: `chat_completions`, `responses`, `messages` or
+`systemone`. With `api="auto"` the client is asked what it exposes, in that order: `responses.create`,
+then `chat.completions.create`, then `messages.create`. A pinned `api` is checked against the same
+routes and refused with `ClientCapabilityError` before anything is sent. `grammar` is Chat-only, so it
+pins the surface itself. `systemone` is the Jev wire format — the questions in the request body, the
+answers back in the Jev shapes — and it is never chosen by `auto`, because both official SDKs have the
+`post` method it needs and a call must not start posting a Jev body by accident. It is described in
+[Jev and jevper, side by side](jev-comparison.md).
 
 **Method** — how the model is made to answer: `logprobs` reads the distribution off the first answer
 token, `grammar` constrains that token to one label per option, `structured` asks for a JSON object
@@ -55,12 +58,13 @@ choice is made per `(model, surface)`: the method this client has already learne
 otherwise `logprobs`, and `structured` where the provider cannot supply logprobs at all. `auto` never
 resolves to anything but `logprobs` or `structured` — see [Methods](methods.md#auto).
 
-| Method | Chat Completions | Responses | Messages |
-| --- | --- | --- | --- |
-| `logprobs` | `logprobs` + `top_logprobs` | `include` with `message.output_text.logprobs` | refused: that API has no logprobs |
-| `grammar` | GBNF `grammar` in `extra_body` | refused: no such field | refused |
-| `structured` | `response_format` JSON schema | `text.format` JSON schema | `output_config.format` in `extra_body`, plus the schema in the prompt |
-| `discrete` | as `structured` | as `structured` | as `structured` |
+| Method | Chat Completions | Responses | Messages | System One |
+| --- | --- | --- | --- | --- |
+| `logprobs` | `logprobs` + `top_logprobs` | `include` with `message.output_text.logprobs` | refused: that API has no logprobs | refused: the service answers in its own shape |
+| `grammar` | GBNF `grammar` in `extra_body` | refused: no such field | refused | refused |
+| `structured` | `response_format` JSON schema | `text.format` JSON schema | `output_config.format` in `extra_body`, plus the schema in the prompt | refused: there is no prompt to shape |
+| `discrete` | as `structured` | as `structured` | as `structured` | refused |
+| the service's own | — | — | — | what `auto` means there: the questions go in the body and the model answers them |
 
 A method that needs a field the surface does not have is refused locally, never silently downgraded:
 `UnsupportedMethodError` for a pinned method, one surface move for `auto` on the OpenAI surfaces, and

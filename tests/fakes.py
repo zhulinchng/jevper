@@ -209,10 +209,14 @@ class StubServer:
         chat: Script | None = None,
         responses: Script | None = None,
         messages: Script | None = None,
+        systemone: Script | None = None,
+        models: Any = None,
     ) -> None:
         self.chat = chat
         self.responses = responses
         self.messages = messages
+        self.systemone = systemone
+        self.models = models
         self.requests: list[dict[str, Any]] = []
         self.paths: list[str] = []
         self.headers: list[dict[str, Any]] = []
@@ -237,6 +241,8 @@ class StubServer:
                     script = stub.responses
                 elif self.path.endswith("/messages"):
                     script = stub.messages
+                elif self.path.endswith("/systemone"):
+                    script = stub.systemone
                 else:
                     script = stub.chat
                 answered: tuple[Any, ...]
@@ -266,6 +272,26 @@ class StubServer:
                 self.send_header("Content-Length", str(len(data)))
                 for name, value in response_headers.items():
                     self.send_header(name, str(value))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self) -> None:
+                # The System One endpoint's other route. Recorded like a POST so a test can see that
+                # jevper asked for the list, and answered with whatever the test scripted.
+                stub.paths.append(self.path)
+                stub.requests.append({"method": "GET"})
+                stub.headers.append(dict(self.headers))
+                stub.header_pairs.append(list(self.headers.items()))
+                if stub.models is None:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                status, payload = stub.models
+                data = json.dumps(payload).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
 

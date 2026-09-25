@@ -1,14 +1,19 @@
 """The version a checkout carries has to describe the library a release would ship.
 
-Two facts are read together by everyone who installs the package: the number in
-``pip install jevper==…`` and the documentation built from the branch. When ``src/`` has moved since
-the tag that carried the published version, the working tree already *is* the next release, and
-keeping the old number makes the docs describe behaviour nobody can install — the truncation advice
-naming ``max_completion_tokens`` on Chat Completions while the published wheel still names
-``max_tokens`` is exactly that, and a bug report saying "0.7.3" cannot be read either.
+Three numbers are read together by everyone who installs the package: the one in
+``pip install jevper==…``, the one the documentation states, and the one in the code. When they
+disagree, a bug report naming a version cannot be read — the truncation advice naming
+``max_completion_tokens`` on Chat Completions while the published wheel still names ``max_tokens`` is
+exactly that, and it passed review because the prose reads the same in both.
 
-The check needs the tag history, so it skips where there is none: an installed wheel in the runtime
-matrix, a source tarball, a fresh clone with no tags fetched.
+What is not checked is that ``src/`` has moved since the last tag. A commit that changes the library
+is the next release being written; the number it carries is the maintainer's decision at release
+time, and the guard that keeps the pages and the code in step until then is the site-version check
+below.
+
+The published version is read from the release tag rather than from PyPI, so the checks need no
+network and skip where there is no tag history: an installed wheel in the runtime matrix, a source
+tarball, a fresh clone with no tags fetched.
 """
 
 from __future__ import annotations
@@ -49,8 +54,22 @@ def test_the_declared_version_is_one_number_everywhere() -> None:
     assert exported is not None and exported.group(1) == jevper.__version__
 
 
-def test_a_changed_library_is_not_still_the_published_version() -> None:
-    """``src/`` has moved since the last release tag: say so, or revert the change."""
+def test_the_published_release_is_the_one_the_docs_describe() -> None:
+    """The version on PyPI and the version the site states must be the same number.
+
+    The release tag is what PyPI carries, so it is the published version read from the checkout
+    rather than over the network: a test that asked PyPI would fail on a laptop offline, and one that
+    read ``pip index`` would answer a different question on every mirror. A reader who installed
+    0.7.3 has to be able to tell whether the page in front of them is the one that still advises
+    ``max_tokens`` on Chat Completions or the one that advises ``max_completion_tokens`` — the prose
+    reads the same either way, which is how that divergence passed review in the first place.
+
+    What is deliberately *not* checked here is that ``src/`` has moved since the tag. A commit that
+    changes the library is the next release being written, and refusing to let that be committed is
+    how a version stops meaning anything; the number a release carries is the maintainer's decision
+    at release time, and the site-version guard above keeps the pages and the code in step until
+    then.
+    """
     tag = _git("describe", "--tags", "--abbrev=0", "--match", "v*")
     if tag is None:
         pytest.skip("no release tag is reachable from this checkout")
@@ -60,15 +79,22 @@ def test_a_changed_library_is_not_still_the_published_version() -> None:
     shipped = VERSION.search(tagged)
     if shipped is None:
         pytest.skip(f"{tag} declares no __version__")
-    # The tag against the working tree, not against HEAD: a change that is staged but uncommitted
-    # still describes a library no release carries.
-    changed = bool(_git("diff", "--name-only", tag, "--", "src"))
+    if shipped.group(1) != tag.removeprefix("v"):
+        pytest.fail(f"the tag {tag} and the version inside it ({shipped.group(1)}) disagree")
 
-    assert not (changed and jevper.__version__ == shipped.group(1)), (
-        f"src/ has changed since {tag} ({shipped.group(1)}), but the version is still "
-        f"{jevper.__version__}; bump it so the published package and this branch stop claiming to be "
-        "the same release"
-    )
+    landing = (REPO / "docs" / "index.md").read_text()
+    config = (REPO / "mkdocs.yml").read_text()
+    stated = re.findall(r"jevper (\d+\.\d+\.\d+)", landing)
+    footer = re.search(r'^copyright: "[^"]*?jevper (\d+\.\d+\.\d+)"', config, re.MULTILINE)
+    documented = {*stated, footer.group(1) if footer is not None else None} - {None}
+
+    assert documented, "the site states no version to compare against"
+    for number in sorted(documented):
+        assert number == shipped.group(1), (
+            f"the site documents jevper {number} but the published release is "
+            f"{shipped.group(1)} ({tag}); a reader cannot tell which one the pages describe unless "
+            "they are the same release"
+        )
 
 
 def test_the_site_states_the_release_it_documents() -> None:

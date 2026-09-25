@@ -23,8 +23,12 @@ def stub_server() -> Any:
         chat: Callable[..., Any] | None = None,
         responses: Callable[..., Any] | None = None,
         messages: Callable[..., Any] | None = None,
+        systemone: Callable[..., Any] | None = None,
+        models: Any = None,
     ) -> StubServer:
-        server = StubServer(chat=chat, responses=responses, messages=messages)
+        server = StubServer(
+            chat=chat, responses=responses, messages=messages, systemone=systemone, models=models
+        )
         servers.append(server)
         return server
 

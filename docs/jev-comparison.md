@@ -15,9 +15,7 @@ Where something could not be measured, it says so rather than guessing — see
 | jevper | 0.7.4 on this branch, `.venv` (Python 3.14, openai 3.19.0) |
 | Published docs | TypeSafe's API reference, confidence page, and the `jev-1.13` jaggedness page (reviewed 2026-09-17) |
 
-## The difference that decides everything: jevper cannot call this endpoint
-
-The hosted API takes one request per evaluation:
+## jevper can call this endpoint
 
 ```http
 POST https://api.typesafe.ai/v1/systemone
@@ -27,57 +25,76 @@ Content-Type: application/json
 {"state": "…", "model": "jev-latest", "questions": {"is_urgent": {"type": "noul", "instructions": "…"}}}
 ```
 
-jevper has no transport for that. It picks a surface by probing `responses.create`, then
-`chat.completions.create`, then `messages.create` ([Architecture](architecture.md)), renders the
-questions into a prompt, and reads a distribution back out of the model's answer. There is no code
-path in it that posts a `questions` map to `/v1/systemone`, so pointing jevper at a Jev key today
-does nothing useful: the surface probe finds no route and the call fails with a capability error.
+That request is what `api="systemone"` sends. The questions go in the body as typed questions rather
+than as a prompt, the model answers them together, and the answers come back as the Jev answer shapes.
+It is a fourth surface beside the three prompt ones ([Architecture](architecture.md)), reached through
+the same duck-typed client object — any object with `post(path, body=…, cast_to=…)`, which an `openai`
+client has:
 
-So the two are not competitors on the same endpoint. The hosted service is a purpose-built decision
-model reached over its own wire format; jevper is a client that puts the Jev question and answer
-shapes onto whatever OpenAI-compatible model you already have. If you hold a Jev key and want the
-real model, the reference SDK is the tool. If you want the Jev shapes over a model you control,
-[jevper](index.md) is.
+```python
+from openai import OpenAI
+from jevper import Choice, Noul, SystemOneClient
 
-The reverse direction is more interesting, and it works: **jevper's response model accepts the
-service's real payloads verbatim.** Every response captured below was fed to
-`SystemOneResponse.model_validate` and accepted — the string legend keys (`"0"`, `"1"`, `"2"`) come
-back as the `int` keys `ScoreAnswer.legend` declares, and the service's two-field `usage` fills
-jevper's wider `Usage` with its defaults for `n_calls`, `n_retries` and `latency`. The answer
-contract is compatible. Only the transport is missing, so bridging the two is a small adapter rather
-than a redesign.
+client = SystemOneClient(
+    OpenAI(base_url="https://api.typesafe.ai/v1", api_key=key), model="jev-latest", api="systemone"
+)
 
-There is a second, sharper limit in the way this model is served. The same free model over the
-*chat* route — the shape jevper speaks — answers:
-
-```json
-{"type": "error", "error": {"type": "FreeTierError", "message": "OpenCode's free tier can only be used from within OpenCode"}}
+response = client.system_one(
+    state="I was charged twice for the same order. Can someone look into this?",
+    questions={
+        "refund": Noul(instructions="Is the customer asking for a refund?"),
+        "team": Choice(instructions="Which team should handle this?",
+                       criteria={"billing": "Payments", "support": "Customer problems"}),
+    },
+)
 ```
 
-HTTP 403, on `POST https://opencode.ai/zen/v1/chat/completions`. The `systemone` route serves the
-same model to an ordinary HTTP client; the chat route does not. So even with a bridge, this
-particular deployment is reachable only as System One.
+Measured against the live endpoint on 2026-09-26, that call returned in 1.10 s: `refund` 0.72,
+`team` billing at confidence 0.99, `usage.n_calls` 1, and one attempt record per question naming the
+request it was read from. `client.list_models()` reads the service's other route the same way.
+
+Three things about this surface are worth knowing before you point a call at it.
+
+**The service's own numbers are kept.** `score`, `confidence`, `choice` and `legend` are read as they
+arrived rather than recomputed by jevper, because the service computed them from a model trained for
+the decision. jevper's formulas agree with it to within 0.015 (see below), which is a reason to trust
+them when a general model is doing the answering — not a reason to overwrite a trained model's
+arithmetic with them.
+
+**The options this wire format has no field for are refused, not dropped.** `method` other than
+`auto`, `reasoning`, `examples`, `temperature` and `prompt_cache_key` are all refused by name, in one
+error, before a request is sent. The service ignores what it does not know, so accepting them would
+mean reporting a method the caller did not get. A noul carrying neither instructions nor criteria is
+refused for the same reason the service answers 400 for one.
+
+**The surface is never chosen for you.** `api="auto"` keeps its documented order and does not post a
+Jev body to a client that happens to have a `post` method — both official SDKs do.
+
+What is still not the same as the service: the reference SDK is generated from the service's own
+OpenAPI schema, and jevper is an independent implementation of the same wire format. It reads the
+documented response shape and refuses a body that breaks it; it does not know about fields the
+service has not published.
 
 ## One request, or one per question
 
 | | Real Jev | jevper |
 | --- | --- | --- |
-| 11 questions in one call | 1 request, 1.08 s, 1094 input + 353 output tokens | 11 requests, `usage.n_calls == 11` |
-| The state | sent once, as the request's `state` field | sent in every request, wrapped in `<document>` |
-| The questions | become the request body | become a 305-character system prompt plus a per-question user turn |
-| Prompt caching | not applicable | `prompt_cache_key` offered on every request |
-| Question isolation | one evaluation per question, by construction | one worker per question (`_BaseClient._run`), so also isolated |
+| 11 questions in one call | 1 request, 1.08 s, 1094 input + 353 output tokens | 1 request on `systemone`; 11 requests on a prompt surface |
+| The state | sent once, as the request's `state` field | sent once as `state` on `systemone`; in every request on a prompt surface, wrapped in `<document>` |
+| The questions | become the request body | become the request body on `systemone`; a 305-character system prompt plus a per-question user turn otherwise |
+| Prompt caching | not applicable | `prompt_cache_key` offered on every prompt-surface request, refused on `systemone` |
+| Question isolation | one evaluation per question, by construction | the same on `systemone`, since the service evaluates each question on its own; one worker per question otherwise |
 
-The jevper column was measured against a fake provider object that records requests and answers with
-a schema-conforming distribution, because the OpenRouter daily free quota was exhausted
+The prompt-surface column was measured against a fake provider object that records requests and
+answers with a schema-conforming distribution, because the OpenRouter daily free quota was exhausted
 (`X-RateLimit-Remaining: 0`, `limit_source: openrouter_free_tier_daily`) before the comparison ran;
 the request count is jevper's own dispatch, not an artefact of the fake. Three questions produced
 three requests, eleven produced eleven.
 
-The cost shapes differ even where the totals look alike: the real service billed 1094 input tokens
-for the whole batch, jevper's fake billed 100 per request for 1100. What a real run costs depends
-entirely on the backend, but the round trips do not: N questions is N sequential-per-question
-requests, up to `max_concurrency` in flight, and one pass is one request each.
+So the round trips now match the service on the surface that talks to it, and do not on the ones that
+render a prompt. What a run costs still depends on the backend: the service billed 1094 input tokens
+for eleven questions, a prompt surface bills its prompt per question, and the free-tier model behind
+OpenRouter bills a different number again.
 
 ## The numbers agree
 
@@ -131,14 +148,14 @@ reference client, and it turns out to enforce almost nothing:
 | `instructions` as an object or an array | accepted | accepted | accepted |
 | `state` as an object or an array | accepted | accepted | accepted |
 | An empty `questions` map | 422 with a pydantic `detail` list | `TypeSafeError` before sending | rejected before sending |
-| A noul with neither instructions nor criteria | 400 `Noul question must have criteria or instructions` | accepted | accepted |
+| A noul with neither instructions nor criteria | 400 `Noul question must have criteria or instructions` | accepted | refused on `systemone`, accepted on a prompt surface, where the question can be rendered from an example |
 | An unknown field on a question (`temperature`) | ignored, 200 | rejected, `extra="forbid"` | rejected, `extra="forbid"` |
 
 The one row where jevper is stricter than the service it mirrors is the single-level score. The
 service answers it, and the answer is degenerate — all mass on level 0, score 0, confidence 1 — so
 jevper's refusal is a judgement, not a compatibility gap, and it is deliberate.
 
-## Four error envelopes, and none of them reach jevper
+## Four error envelopes
 
 The service signals failure four different ways, which is worth knowing before writing a client
 against it:
@@ -153,12 +170,11 @@ against it:
 | 422 | `{"detail": [{"type": "too_short", "loc": ["body", "questions"], "msg": "…"}]}` |
 
 A client that only parses `detail` misses the first three; one that only parses `error` misses the
-rest. jevper is in neither position, because it never calls this endpoint — and on the surfaces it
-does call, it classifies by status and retries the transient set (408, 409, 429 and 5xx), which puts
-400, 401 and 402 in the non-retryable branch as a `ProviderError`. That is the right outcome for all
-three, though for a different reason than the service's own taxonomy. The reference SDK raises its
-own exception family and parses `retry-after` and `retry-after-ms`; jevper honours the same two
-headers on its own surfaces, described in [Methods](methods.md).
+rest. On `api="systemone"` these reach the caller as a `ProviderError` carrying the service's own
+status and message — a 400 for too many score levels arrives with the service's wording — and the
+transient set (408, 409, 429 and 5xx) is retried on the same terms as every other surface. The
+reference SDK raises its own exception family and parses `retry-after` and `retry-after-ms`; jevper
+honours the same two headers everywhere, described in [Methods](methods.md).
 
 ## What the model does that jevper cannot promise
 

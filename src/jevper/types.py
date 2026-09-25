@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -20,7 +21,7 @@ from pydantic import (
     model_validator,
 )
 
-from .errors import InvalidQuestionError, JevperError
+from .errors import InvalidQuestionError, JevperError, MalformedAnswerError
 from .labels import MAX_CHOICE_OPTIONS
 from .reasoning import ReasoningContentPart
 
@@ -201,10 +202,48 @@ def ensure_encodable(value: Any, *, where: str, error: type[JevperError] = Jevpe
 
 Question = Noul | Choice | Score
 
-Method = Literal["logprobs", "grammar", "structured", "discrete"]
-# What you may pass as `method`: a concrete method, or "auto" to resolve one by observation.
+
+@dataclass(frozen=True)
+class SystemOnePayload:
+    """One System One request: the state, and the questions asked of it.
+
+    The state is the caller's value as they passed it, not a rendered prompt: this wire format takes
+    structured state, so a dict or a list arrives as itself rather than as text describing itself.
+    """
+
+    state: Any
+    questions: Mapping[str, Question]
+
+
+def question_on_wire(question: Question) -> dict[str, Any]:
+    """A question as ``POST /v1/systemone`` takes it.
+
+    An optional field the caller did not set is left off the body, as the service's own client does,
+    while a ``null`` *inside* ``criteria`` is kept: ``{"billing": null}`` is how a caller says this
+    option needs no description, and dropping the key would drop the option with it. Few-shot
+    examples are jevper's own field and have no place on this wire, which is why a question carrying
+    them is refused before a request rather than quietly sent without them.
+    """
+    wire: dict[str, Any] = {"type": question.type}
+    if question.instructions is not None:
+        wire["instructions"] = question.instructions
+    criteria = question.criteria
+    if criteria is None:
+        return wire
+    if isinstance(criteria, NoulCriteria):
+        wire["criteria"] = criteria.model_dump(exclude_none=True)
+    elif isinstance(criteria, Mapping):
+        wire["criteria"] = dict(criteria)
+    else:
+        wire["criteria"] = list(criteria)
+    return wire
+
+Method = Literal["logprobs", "grammar", "structured", "discrete", "systemone"]
+# What you may pass as `method`: a concrete method, "auto" to resolve one by observation, or nothing
+# to let the surface decide. "systemone" is not among them: it is what the System One endpoint's own
+# method is reported as, never something a caller can ask for on another surface.
 MethodSelection = Literal["auto", "logprobs", "grammar", "structured", "discrete"]
-Api = Literal["auto", "chat_completions", "responses", "messages"]
+Api = Literal["auto", "chat_completions", "responses", "messages", "systemone"]
 
 
 def validate_question(question: Question, question_id: str | None = None) -> None:
@@ -224,6 +263,10 @@ def validate_question(question: Question, question_id: str | None = None) -> Non
             raise InvalidQuestionError(
                 f"{where}: score needs {SCORE_MIN_LEVELS}..{SCORE_MAX_LEVELS} levels, got {count}"
             )
+    # A noul carrying no instructions and no criteria is refused on the System One surface, in
+    # `_prepare_systemone`, rather than here: the service answers 400 for one, but on a prompt
+    # surface jevper can render the question from a few-shot example, which `Noul(examples=…)`
+    # is.
     # Every string the question puts on the wire — its instructions, its option keys and their
     # descriptions — has to be encodable, and the cache key derived from them is hashed before the
     # first request. A lone surrogate in any of them is a question no request could carry.
@@ -357,3 +400,101 @@ class SystemOneResponse(BaseModel):
     @functools.cached_property
     def scores(self) -> dict[str, ScoreAnswer]:
         return {key: answer for key, answer in self.answers.items() if isinstance(answer, ScoreAnswer)}
+
+
+class ModelMetadata(BaseModel):
+    """One model the System One endpoint offers, as ``GET /v1/models`` describes it."""
+
+    name: str
+    description: str = ""
+    release_date: str | None = None
+    """``YYYY-MM-DD`` when the service reports one; ``None`` when it does not."""
+
+
+_ANSWER_TYPES: dict[str, type[Answer]] = {
+    "noul": NoulAnswer,
+    "choice": ChoiceAnswer,
+    "score": ScoreAnswer,
+}
+
+
+def parse_answer(question_id: str, question: Question, payload: Any) -> Answer:
+    """One answer as the System One endpoint sent it, as jevper's own answer type.
+
+    The other three surfaces hand a distribution to ``methods.readout`` and jevper computes the
+    score, the confidence and the choice from it. This one is the reverse: the service computed all
+    three from a model trained for the decision, and recomputing them here would replace its numbers
+    with jevper's — which agree to within 0.015 (see ``docs/jev-comparison.md``) but are not the
+    service's. So the answer is read as it arrived, with three checks the type system cannot make:
+    the answer is for a question that was asked, its ``type`` matches the question's, and the keys of
+    a score's distribution are its own levels.
+    """
+    if not isinstance(payload, Mapping):
+        raise MalformedAnswerError(
+            f"question {question_id!r}: the System One answer must be an object, got "
+            f"{type(payload).__name__}"
+        )
+    kind = payload.get("type")
+    if kind != question.type:
+        raise MalformedAnswerError(
+            f"question {question_id!r}: asked a {question.type} and the service answered "
+            f"{kind!r}"
+        )
+    if question.type == "score":
+        unknown = sorted(
+            str(key) for key in payload.get("probabilities", {}) if str(key) not in _level_texts(question)
+        )
+        if unknown:
+            raise MalformedAnswerError(
+                f"question {question_id!r}: the service answered with levels {unknown}, which are "
+                f"not this rubric's {_level_texts(question)}"
+            )
+    try:
+        return _ANSWER_TYPES[kind].model_validate(payload)
+    except ValidationError as exc:
+        raise MalformedAnswerError(
+            f"question {question_id!r}: {_validation_message(exc)}"
+        ) from None
+
+
+def noul_carries_a_question(question: Noul) -> bool:
+    """Whether a noul says what it is asking, which the System One wire format requires.
+
+    Measured against the live service on 2026-09-26: it answers 400 for a noul with no
+    ``instructions``, with ``instructions=""``, with ``criteria={}`` and with
+    ``criteria={"true": null, "false": null}`` — "Noul question must have criteria or
+    instructions" — and 200 for either side carrying any value. So the test is whether a value is
+    there, not whether the key is, and a ``NoulCriteria`` with both sides unset does not count.
+    """
+    if question.instructions:
+        return True
+    criteria = question.criteria
+    return criteria is not None and (criteria.true is not None or criteria.false is not None)
+
+
+def _level_texts(question: Question) -> set[str]:
+    """A score rubric's level indices as the wire spells them."""
+    return {str(level) for level in range(len(question.criteria))}
+
+
+def parse_models(payload: Any) -> list[ModelMetadata]:
+    """``GET /v1/models`` as the OpenAPI schema describes it: ``{"models": [...]}``.
+
+    Only that shape is read. A gateway that answers the path with its own model list — an OpenAI-style
+    ``{"data": [{"id": ...}]}``, which is what opencode Zen serves on the same URL — is a different
+    API wearing this path, and saying so is more use than guessing which of its fields was meant to
+    be a release date.
+    """
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("models"), list):
+        raise MalformedAnswerError(
+            "the model list must be an object with a 'models' array, as GET /v1/models documents; "
+            f"got {type(payload).__name__}"
+            + ("" if isinstance(payload, Mapping) else f" {payload!r:.100}")
+        )
+    models: list[ModelMetadata] = []
+    for index, entry in enumerate(payload["models"]):
+        try:
+            models.append(ModelMetadata.model_validate(entry))
+        except ValidationError as exc:
+            raise MalformedAnswerError(f"model {index}: {_validation_message(exc)}") from None
+    return models

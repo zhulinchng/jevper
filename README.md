@@ -12,9 +12,12 @@ The same call shape as `typesafe-sdk`, a different backend: point `jevper` at a 
 llama.cpp server and the `system_one(state=..., questions=...)` code reads the same, though the two packages
 are independent and neither imports the other.
 
-It does not call the hosted TypeSafe API and does not depend on `typesafe-sdk` or `openai` at runtime — the
-client object is duck-typed. Any object exposing `responses.create` or `chat.completions.create` works,
-including a self-hosted llama.cpp server.
+It does not depend on `typesafe-sdk` or `openai` at runtime — the client object is duck-typed. Any
+object exposing `responses.create` or `chat.completions.create` works, including a self-hosted
+llama.cpp server. With `api="systemone"` the same client object reaches the hosted Jev service instead:
+jevper posts the Jev request body to `/v1/systemone` and reads the Jev answer shapes back, and
+`list_models()` reads the service's model list. That path is measured in
+[docs/jev-comparison.md](https://github.com/zhulinchng/jevper/blob/main/docs/jev-comparison.md).
 
 The `responses` surface speaks both OpenAI's Responses API and the [OpenResponses](https://www.openresponses.org)
 specification, and both live at the same `/v1/responses` path — the OpenResponses site lists LM Studio among

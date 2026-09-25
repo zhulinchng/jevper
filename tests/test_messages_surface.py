@@ -493,11 +493,27 @@ def test_the_async_client_refuses_a_label_readout_too(stub_server):
     assert stub.requests == []
 
 
-def test_the_messages_surface_is_registered_once(stub_server):
-    """The registry entry is what ``api="auto"`` and the downgrade ladder look things up in."""
+def test_every_surface_is_registered_with_a_path_its_client_has(stub_server):
+    """The registry is what ``api="auto"`` and the downgrade ladder look things up in.
+
+    Its third field is the dotted path to the method ``Transport`` calls, so what is worth pinning is
+    that every declared surface has an entry and that each path is walkable on a real client of that
+    API — not which string it spells, which is what the entry is free to change.
+    """
+    from typing import get_args
+
+    from jevper.transport import Surface, _has_attribute
+
+    assert set(SURFACES) == set(get_args(Surface))
+    stub = stub_server(chat=lambda _: (200, chat_body(content="{}")))
+    openai_like = openai_client(stub)
+    for surface in ("chat_completions", "responses"):
+        builder, normalizer, path = SURFACES[surface]
+        assert callable(builder) and callable(normalizer)
+        assert _has_attribute(openai_like, path), f"{surface}: {path!r} is not on an OpenAI client"
     builder, normalizer, path = SURFACES["messages"]
-    assert path == "messages"
     assert callable(builder) and callable(normalizer)
+    assert _has_attribute(anthropic_client(stub), path)
 
 
 def test_a_mapping_shaped_response_is_read_too():

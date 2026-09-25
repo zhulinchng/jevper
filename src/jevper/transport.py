@@ -14,9 +14,9 @@ from typing import Any, Literal
 
 from .errors import ClientCapabilityError, JevperError, ProviderError
 from .reasoning import ReasoningConfig, ReasoningContentPart, ReasoningTextPart
-from .types import Method, bounded_text
+from .types import Method, SystemOnePayload, bounded_text, question_on_wire
 
-Surface = Literal["chat_completions", "responses", "messages"]
+Surface = Literal["chat_completions", "responses", "messages", "systemone"]
 
 JSON_SCHEMA_FORMAT = "json_schema"
 
@@ -28,6 +28,13 @@ JSON_SCHEMA_FORMAT = "json_schema"
 # budget, because Anthropic requires the budget to be strictly below ``max_tokens`` and answers 400
 # when it is not — a fixed 1024 would refuse the 1024 the docs call the floor.
 DEFAULT_MAX_TOKENS = 1024
+
+# The System One endpoint's two routes, relative to the client object's base URL — which, as with
+# every OpenAI-compatible client, already carries the version prefix. `OpenAI(base_url=
+# "https://api.typesafe.ai/v1")` reaches the service; a gateway that mounts the routes elsewhere is
+# reached by pointing that client somewhere else, the same way the other three surfaces are.
+SYSTEMONE_PATH = "/systemone"
+MODELS_PATH = "/models"
 
 
 @dataclass(frozen=True)
@@ -42,6 +49,10 @@ class CallSpec:
     temperature: float | None = None
     prompt_cache_key: str | None = None
     """The provider's cache-routing key for this request, or ``None`` to send no key at all."""
+    systemone: SystemOnePayload | None = None
+    """The Jev request body, for the System One surface. The other fields describe a prompt; this one
+    is the wire format itself, so it is built once and sent as it is. Which questions it carries is
+    the caller's choice: one per request, as every jevper surface does, or all of them at once."""
 
 
 @dataclass(frozen=True)
@@ -1144,14 +1155,73 @@ def _messages_result(response: Any, request: dict[str, Any]) -> CallResult:
     )
 
 
+def build_systemone_kwargs(
+    spec: CallSpec,
+    *,
+    model: str,
+    structured_outputs: bool = True,
+    extra_body: Mapping[str, Any] | None = None,
+    extra_headers: Mapping[str, Any] | None = None,
+    limits: Limits | None = None,
+) -> dict[str, Any]:
+    """The System One request: the payload itself, and the path and cast that carry it.
+
+    This surface is not a prompt, so the fields the other three builders assemble — messages, a
+    schema, logprobs, a temperature, a cache key — have nothing to fill. ``cast_to=dict`` is what an
+    ``openai`` client needs to hand back the parsed body rather than a model it expects to know the
+    shape of, and ``path`` is passed by keyword so a duck client with the same three-parameter shape
+    works unchanged.
+    """
+    if spec.systemone is None:  # pragma: no cover - the System One runner always sets it
+        raise ClientCapabilityError("a System One request needs a payload")
+    body: dict[str, Any] = {
+        "state": spec.systemone.state,
+        "model": model,
+        "questions": {
+            question_id: question_on_wire(question)
+            for question_id, question in spec.systemone.questions.items()
+        },
+    }
+    if extra_body:
+        # The caller's own fields, merged the way the other surfaces merge them: its value is the
+        # value on the wire. The service ignores a field it does not know, so this is a way to send
+        # what a deployment in front of it understands.
+        body.update(extra_body)
+    return {"path": SYSTEMONE_PATH, "body": body, "cast_to": dict}
+
+
+def _systemone_result(response: Any, request: dict[str, Any]) -> CallResult:
+    """A System One response as a ``CallResult``: the body, its usage, and nothing invented.
+
+    There is no text, no logprob list and no stop reason to read — the service returns decisions,
+    not a generation — so those stay empty rather than carrying a value that would read as one.
+    """
+    body = response if isinstance(response, Mapping) else _as_mapping(response)
+    failure = _embedded_error(body)
+    if failure is not None:
+        raise failure
+    usage = body.get("usage")
+    return CallResult(
+        text="",
+        token_logprobs=(),
+        reasoning=(),
+        surface="systemone",
+        request=request,
+        response=body,
+        input_tokens=_get(usage, "input_tokens"),
+        output_tokens=_get(usage, "output_tokens"),
+    )
+
+
 SurfaceBuilder = Callable[..., dict[str, Any]]
 SurfaceNormalizer = Callable[[Any, dict[str, Any]], CallResult]
 
-# surface -> (request builder, response normalizer, dotted path to the create method on the client)
+# surface -> (request builder, response normalizer, dotted path to the method on the client)
 SURFACES: dict[Surface, tuple[SurfaceBuilder, SurfaceNormalizer, str]] = {
-    "chat_completions": (build_chat_kwargs, _chat_result, "chat.completions"),
-    "responses": (build_responses_kwargs, _responses_result, "responses"),
-    "messages": (build_messages_kwargs, _messages_result, "messages"),
+    "chat_completions": (build_chat_kwargs, _chat_result, "chat.completions.create"),
+    "responses": (build_responses_kwargs, _responses_result, "responses.create"),
+    "messages": (build_messages_kwargs, _messages_result, "messages.create"),
+    "systemone": (build_systemone_kwargs, _systemone_result, "post"),
 }
 
 
@@ -1281,15 +1351,21 @@ class Transport:
         )
 
     def _endpoint(self) -> Any:
+        """The method this surface calls, reached by attribute alone.
+
+        The three OpenAI-shaped surfaces end in ``.create`` and the System One one in ``.post``, so
+        the registry names the whole path and what arrives here is the callable itself.
+        """
         endpoint = self.client
         for name in self.endpoint_path.split("."):
             endpoint = getattr(endpoint, name)
         return endpoint
 
+
     def call(self, spec: CallSpec, model: str) -> CallResult:
         kwargs = self.kwargs(spec, model)
         try:
-            response = self._endpoint().create(**kwargs)
+            response = self._endpoint()(**kwargs)
         except Exception as exc:  # noqa: BLE001 - re-raised below, carrying the provider's own error
             raise _provider_error_from(exc) from None
         if inspect.isawaitable(response):
@@ -1305,7 +1381,7 @@ class Transport:
 
     async def acall(self, spec: CallSpec, model: str) -> CallResult:
         kwargs = self.kwargs(spec, model)
-        create = self._endpoint().create
+        create = self._endpoint()
         if (
             not inspect.iscoroutinefunction(create)
             and type(self.client).__module__.split(".")[0] in ("openai", "anthropic")
@@ -1370,6 +1446,16 @@ def select_surface(client: Any, api: str, method: Method) -> Surface:
                 "api='chat_completions'/'responses' for an OpenAI-compatible one"
             )
         return "messages"
+    if api == "systemone":
+        # Never chosen by `auto`: `post` is a method many clients have for their own reasons, and a
+        # call that silently started posting a Jev body to whatever `post` means on that client would
+        # be the worst possible reading of an OpenAI-compatible surface.
+        if not _has_attribute(client, "post"):
+            raise ClientCapabilityError(
+                "api='systemone' needs a client with post(path, body=..., cast_to=...), which an "
+                "OpenAI client has: OpenAI(base_url='https://api.typesafe.ai/v1', api_key=...)"
+            )
+        return "systemone"
     if method == "grammar":
         if not has_chat:
             raise ClientCapabilityError(
@@ -1387,8 +1473,48 @@ def select_surface(client: Any, api: str, method: Method) -> Surface:
         # refused before any request is sent.
         return "messages"
     raise ClientCapabilityError(
-        "client exposes none of responses.create, chat.completions.create or messages.create"
+        "client exposes none of responses.create, chat.completions.create, messages.create or post"
     )
+
+
+def fetch_models(client: Any) -> Any:
+    """``GET /v1/models`` through the same client object, returning the parsed body.
+
+    The one request on this surface that is not a System One evaluation, and the reason the surface
+    needs ``get`` as well as ``post``: a caller who wants to know which models the deployment offers
+    before naming one in ``model=`` should not have to leave jevper to ask.
+    """
+    get = getattr(client, "get", None)
+    if not callable(get):
+        raise ClientCapabilityError(
+            "listing models needs a client with get(path, cast_to=...), which an OpenAI client has"
+        )
+    try:
+        return get(path=MODELS_PATH, cast_to=dict)
+    except Exception as exc:  # noqa: BLE001 - re-raised below, carrying the provider's own error
+        raise _provider_error_from(exc) from None
+
+
+async def afetch_models(client: Any) -> Any:
+    """``fetch_models`` for a client whose ``get`` is a coroutine function."""
+    get = getattr(client, "get", None)
+    if not inspect.iscoroutinefunction(get) and not callable(get):
+        raise ClientCapabilityError(
+            "listing models needs a client with get(path, cast_to=...), which an OpenAI client has"
+        )
+    try:
+        result = get(path=MODELS_PATH, cast_to=dict)
+        if inspect.isawaitable(result):
+            result = await result
+        elif not inspect.iscoroutinefunction(get):
+            # A blocking client in the async facade, called without a request being made: the
+            # coroutine is never produced, so there is nothing to await and nothing to report.
+            raise ClientCapabilityError(
+                "this client answers synchronously; use SystemOneClient for it"
+            )
+    except Exception as exc:  # noqa: BLE001 - re-raised below, carrying the provider's own error
+        raise _provider_error_from(exc) from None
+    return result
 
 
 def make_transport(

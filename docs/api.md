@@ -27,7 +27,10 @@ from the constructor rather than an option.
 
 `client` is any object exposing `responses.create`, `chat.completions.create` and/or `messages.create` (the
 Anthropic SDK's, pointed at any server that implements the Messages API); it stays owned by the caller
-(`close()` only shuts down jevper's own thread pool).
+(`close()` only shuts down jevper's own thread pool). With `api="systemone"` the object needs `post`
+instead, which an `openai` client has: `OpenAI(base_url="https://api.typesafe.ai/v1", api_key=…)`
+reaches the Jev service, and jevper posts the Jev request body itself. See
+[jev-comparison.md](jev-comparison.md).
 
 The `responses` surface speaks both OpenAI's Responses API and the [OpenResponses](https://www.openresponses.org)
 specification, and both are served at the same `/v1/responses` path. The OpenResponses site lists LM Studio
@@ -112,10 +115,18 @@ system_one(*, state, questions, examples=(), model=None, method=None, api=None, 
 | `examples` | `()` | Per-call examples: sequence for all questions, or mapping keyed by question id |
 | `model` | `None` | Overrides the constructor model |
 | `method` | `None` | Overrides the constructor method |
-| `api` | `None` | Overrides the constructor api |
+| `api` | `None` | Overrides the constructor api: `auto`, `chat_completions`, `responses`, `messages` or `systemone` |
 | `reasoning` | `None` | Overrides the constructor reasoning |
 | `temperature` | `None` | Overrides the constructor temperature |
 | `prompt_cache_key` | `None` | Overrides the constructor cache key; `None` keeps the constructor's (or the derived one) |
+
+On `api="systemone"` every question goes in one request — that is the shape the service is built to be
+asked — and four of the options above have no field on that wire, so they are refused by name in one
+error before anything is sent: a `method` other than `auto`, a `reasoning`, `examples`, a
+`temperature` and a `prompt_cache_key`. A noul carrying neither instructions nor criteria is refused
+there too, because the service answers 400 for one. The service's own `score`, `confidence`, `choice`
+and `legend` are read as they arrived rather than recomputed, and the request's usage is counted once
+for the whole call however many questions it answered.
 
 Per-call values win over constructor defaults. Everything is resolved and validated before the first provider
 call, so a bad question, an empty `questions` mapping, an unusable `state`, or `grammar` on the Responses
@@ -159,6 +170,19 @@ the state instead, so the conversation still ends on a question. Ending it on th
 question at all — the llama.cpp engines refuse it outright (`400 Failed to initialize samplers`, from both
 ollama and LM Studio) and a server that reads it as a prefill continues that turn rather than answering. The
 cost is that this one shape cannot reuse the question block as a cached prefix.
+
+### `list_models()` / `alist_models()`
+
+```python
+list_models() -> list[ModelMetadata]
+```
+
+The models the deployment offers, from the System One endpoint's `GET /v1/models`, read through the
+same client object and parsed as the service's own OpenAPI declares it —
+`{"models": [{"name", "description", "release_date"}]}`. A gateway answering that path with a list of
+its own is reported as the wrong shape rather than half-read. `ModelMetadata.description` defaults to
+`""` and `release_date` to `None` when the service omits them. `alist_models()` is the async twin.
+No `api=` is needed: the path is the service's, and the client is the caller's own.
 
 ### `close()` / `aclose()`
 
