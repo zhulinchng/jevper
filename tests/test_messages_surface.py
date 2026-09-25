@@ -722,3 +722,67 @@ def test_a_budget_resolves_to_the_thinking_field_under_mode_auto(stub_server):
     assert sent["max_tokens"] == DEFAULT_MAX_TOKENS + 1024
     assert response.debug["reasoning_mode"] == "native"
     assert response.answers["q"].choice == "billing"
+
+
+def test_a_caller_thinking_budget_gets_room_in_max_tokens(stub_server):
+    """A ``thinking`` object in ``extra_body`` carries the same rule a ReasoningConfig does.
+
+    The API requires ``budget_tokens < max_tokens``, so a caller who brings their own 2048-token
+    budget against jevper's 1024 default gets a request the API refuses before a token is generated —
+    the one failure a local check is strictly better at than a round trip.
+    """
+    stub = stub_server(messages=answer())
+    client = client_for(stub, extra_body={"thinking": {"type": "enabled", "budget_tokens": 2048}})
+
+    ask(client)
+
+    sent = body_sent(stub)
+    assert sent["max_tokens"] == DEFAULT_MAX_TOKENS + 2048
+    assert sent["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+
+
+def test_a_caller_max_tokens_that_cannot_hold_their_own_budget_is_refused_locally(stub_server):
+    """Both numbers are the caller's here, and the check is the same one jevper applies to its own."""
+    stub = stub_server(messages=answer())
+    client = client_for(
+        stub,
+        extra_body={
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "max_tokens": 4096,
+        },
+    )
+
+    with pytest.raises(JevperError) as raised:
+        ask(client)
+
+    assert "max_tokens=4096" in str(raised.value) and "budget_tokens=4096" in str(raised.value)
+    assert "extra_body['thinking']['budget_tokens']" in str(raised.value)
+    assert stub.requests == []
+
+
+def test_no_temperature_travels_beside_a_caller_thinking_budget(stub_server):
+    """The API refuses a temperature that is not its default alongside a thinking budget."""
+    stub = stub_server(messages=answer())
+    client = client_for(
+        stub,
+        temperature=0.3,
+        extra_body={"thinking": {"type": "enabled", "budget_tokens": 2048}},
+    )
+
+    ask(client)
+
+    sent = body_sent(stub)
+    assert "temperature" not in sent
+    assert "temperature" not in sent.get("extra_body", {})
+
+
+def test_a_disabled_caller_thinking_block_asks_for_no_room(stub_server):
+    """``"type": "disabled"`` is a configuration, not a budget, and nothing has to be made room for."""
+    stub = stub_server(messages=answer())
+    client = client_for(stub, extra_body={"thinking": {"type": "disabled"}})
+
+    ask(client)
+
+    sent = body_sent(stub)
+    assert sent["max_tokens"] == DEFAULT_MAX_TOKENS
+    assert sent["thinking"] == {"type": "disabled"}

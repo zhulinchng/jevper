@@ -217,9 +217,17 @@ def build_chat_kwargs(
     limits = limits or Limits()
     body = _caller_body(extra_body, limits)
     kwargs: dict[str, Any] = {"model": model, "messages": spec.messages}
-    if spec.logprobs and "logprobs" not in body:
-        kwargs["logprobs"] = True
-        kwargs["top_logprobs"] = spec.top_logprobs
+    if spec.logprobs:
+        # ``logprobs`` and ``top_logprobs`` are two fields, and a caller who names only the first in
+        # ``extra_body`` is still asking for a distribution: dropping the alternatives would answer
+        # with the sampled token's own logprob and no rivals, which the label readout cannot read.
+        # A caller who turned logprobs *off* keeps them off — ``top_logprobs`` without ``logprobs``
+        # is a 400 on OpenAI — and a caller who named both keeps their numbers.
+        wanted = body.get("logprobs", True)
+        if wanted and "logprobs" not in body:
+            kwargs["logprobs"] = True
+        if wanted and "top_logprobs" not in body:
+            kwargs["top_logprobs"] = spec.top_logprobs
     schema_sent = False
     if spec.json_schema is not None:
         if "response_format" in body:
@@ -330,16 +338,32 @@ def _get(obj: Any, name: str, default: Any = None) -> Any:
 
 
 def _as_mapping(obj: Any) -> dict[str, Any]:
-    """Best-effort mapping view of a provider object; an unreadable object maps to nothing."""
+    """Best-effort mapping view of a provider object; an unreadable object maps to nothing.
+
+    A ``model_dump`` that answers with something that is not a mapping is one of the unreadable
+    objects this promises to map to nothing: returning it would fail later, in a ``.get`` far from
+    here, and take an otherwise readable answer down with it. A dump that is a mapping but leaves
+    out the fields the object plainly has is read the other way round — a partial dump is a
+    serialization quirk, not a missing answer, and the attributes are right there.
+    """
     if isinstance(obj, Mapping):
         return dict(obj)
     dump = getattr(obj, "model_dump", None)
     if callable(dump):
-        # A ``model_dump`` that answers with something that is not a mapping is one of the unreadable
-        # objects this promises to map to nothing: returning it would fail later, in a ``.get`` far from
-        # here, and take an otherwise readable answer down with it.
-        dumped = dump()
-        return dict(dumped) if isinstance(dumped, Mapping) else {}
+        try:
+            dumped = dump()
+        except Exception:  # noqa: BLE001 - a dump that raises is an unreadable object, not a failure
+            dumped = None
+        if isinstance(dumped, Mapping) and dumped:
+            return dict(dumped)
+        attributes: dict[str, Any] = {}
+        try:
+            attributes = dict(vars(obj))
+        except TypeError:
+            attributes = {}
+        if isinstance(dumped, Mapping):
+            attributes = {**attributes, **dumped}
+        return attributes
     try:
         return dict(vars(obj))
     except TypeError:
@@ -475,7 +499,11 @@ def _embedded_error(response: Any) -> ProviderError | None:
     OpenRouter answers an overloaded upstream that way — ``{"id": ..., "error": {"message":
     "Upstream error from Nvidia: Service temporarily overloaded", "code": 503}}``, with no
     ``choices`` at all — so without this the call reads as a surface the client cannot parse. The
-    status travels with the error, which keeps a transient upstream failure retryable.
+    status travels with the error, which keeps a transient upstream failure retryable, and the code
+    arrives as a string about as often as a number (OpenRouter sends ``"503"``), which is read the
+    same way. An error beside a readable answer is still the error: a body that says both is a body
+    whose answer cannot be trusted, and a 200 is not a provider's way of reporting success with an
+    error attached.
     """
     error = _get(response, "error")
     if error is None:
@@ -483,16 +511,40 @@ def _embedded_error(response: Any) -> ProviderError | None:
     message = _get(error, "message")
     code = _get(error, "code")
     detail = message if isinstance(message, str) and message else "no message"
-    status = code if isinstance(code, int) and not isinstance(code, bool) else None
+    status: int | None = None
+    if isinstance(code, int) and not isinstance(code, bool):
+        status = code
+    elif isinstance(code, str) and code.strip().isdigit():
+        status = int(code.strip())
     return ProviderError(f"provider reported an error: {detail}", status_code=status)
 
 
+def _stop_text(value: Any) -> str | None:
+    """A stop reason as a hashable name, whatever the provider sent in the field.
+
+    The documented values are strings, and a provider that sends a list or a dict there is broken —
+    but a broken stop reason must not be a ``TypeError`` from a set lookup halfway through reading
+    the answer. Naming it as text keeps the failure where it belongs: an incomplete answer, reported
+    as one.
+    """
+    if value is None or isinstance(value, str):
+        return value
+    return str(value)
+
+
 def _chat_result(response: Any, request: dict[str, Any]) -> CallResult:
+    failure = _embedded_error(response)
+    if failure is not None:
+        raise failure
     choices = _get(response, "choices") or []
     choice = choices[0] if choices else None
     if not _usable_choice(choice):
-        raise _embedded_error(response) or ClientCapabilityError("provider returned no choices")
+        raise ClientCapabilityError("provider returned no choices")
+    # ``text`` is the legacy completions carrier, and a proxy that answers a chat request with one
+    # puts the answer there: the choice is already accepted as usable for carrying it, so read it.
     message = _get(choice, "message")
+    if message is None:
+        message = {"content": _get(choice, "text")}
     usage = _get(response, "usage")
     details = _get(usage, "completion_tokens_details")
     prompt_details = _get(usage, "prompt_tokens_details")
@@ -507,7 +559,7 @@ def _chat_result(response: Any, request: dict[str, Any]) -> CallResult:
         output_tokens=_get(usage, "completion_tokens"),
         reasoning_tokens=_chat_reasoning_tokens(usage, details),
         cached_tokens=_get(prompt_details, "cached_tokens"),
-        stop=_get(choice, "finish_reason"),
+        stop=_stop_text(_get(choice, "finish_reason")),
         refusal=_chat_refusal(message),
     )
 
@@ -563,10 +615,11 @@ def _responses_reasoning(response: Any) -> tuple[ReasoningContentPart, ...]:
 
 
 def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
-    if not (_get(response, "output") or []):
-        failure = _embedded_error(response)
-        if failure is not None:
-            raise failure
+    # An error carried in a 200 wins over anything the body also carries: a response that says both
+    # "here is your answer" and "the upstream failed" is not an answer jevper can vouch for.
+    failure = _embedded_error(response)
+    if failure is not None:
+        raise failure
     usage = _get(response, "usage")
     status = _get(response, "status")
     if status is not None and status not in ("completed", "incomplete"):
@@ -585,7 +638,8 @@ def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
     # A Responses call that hit the output budget says so here rather than in a finish_reason.
     stop = None
     if _get(response, "status") == "incomplete":
-        stop = _get(_get(response, "incomplete_details"), "reason") or "incomplete"
+        reason = _get(_get(response, "incomplete_details"), "reason")
+        stop = _stop_text(reason) or "incomplete"
     return CallResult(
         text=_responses_text(response),
         token_logprobs=_responses_token_logprobs(response),
@@ -657,22 +711,37 @@ def build_messages_kwargs(
         instruction = _schema_instruction(spec)
         system = f"{system}\n\n{instruction}" if system else instruction
     budget = spec.reasoning.budget_tokens if spec.reasoning is not None else None
+    caller_thinking = body.get("thinking")
+    caller_budget = (
+        caller_thinking.get("budget_tokens")
+        if isinstance(caller_thinking, Mapping) and caller_thinking.get("type") != "disabled"
+        else None
+    )
+    if not isinstance(caller_budget, int) or isinstance(caller_budget, bool):
+        caller_budget = None
     thinking = budget is not None and limits.thinking and "thinking" not in body
-    if thinking:
+    # A thinking budget is a thinking budget whoever set it: the caller's own ``thinking`` object in
+    # ``extra_body`` carries the same rule Anthropic enforces (budget strictly below max_tokens), so
+    # jevper sizes max_tokens for it exactly as it does for a ReasoningConfig — otherwise the request
+    # it builds is one the API refuses before a token is generated. A budget the server has already
+    # refused is not one: the request carries no thinking block, so nothing has to be made room for.
+    sent_budget = max(budget if thinking else 0, caller_budget or 0) or None
+    if sent_budget is not None:
         # Anthropic requires the budget to be strictly below ``max_tokens`` and answers 400 otherwise,
         # and jevper owns this default: a fixed 1024 would refuse the 1024 the docs call the floor. The
         # answer keeps the whole default and the thinking is paid for out of the extra.
-        default_max_tokens = DEFAULT_MAX_TOKENS + (budget or 0)
+        default_max_tokens = DEFAULT_MAX_TOKENS + sent_budget
     else:
         default_max_tokens = DEFAULT_MAX_TOKENS
     max_tokens = body.pop("max_tokens", default_max_tokens)
-    if thinking and isinstance(max_tokens, int) and budget is not None and max_tokens <= budget:
+    if sent_budget is not None and isinstance(max_tokens, int) and max_tokens <= sent_budget:
         # Anthropic requires the budget to be strictly below max_tokens, and jevper owns both numbers
         # unless the caller took one over. Spending a request on a request this code can already prove
         # the API will refuse is the one failure mode a local check is strictly better at.
         raise JevperError(
-            f"max_tokens={max_tokens} must be greater than the thinking budget_tokens={budget}; "
-            "raise max_tokens (extra_body={'max_tokens': n}) or lower ReasoningConfig(budget_tokens=n)"
+            f"max_tokens={max_tokens} must be greater than the thinking budget_tokens="
+            f"{sent_budget}; raise max_tokens (extra_body={{'max_tokens': n}}) or lower "
+            "ReasoningConfig(budget_tokens=n) / extra_body['thinking']['budget_tokens']"
         )
     kwargs: dict[str, Any] = {
         "model": model,
@@ -692,7 +761,7 @@ def build_messages_kwargs(
         body["output_config"] = {
             "format": {"type": JSON_SCHEMA_FORMAT, "schema": _api_schema(spec.json_schema)}
         }
-    if spec.temperature is not None and not thinking:
+    if spec.temperature is not None and sent_budget is None:
         # Not a typed parameter of the SDK's ``messages.create`` — the newest Claude models refuse a
         # non-default temperature, so the client stopped naming it — but the API itself still accepts
         # one, and every local server implementing this API reads it. Extended thinking is the
@@ -748,8 +817,9 @@ def _messages_reasoning(response: Any) -> tuple[ReasoningContentPart, ...]:
 
 
 def _messages_result(response: Any, request: dict[str, Any]) -> CallResult:
-    if _get(response, "type") == "error":
-        raise _embedded_error(response) or ClientCapabilityError("provider reported an error")
+    failure = _embedded_error(response)
+    if failure is not None or _get(response, "type") == "error":
+        raise failure or ClientCapabilityError("provider reported an error")
     usage = _get(response, "usage")
     details = _get(usage, "output_tokens_details")
     return CallResult(
@@ -766,7 +836,7 @@ def _messages_result(response: Any, request: dict[str, Any]) -> CallResult:
         # Anthropic reports what it read from its cache under this name; a server without prompt
         # caching reports nothing at all, which stays ``None`` rather than becoming a zero.
         cached_tokens=_get(usage, "cache_read_input_tokens"),
-        stop=_get(response, "stop_reason"),
+        stop=_stop_text(_get(response, "stop_reason")),
     )
 
 
@@ -832,9 +902,18 @@ class Transport:
 
 
 def _has_attribute(client: Any, path: str) -> bool:
+    """Whether the client exposes a callable at this dotted path, without letting it raise.
+
+    A property that raises is a client that cannot be used — a closed SDK client, a lazy loader that
+    failed to load — and the answer to "can this client do this?" is no. Letting its exception
+    escape would hand the caller the SDK's error from a place that promised a capability verdict.
+    """
     current = client
     for name in path.split("."):
-        current = getattr(current, name, None)
+        try:
+            current = getattr(current, name, None)
+        except Exception:  # noqa: BLE001 - any failure to reach the attribute means it is not there
+            return False
         if current is None:
             return False
     return callable(current)

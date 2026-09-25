@@ -193,6 +193,15 @@ refuses everything still ends in a `ProviderError`, and `debug["server_limits"]`
 field the caller put in `extra_body` is dropped with it: the SDK merges `extra_body` last, so leaving it there
 would re-send the refused field under another name.
 
+Two `extra_body` fields interact with jevper's own rather than replacing it, and both are read as the
+caller's configuration rather than as a reason to fail. `logprobs` and `top_logprobs` are two separate
+fields: naming only `logprobs` (any truthy value) still gets the alternatives jevper's label readout needs,
+and `logprobs: false` turns both off together, because `top_logprobs` without `logprobs` is a `400` on
+OpenAI. On the Messages surface a caller's own `thinking` object carries the same rule a
+`ReasoningConfig(budget_tokens=…)` does — the budget must be strictly below `max_tokens` — so jevper sizes
+`max_tokens` above it, leaves the temperature out beside it, and refuses locally when the caller's own
+`max_tokens` cannot hold the budget they named.
+
 A refusal of the *value* is not a refusal of the field, and the difference decides whether the field may be
 dropped at all. `budget_tokens: must be at least 1024`, `Invalid 'top_logprobs': integer must be between 0 and
 5`, `reasoning_effort must be one of low, medium, high` — each names a field the server knows and a number it
@@ -286,20 +295,25 @@ Constraints:
 
 Request: a strict JSON schema, with the model reporting a probability per option. Schema names are
 `jevper_choice`, `jevper_noul` and `jevper_score`; every object sets `additionalProperties: false` and lists
-all properties in `required`. The schemas carry no numeric bounds: strict mode does accept `minimum`/`maximum`
-(though not for fine-tuned models), but the constraint that matters here — the distribution summing to 1 — is
-not expressible in JSON Schema, so range checks are client-side either way.
+all properties in `required`. Each probability is bounded (`minimum: 0`, and for `noul` also
+`maximum: 1`): strict mode accepts those on the OpenAI surfaces, and the constraint that matters here — the
+distribution summing to 1 — is not expressible in JSON Schema, so that check is client-side either way. The
+Messages surface is the exception: Anthropic's structured outputs reject numerical constraints outright, so
+each bound is folded into the description of the field it bounded before the request goes out, and the
+prompt still carries the full schema.
 
 ```json
 {"type": "object",
  "properties": {"probabilities": {"type": "object",
-     "properties": {"billing": {"type": "number"}, "technical": {"type": "number"}, "sales": {"type": "number"}},
+     "properties": {"billing": {"type": "number", "minimum": 0},
+                    "technical": {"type": "number", "minimum": 0},
+                    "sales": {"type": "number", "minimum": 0}},
      "required": ["billing", "technical", "sales"], "additionalProperties": false}},
  "required": ["probabilities"], "additionalProperties": false}
 ```
 
-`noul` uses `{"noul": {"type": "number"}}` (the probability of `true`); `score` uses the level indexes
-`"0"`, `"1"`, … as keys.
+`noul` uses `{"noul": {"type": "number", "minimum": 0, "maximum": 1}}` (the probability of `true`); `score`
+uses the level indexes `"0"`, `"1"`, … as keys.
 
 Readout:
 
@@ -370,17 +384,24 @@ looking for a bug that is not there:
 
 - **The budget ran out.** Each surface has its own word for it — Chat Completions `finish_reason:
   "length"`, the Messages API `stop_reason: "max_tokens"`, the Responses surface `status: "incomplete"`
-  with `incomplete_details.reason: "max_output_tokens"` — and all of them reach the caller as *the
-  provider ran out of output tokens before the answer was complete*, with the field to raise. This
-  holds however the answer was cut off: mid-object, or with no `{` at all. The Messages API's other
-  reason, `model_context_window_exceeded`, is the same failure with the opposite remedy — the request
-  is already too long to answer in — so it arrives as *the provider's context window ran out*, naming
-  the state and the examples as what to shorten.
-- **The model refused.** Each surface puts a refusal in its own place, and jevper reads all three: a
-  `refusal` sibling of a null `content` on Chat Completions, a `refusal` content part on Responses, and
-  `stop_reason: "refusal"` on the Messages API. The message carries the model's own words, so a refusal
-  reads as a refusal rather than as malformed JSON, and one that arrives where the answer would have been
-  is never parsed as the answer.
+  with `incomplete_details.reason: "max_output_tokens"` (or the `"max_tokens"` spelling OpenAI's own
+  streaming example uses) — and all of them reach the caller as *the provider ran out of output tokens
+  before the answer was complete*, with the field to raise on **that** surface: `max_output_tokens` for
+  the Responses surface, which refuses a `max_tokens` it does not know, and `max_tokens` on Chat
+  Completions and the Messages API. This holds however the answer was cut off: mid-object, or with no `{`
+  at all. The Messages API's other reason, `model_context_window_exceeded`, is the same failure with the
+  opposite remedy — the request is already too long to answer in — so it arrives as *the provider's
+  context window ran out*, naming the state and the examples as what to shorten. A stop reason that is
+  not one the surface documents — or not a string at all — is reported the same way rather than read.
+- **The model refused, or the content was filtered.** Each surface puts a refusal in its own place, and
+  jevper reads all of them: a `refusal` sibling of a null `content` on Chat Completions, a `refusal`
+  content part on Responses, `stop_reason: "refusal"` on the Messages API, and a safety filter as
+  `finish_reason: "content_filter"` or a Responses `incomplete_details.reason` of the same name. A filter
+  is a refusal in everything but the word — the content was withheld on purpose — so both arrive as
+  `ModelRefusalError` with the provider's own report in the message, and neither is corrected: another
+  turn is refused the same way. The model's own words ride along when it gave them, so a refusal reads as
+  a refusal rather than as malformed JSON, and one that arrives where the answer would have been is never
+  parsed as the answer.
 - **The server separated reasoning from the answer and sent no answer.** A reasoning parser with thinking on
   does this (see [`local-servers.md`](local-servers.md)), and the message says so instead of "no non-whitespace
   token in the response".

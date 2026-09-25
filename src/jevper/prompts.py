@@ -182,6 +182,12 @@ def validate_example_probabilities(
     shape: the keys, a non-negative weight, and a ``Noul`` weight within [0, 1].
     """
     if question.type == "noul":
+        if not probabilities:
+            # The renderer looks up the demonstrated answer's own key, so an empty mapping is a
+            # KeyError at render time; a Noul example carries either no distribution or a real one.
+            raise InvalidQuestionError(
+                f"example {index}: noul probabilities must have a True or False key, got none"
+            )
         for name, value in probabilities.items():
             if name not in (True, False) and str(name).lower() not in ("true", "false"):
                 raise InvalidQuestionError(
@@ -198,7 +204,17 @@ def validate_example_probabilities(
         if question.type == "score"
         else list(question.criteria)
     )
-    given = {str(name): float(value) for name, value in probabilities.items()}
+    given: dict[str, float] = {}
+    for name, value in probabilities.items():
+        key = str(name)
+        if key in given:
+            # ``{1: 0.9, "1": 0.1}`` are two keys in Python and one in JSON, so the rendered
+            # demonstration would silently keep the last and drop the first. Say so instead.
+            raise InvalidQuestionError(
+                f"example {index}: probabilities keys {sorted(str(n) for n in probabilities)} both "
+                f"name the answer key {key!r}; use one spelling of it"
+            )
+        given[key] = float(value)
     if set(given) != set(expected):
         raise InvalidQuestionError(
             f"example {index}: probabilities must have exactly the keys {expected}, got {sorted(given)}"

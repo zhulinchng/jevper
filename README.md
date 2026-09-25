@@ -302,20 +302,23 @@ unusable `state`, a `model` that is not a non-empty string, a count option that 
 | `ClientCapabilityError` | the client lacks the attribute the chosen surface needs, or the response carried no choices and no explanation of why |
 | `LabelReadoutError` | the first answer token is not a label, or the provider returned no logprobs (or no alternatives, or no logprob for that token). The provider-side cases are not corrective-retried, and `method="auto"` answers them with `structured` |
 | `MalformedAnswerError` | the JSON answer had an unusable shape after corrective retries |
-| `IncompleteAnswerError` | the provider stopped generating before the answer was complete — `finish_reason: "length"`, `stop_reason: "max_tokens"`, a Responses `status: "incomplete"`, or a filtered answer. A `ProviderError` subclass, and terminal: a cut-off generation is not something a corrective retry can fix |
-| `ModelRefusalError` | the model declined to answer and the provider said so. Also a `ProviderError` subclass, and terminal — a refusal is complete, not broken |
-| `ProviderError` | a provider call failed; `.attempts` carries the attempt history and `.status_code` the status the provider reported — including one carried inside a `200` body, which is how OpenRouter reports an upstream failure |
+| `IncompleteAnswerError` | the provider stopped generating before the answer was complete — `finish_reason: "length"`, `stop_reason: "max_tokens"`, a Responses `status: "incomplete"`, or a stop reason the surface does not document. A `ProviderError` subclass, and terminal: a cut-off generation is not something a corrective retry can fix |
+| `ModelRefusalError` | the model declined to answer — its own `refusal`, or a safety filter (`content_filter`) — and the provider said so. Also a `ProviderError` subclass, and terminal: a refusal is complete, not broken |
+| `ProviderError` | a provider call failed; `.attempts` carries the attempt history and `.status_code` the status the provider reported — including one carried inside a `200` body, which is how OpenRouter reports an upstream failure, and which wins over any answer the same body carries |
 | `JevperError` | constructor misuse, a bad `state` message, or content that is not JSON-serializable |
 
-Transient failures (HTTP 408/429/500/502/503/504/529, connection and timeout errors — including the `httpx`
-transport errors whose class names carry neither word) are retried per call with
+Transient failures (HTTP 408, 409, 429 and any 5xx — the set both official SDKs retry — plus the
+transport and timeout errors the SDKs and the standard library raise, and whatever an `x-should-retry`
+header says, which outranks the status) are retried per call with
 `RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0, respect_retry_after=True)`. The wait is the
-provider's own instruction when it sent one: a `Retry-After` (seconds or an HTTP date) or the millisecond
-`retry-after-ms` replaces the exponential backoff `min(base_delay · 3ⁿ, max_delay)`, which is what the
-TypeSafe clients do — coming back sooner than a rate limit asked only extends it. `max_delay` caps jevper's
-curve, not the server's number; `respect_retry_after=False` goes back to the curve alone. Unreadable answers
-get one corrective retry (`n_retry_malformed`) with the failure appended to the conversation. `ProviderError`
-propagates after all questions have settled, in question insertion order.
+provider's own instruction when it sent one: a `Retry-After` (delta-seconds or an HTTP date) or the
+millisecond `retry-after-ms` replaces the exponential backoff `min(base_delay · 3ⁿ, max_delay)`, which is
+what the TypeSafe clients do — coming back sooner than a rate limit asked only extends it. `max_delay` caps
+jevper's curve, not the server's number; a header past a day (`jevper.client.MAX_RETRY_AFTER`) is not an
+instruction any client should carry out, so the curve answers instead; `respect_retry_after=False` goes back
+to the curve alone. Unreadable answers get one corrective retry (`n_retry_malformed`) with the failure
+appended to the conversation. `ProviderError` propagates after all questions have settled, in question
+insertion order.
 
 ## Tracing
 

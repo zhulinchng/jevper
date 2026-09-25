@@ -176,10 +176,21 @@ def softmax_over_labels(values: Mapping[str, float]) -> dict[str, float]:
 
     A grammar masks logits but never renormalizes them, so renormalizing the pre-mask distribution
     over the label set equals the post-mask distribution: one code path is correct for both.
+
+    A log probability is never positive, so a value above zero is not a distribution to normalize
+    but a different quantity sent in its place — a gateway that passes probabilities through as
+    logprobs, or a server with the sign flipped. Exponentiating those would turn ``0.9`` and
+    ``-0.1`` into a confident-looking 73/27 split that no model ever reported, so they are refused
+    with the number that gave them away.
     """
     for key, value in values.items():
         if value != float("-inf") and (math.isnan(value) or value == float("inf")):
             raise LabelReadoutError(f"logprob for {key!r} must be finite or -inf, got {value!r}")
+        if value > 0.0:
+            raise LabelReadoutError(
+                f"logprob for {key!r} is positive ({value!r}), which no log probability can be — the "
+                f"provider sent something other than logprobs"
+            )
     best = max(values.values(), default=float("-inf"))
     if best == float("-inf"):
         raise LabelReadoutError("no probability mass on any label")
@@ -241,16 +252,33 @@ the opposite one: the request is already too long to answer, so raising ``max_to
 Anthropic names the two differently for that reason, and the message says which one happened."""
 
 
-def _truncation_message(stop: str) -> str:
-    """The error text for a generation that ran out of room, naming the room that ran out."""
+_REFUSAL_STOPS = frozenset({"refusal", "content_filter"})
+"""What each surface calls "the model did not answer": the Messages API reports a declined turn as
+``stop_reason: "refusal"``, and OpenAI reports a safety-filtered generation as
+``finish_reason: "content_filter"`` on Chat Completions and ``incomplete_details.reason:
+"content_filter"`` on the Responses surface. A filter is a refusal in everything but the word: the
+content was withheld on purpose, so a second attempt spends a call to be filtered the same way, and
+the error says so instead of reporting a generation that stopped early."""
+
+
+def _truncation_message(stop: str, surface: str) -> str:
+    """The error text for a generation that ran out of room, naming the room and the knob that opens it.
+
+    The output-budget field is the surface's own, because they do not share a name: Chat Completions
+    and the Messages API call it ``max_tokens`` (OpenAI's current name for the first is
+    ``max_completion_tokens``), while the Responses surface calls it ``max_output_tokens`` and
+    refuses a ``max_tokens`` it does not know. Advice naming the wrong field is advice that cannot be
+    followed.
+    """
     if stop in _CONTEXT_STOPS:
         return (
             f"the provider's context window ran out before the answer was complete ({stop!r}); "
             f"shorten the state or the examples, or use a model with a larger context"
         )
+    knob = "max_output_tokens" if surface == "responses" else "max_tokens"
     return (
         f"the provider ran out of output tokens before the answer was complete ({stop!r}); "
-        f"raise the limit, for example extra_body={{'max_tokens': 2048}}"
+        f"raise the limit, for example extra_body={{{knob!r}: 2048}}"
     )
 
 
@@ -267,11 +295,11 @@ def _stop_note(result: CallResult) -> str:
     otherwise, which sends a caller looking for a parsing bug that is not there.
     """
     if result.stop in _TRUNCATED_STOPS:
-        return f" — {_truncation_message(result.stop)}"
+        return f" — {_truncation_message(result.stop, result.surface)}"
     note = f" — the provider reported {result.stop!r}" if result.stop is not None else ""
     if result.refusal:
         note += f" — the model refused to answer: {result.refusal[:200]!r}"
-    elif result.stop == "refusal":
+    elif result.stop in _REFUSAL_STOPS:
         note += " — the model refused to answer"
     if not result.text.strip() and result.reasoning:
         # A reasoning parser can put the whole generation in the reasoning channel and send no answer
@@ -301,20 +329,44 @@ def answer_failure(result: CallResult) -> ProviderError | None:
     attempt spends a call to be cut short or refused the same way. The TypeSafe reference adapter
     rejects the same three cases for the same reason.
     """
-    if result.refusal or result.stop == "refusal":
+    if result.refusal or result.stop in _REFUSAL_STOPS:
         message = "the model refused to answer"
         if result.refusal:
             message += f": {result.refusal[:200]!r}"
+        elif result.stop == "content_filter":
+            message += ": the provider filtered the content for safety"
         if result.stop:
             message += f" — the provider reported {result.stop!r}"
         return ModelRefusalError(message)
     if result.stop in _TRUNCATED_STOPS:
-        return IncompleteAnswerError(_truncation_message(result.stop))
+        return IncompleteAnswerError(_truncation_message(result.stop, result.surface))
     if result.stop is not None and result.stop not in _COMPLETE_STOPS.get(result.surface, frozenset()):
         return IncompleteAnswerError(
             f"the provider stopped before the answer was complete ({result.stop!r})"
         )
     return None
+
+
+def _agree_with_answer_text(sampled: str, text: str, labels: Sequence[str]) -> None:
+    """Refuse a sampled token that contradicts an answer text that names a different label.
+
+    The label readout reads the sampled token; the answer text is the same generation seen through
+    another channel. When both are label-shaped and they disagree, one of the two is not this
+    answer — a proxy stitching two responses, a server whose logprobs belong to another request — and
+    reporting either as the answer would be a coin flip presented as a decision. The bounded
+    correction path gets its turn instead.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return
+    first = stripped[: max(len(sampled), 8)].strip().upper()
+    if not first or first not in labels:
+        return
+    if first != sampled.strip().upper():
+        raise LabelReadoutError(
+            f"the sampled token {sampled!r} contradicts the answer text, which starts with the label "
+            f"{first!r}; the provider's logprobs and its text are not from the same generation"
+        )
 
 
 def first_answer_token(result: CallResult, labels: Sequence[str], *, method: Method) -> TokenLogprob:
@@ -331,6 +383,7 @@ def first_answer_token(result: CallResult, labels: Sequence[str], *, method: Met
         if not token.token.strip():
             continue
         if token.token.strip().upper() in labels:
+            _agree_with_answer_text(token.token, result.text, labels)
             return token
         raise LabelReadoutError(
             f"first non-whitespace token {token.token!r} is not one of the labels {list(labels)!r}"
@@ -365,15 +418,17 @@ def _logprob_readout(
             missing_labels=(),
             observed_text=result.text,
         )
-    if token.reported_alternatives < 2:
+    if token.reported_alternatives < 2 or not token.top_logprobs:
         # Nothing but the sampled token came back, so there is no distribution to read: the answer
-        # would be a one-hot built from absence of data. A provider that reports two or more entries
-        # but nulls for some of them is a different case — those labels are missing, not unknown,
-        # and land in debug["labels_missing"].
+        # would be a one-hot built from absence of data. A provider that reports entries but nulls
+        # every one of them is the same absence in a different shape — those labels are missing
+        # rather than unknown, and with no rival at all there is nothing to normalize over.
+        unusable = "" if token.reported_alternatives < 2 else ", none of which carried a logprob"
         raise _LogprobsUnavailable(
-            f"the provider returned {token.reported_alternatives} top_logprobs for the answer token "
-            f"{token.token!r} (method={method!r}), which is not a distribution over the options; use "
-            f"method='structured' for the model's own probabilities, or method='discrete' for one label",
+            f"the provider returned {token.reported_alternatives} top_logprobs{unusable} for the answer "
+            f"token {token.token!r} (method={method!r}), which is not a distribution over the options; "
+            f"use method='structured' for the model's own probabilities, or method='discrete' for one "
+            f"label",
             evidence="readout",
             surface=result.surface,
         )
@@ -418,30 +473,57 @@ def parse_json_object(text: str, note: str = "") -> dict[str, Any]:
     ``note`` says why the provider stopped, and it belongs on all three failure paths: an answer cut off
     mid-object — which is what a spent output budget looks like, and the ``{`` is there but the rest is
     not — reads as a parse bug otherwise, when the actionable fact is the budget.
+
+    Prose around the object is tolerated, because a model that says "here you go: {...}" has answered.
+    A *second* object is not: two answers in one response is a generation that contradicted itself,
+    and reading the first would report one of the two as the answer without ever saying the other
+    existed. The bounded correction path gets a turn at it instead.
     """
     try:
         value = json.loads(text)
-    except json.JSONDecodeError as first_error:
+    except ValueError as first_error:  # JSONDecodeError, and the int-conversion limit it shares
         start = text.find("{")
         if start < 0:
             raise MalformedAnswerError(
                 f"no JSON object in the answer ({first_error}){note}"
             ) from first_error
         try:
-            value, _ = json.JSONDecoder().raw_decode(text[start:])
+            value, end = json.JSONDecoder().raw_decode(text[start:])
         except ValueError as exc:
             raise MalformedAnswerError(
                 f"could not parse a JSON object from the answer ({exc}){note}"
             ) from exc
+        rest = text[start + end :]
+        next_object = rest.find("{")
+        if next_object >= 0:
+            try:
+                json.JSONDecoder().raw_decode(rest[next_object:])
+            except ValueError:
+                pass  # a brace in prose is not a second answer
+            else:
+                raise MalformedAnswerError(
+                    f"the answer carries more than one JSON object{note}"
+                )
     if not isinstance(value, dict):
         raise MalformedAnswerError(f"expected a JSON object, got {type(value).__name__}{note}")
     return value
 
 
 def _number(value: Any, *, where: str, upper: float | None = None) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise MalformedAnswerError(f"{where} must be a finite number, got {value!r}")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        # An integer with more digits than a float holds: json parses it happily, and both
+        # ``math.isfinite`` and ``float`` raise OverflowError on it. It is not a number this contract
+        # can carry, and the answer is as malformed as one that is out of range.
+        raise MalformedAnswerError(
+            f"{where} is too large to be a number, got an integer of "
+            f"{len(str(abs(value)))} digits"
+        ) from None
+    if not math.isfinite(number):
+        raise MalformedAnswerError(f"{where} must be a finite number, got {value!r}")
     if number < 0 or (upper is not None and number > upper):
         bound = ">= 0" if upper is None else f"in [0, {upper}]"
         raise MalformedAnswerError(f"{where} must be {bound}, got {number!r}")

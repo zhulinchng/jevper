@@ -246,20 +246,30 @@ Worth keeping when editing:
   including in the re-asks the ladder performs.
 - An answer that never arrived says why, and a generation the provider itself cut short is never read as one.
   `CallResult.stop` carries the provider's own reason — `finish_reason` on Chat Completions,
-  `incomplete_details.reason` on the Responses surface, `stop_reason` on the Messages API — and
-  `methods.answer_failure` reads it before any readout runs: a truncation (`length`, `max_tokens`,
-  `max_output_tokens`, `model_context_window_exceeded`) or any other non-terminal stop raises
-  `IncompleteAnswerError`, and a refusal raises `ModelRefusalError`. Both are `ProviderError` subclasses and
-  both are terminal, because a correction turn changes the prompt and not the budget the provider stopped at or
-  the fact that the model declined. The truncation message names the room that ran out: a spent context
-  window is told to shorten the state rather than to raise `max_tokens`, which would lengthen the request.
-  The readouts keep the reason on the errors they raise for an answer that did arrive but could not be
-  read, including the two `parse_json_object` paths where the answer contained a `{` but could not be
-  parsed. `CallResult.refusal` carries the model's own words, so a refusal reads as a refusal rather than
-  as malformed JSON.
-- Capability failures are not corrective-retried, and neither are refusals or a spent budget: a correction turn
- changes the prompt, not what the provider reports. Only the model-side failures (a non-label token, an
-  unusable JSON shape) are worth another call.
+  `incomplete_details.reason` on the Responses surface, `stop_reason` on the Messages API — normalized to text
+  so a server that sends a list there is reported as a bad stop reason rather than crashing a set lookup.
+  `methods.answer_failure` reads it before any readout runs, and before the two-step analysis is quoted into
+  the answer prompt: a truncation (`length`, `max_tokens`, `max_output_tokens`,
+  `model_context_window_exceeded`) or any other non-terminal stop raises `IncompleteAnswerError`, and a refusal
+  or a safety filter (`refusal`, `content_filter`) raises `ModelRefusalError`. Both are `ProviderError`
+  subclasses and both are terminal, because a correction turn changes the prompt and not the budget the
+  provider stopped at or the fact that the model declined or withheld the content. The truncation message names
+  the room that ran out and the knob that opens it — the surface's own field, `max_output_tokens` on the
+  Responses surface and `max_tokens` elsewhere — while a spent context window is told to shorten the state
+  rather than to raise `max_tokens`, which would lengthen the request. The readouts keep the reason on the
+  errors they raise for an answer that did arrive but could not be read, including the two `parse_json_object`
+  paths where the answer contained a `{` but could not be parsed. `CallResult.refusal` carries the model's own
+  words, so a refusal reads as a refusal rather than as malformed JSON.
+- Capability failures are not corrective-retried, and neither are refusals, filters or a spent budget: a
+  correction turn changes the prompt, not what the provider reports. Only the model-side failures (a non-label
+  token, an unusable JSON shape) are worth another call.
+- One generation, one answer. A `200` that carries a provider `error` is that error, whatever else the body
+  holds — a body that says both is not an answer jevper can vouch for — and the error's `code`, read as a
+  number or a digit string, keeps a transient upstream failure retryable. A sampled token that contradicts an
+  answer text naming a different label is refused rather than read: the two are two views of one generation,
+  and when they disagree neither is trusted. An answer holding more than one JSON object is malformed, because
+  reading the first hides that the model answered twice. A logprob above zero is not a log probability, and
+  alternatives that are all unusable are no distribution at all.
 - A logprob readout needs at least two candidates, unless the question has only one option. `top_logprobs`
   with nothing but the sampled token is not a distribution over a contest, so it raises instead of
   reporting the answer as certain; with a single label there is no contest and the sampled token is the

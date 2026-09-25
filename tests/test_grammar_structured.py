@@ -417,3 +417,286 @@ def test_schemas_bound_probabilities(stub_server):
 
     noul_schema = noul_stub.bodies("/chat/completions")[0]["response_format"]["json_schema"]["schema"]
     assert noul_schema["properties"]["noul"] == {"type": "number", "minimum": 0, "maximum": 1}
+
+
+# --- boundaries the Jev API sets ------------------------------------------------------------------
+
+
+def test_the_widest_choice_the_api_allows_is_answered(stub_server):
+    """255 options is the documented maximum, and its last label is two letters long.
+
+    The suite already proves 256 is refused; the widest legal question is the one where a label
+    readout stops being single-letter and the mapping from label to key has to hold at the far end.
+    """
+    criteria = {f"option_{index}": None for index in range(255)}
+    last = list(criteria)[-1]
+    stub = stub_server(chat=lambda _: (200, chat_body(content='{"choice": "JU"}')))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="discrete", api="chat_completions"
+    )
+
+    response = client.system_one(
+        state="s", questions={"q": Choice(criteria=criteria, instructions="Pick one")}
+    )
+
+    answer = response.answers["q"]
+    assert answer.choice == last
+    assert answer.probabilities == {key: (1.0 if key == last else 0.0) for key in criteria}
+    assert answer.confidence == 1.0
+
+
+def test_the_widest_score_the_api_allows_is_answered(stub_server):
+    """Ten levels is the documented maximum, and level 9 is the last index the legend carries."""
+    levels = [str(index) for index in range(10)]
+    stub = stub_server(chat=lambda _: (200, chat_body(content='{"score": 9}')))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="discrete", api="chat_completions"
+    )
+
+    response = client.system_one(
+        state="s", questions={"q": Score(criteria=levels, instructions="How bad?")}
+    )
+
+    answer = response.answers["q"]
+    assert answer.score == 9.0
+    assert answer.probabilities == {index: (1.0 if index == 9 else 0.0) for index in range(10)}
+    assert answer.legend == {index: str(index) for index in range(10)}
+
+
+@pytest.mark.parametrize(("value", "expected"), [("0", 0.0), ("1", 1.0)])
+def test_a_noul_reads_both_ends_of_its_interval(stub_server, value, expected):
+    """0 and 1 are inside ``[0, 1]``, and neither is normalized away from what the model said."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps({"noul": expected}))))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions"
+    )
+
+    response = client.system_one(state="s", questions={"q": Noul()})
+
+    assert response.answers["q"].noul == expected
+    assert response.usage.n_calls == 1
+
+
+def test_a_uniform_distribution_is_no_confidence_at_all(stub_server):
+    """A flat distribution is the honest answer to a question the model cannot decide."""
+    answer = '{"probabilities": {"billing": 0.5, "technical": 0.5}}'
+    stub = stub_server(chat=lambda _: (200, chat_body(content=answer)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions"
+    )
+
+    response = client.system_one(
+        state="s", questions={"q": Choice(criteria={"billing": None, "technical": None})}
+    )
+
+    result = response.answers["q"]
+    assert result.confidence == 0.0
+    assert result.probabilities == {"billing": 0.5, "technical": 0.5}
+
+
+def test_a_tie_is_broken_by_criteria_order_not_alphabet(stub_server):
+    """Two equal maxima resolve to the first option the caller wrote, which is a choice they made."""
+    answer = '{"probabilities": {"zeta": 0.5, "alpha": 0.5}}'
+    stub = stub_server(chat=lambda _: (200, chat_body(content=answer)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="chat_completions"
+    )
+
+    response = client.system_one(
+        state="s",
+        questions={"q": Choice(criteria={"zeta": "Z", "alpha": "A"})},
+    )
+
+    result = response.answers["q"]
+    assert result.choice == "zeta"
+    assert result.confidence == 0.0
+    assert list(result.probabilities) == ["zeta", "alpha"]
+    assert response.debug["probability_errors"] == {}
+
+
+# --- a distribution the provider did not actually report -------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [0.9, 1.0, 2.5])
+def test_a_positive_logprob_is_not_a_distribution(stub_server, bad):
+    """A log probability is never above zero, so one that is says the field carries something else.
+
+    A gateway that passes raw probabilities through as logprobs would otherwise be exponentiated into
+    a confident-looking split no model ever reported.
+    """
+    body = chat_body(content="A", logprobs=[("A", bad)], alternatives=[("A", bad), ("B", -0.1)])
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="logprobs", api="chat_completions"
+    )
+
+    with pytest.raises(LabelReadoutError) as raised:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "positive" in str(raised.value)
+
+
+def test_alternatives_that_carry_no_logprob_are_not_a_distribution(stub_server):
+    """Two null alternatives are two missing labels, and with no rival at all there is nothing to read."""
+    body = chat_body(content="A")
+    body["choices"][0]["logprobs"] = {
+        "content": [
+            {
+                "token": "A",
+                "logprob": 0.0,
+                "bytes": [65],
+                "top_logprobs": [
+                    {"token": "B", "logprob": None, "bytes": [66]},
+                    {"token": "C", "logprob": None, "bytes": [67]},
+                ],
+            }
+        ]
+    }
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="logprobs",
+        api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(LabelReadoutError) as raised:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "none of which carried a logprob" in str(raised.value)
+
+
+def test_a_sampled_token_that_contradicts_the_answer_text_is_refused(stub_server):
+    """The logprobs and the text are two views of one generation; when they disagree, neither is trusted."""
+    body = chat_body(content="B", logprobs=[("A", -0.12), ("B", -2.47), ("C", -3.48)])
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="logprobs",
+        api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(LabelReadoutError) as raised:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "contradicts the answer text" in str(raised.value)
+
+
+def test_an_answer_text_that_is_not_a_label_does_not_contradict_anything(stub_server):
+    """A JSON answer on the logprob channel is not a rival claim: the text is prose, the token is the label."""
+    body = chat_body(
+        content='{"probabilities": {"billing": 0.8, "technical": 0.1, "sales": 0.1}}',
+        logprobs=CHOICE_LOGS,
+    )
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="logprobs", api="chat_completions"
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+
+
+# --- the answer's own JSON -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        '{"probabilities": {"billing": 0.1, "technical": 0.1, "sales": 0.8}}',
+        ' and then {"probabilities": {"billing": 0.1, "technical": 0.1, "sales": 0.8}}',
+    ],
+)
+def test_two_json_objects_in_one_answer_are_malformed(stub_server, second):
+    """A generation that answered twice contradicts itself, and reading the first hides that."""
+    first = '{"probabilities": {"billing": 0.8, "technical": 0.1, "sales": 0.1}}'
+    stub = stub_server(chat=lambda _: (200, chat_body(content=first + second)))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="structured",
+        api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(MalformedAnswerError) as raised:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "more than one JSON object" in str(raised.value)
+
+
+@pytest.mark.parametrize("digits", [400, 5000])
+def test_a_number_too_large_to_be_one_is_malformed(stub_server, digits):
+    """A 400-digit integer parses and overflows a float; a 5000-digit one does not even parse.
+
+    Neither may leave as a raw ``OverflowError``/``ValueError`` from the middle of a readout.
+    """
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content='{"probabilities": {"billing": ' + "9" * digits + "}}"))
+    )
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="structured",
+        api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(MalformedAnswerError):
+        client.system_one(state="s", questions={"q": Choice(criteria={"billing": None})})
+
+
+# --- a caller who takes over a field --------------------------------------------------------------
+
+
+def test_a_caller_who_names_logprobs_still_gets_the_alternatives(stub_server):
+    """``logprobs`` and ``top_logprobs`` are two fields; naming the first is not naming the second.
+
+    Sending ``logprobs: true`` alone returns the sampled token's own logprob and no rivals, which the
+    label readout cannot read — a caller who asked for the distribution gets a failure instead.
+    """
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="logprobs",
+        api="chat_completions",
+        extra_body={"logprobs": True},
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    body = stub.bodies("/chat/completions")[0]
+    assert body["logprobs"] is True
+    assert body["top_logprobs"] == 20
+    assert response.answers["q"].choice == "billing"
+
+
+def test_a_caller_who_turns_logprobs_off_sends_neither_field(stub_server):
+    """``top_logprobs`` without ``logprobs`` is a 400 on OpenAI, so the caller's off is respected whole."""
+    def script(body):
+        # A server that was not asked for logprobs does not send any.
+        if body.get("logprobs"):
+            return 200, chat_body(content="A", logprobs=CHOICE_LOGS)
+        return 200, chat_body(content="A")
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="logprobs",
+        api="chat_completions",
+        extra_body={"logprobs": False},
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(LabelReadoutError):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    body = stub.bodies("/chat/completions")[0]
+    assert "top_logprobs" not in body
+    assert body["logprobs"] is False

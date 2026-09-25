@@ -12,7 +12,7 @@ import contextvars
 import math
 import threading
 import time
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
 from datetime import timezone
@@ -87,10 +87,22 @@ from .types import (
     parse_question,
 )
 
-TRANSIENT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504, 529})
-# 429 means "slow down" and 408 means the request timed out; only the server's own failures can be the
-# logprob request's fault, so neither counts as capability evidence.
-_SERVER_ERROR_STATUS_CODES = TRANSIENT_STATUS_CODES - {408, 429}
+TRANSIENT_STATUS_CODES = frozenset({408, 409, 429})
+"""The statuses below 500 that both official SDKs retry: 408 (the request timed out), 409 (OpenAI's
+lock timeout, which Anthropic also retries) and 429 (slow down). Every 5xx is retried too, which is
+why this is a set and not the whole rule — see :func:`_is_transient_status`. 429 and 408 can be the
+logprob request's own fault, so neither counts as capability evidence; a 5xx can be nothing but the
+server's, and is."""
+
+
+def _is_transient_status(status: int | None) -> bool:
+    """Whether this HTTP status is the provider's own transient failure, by the SDKs' rule."""
+    return status is not None and (status in TRANSIENT_STATUS_CODES or status >= 500)
+
+
+def _is_server_error(status: int | None) -> bool:
+    """Whether the provider answered with a 5xx of its own: never the request's fault."""
+    return status is not None and status >= 500
 _LOGPROB_REJECTION_STATUS_CODES = frozenset({400, 403, 422})
 # Text that says the provider refuses the *field itself*: the capability evidence ``auto`` remembers.
 # "requires" and "must be set" are how a server states a structural condition rather than a bad value:
@@ -158,8 +170,42 @@ _THINKING_MARKERS = ("thinking", "budget_tokens")
 # an unrelated message can easily contain a short model name, and a server that does not implement
 # the Responses route answers 404 there with a message about the route.
 _MODEL_404_MARKERS = ("model", "no such", "not exist")
-_TRANSIENT_NAME_MARKERS = ("Connection", "Timeout")
-_TRANSIENT_TRANSPORT_CLASSES = frozenset({"TransportError", "TimeoutException"})
+_SHOULD_RETRY = "x-should-retry"
+_TRANSIENT_EXCEPTION_CLASSES = frozenset(
+    {
+        # httpx: every transport failure derives from TransportError, named individually anyway so a
+        # client that raises its own look-alike is still recognised.
+        "ConnectError",
+        "ConnectTimeout",
+        "ReadError",
+        "ReadTimeout",
+        "WriteError",
+        "WriteTimeout",
+        "PoolTimeout",
+        "RemoteProtocolError",
+        "TransportError",
+        "TimeoutException",
+        # openai / anthropic
+        "APIConnectionError",
+        "APITimeoutError",
+        # urllib / http.client / ssl, and the socket errors they raise
+        "URLError",
+        "HTTPException",
+        "IncompleteRead",
+        "ChunkedEncodingError",
+        "SSLError",
+        "SSLEOFError",
+        "ConnectionResetError",
+        "ConnectionAbortedError",
+        "ConnectionRefusedError",
+        "BrokenPipeError",
+        "NewConnectionError",
+    }
+)
+"""Exception *class names* that mean the request never reached an answer: the httpx transport family,
+the two SDKs' connection errors, and the standard library's. Matched whole — a name that merely
+contains one of these words is somebody else's error, and retrying a programming error wastes the
+caller's money to tell them nothing new."""
 METHODS: tuple[Method, ...] = ("logprobs", "grammar", "structured", "discrete")
 METHOD_SELECTIONS: tuple[MethodSelection, ...] = ("auto", *METHODS)
 APIS: tuple[Api, ...] = ("auto", "chat_completions", "responses", "messages")
@@ -195,30 +241,77 @@ class RetryPolicy(BaseModel):
     respect_retry_after: bool = True
 
 
-def _status_code(exc: BaseException) -> int | None:
-    """The provider's HTTP status, when the exception carries one in a readable form."""
-    status = getattr(exc, "status_code", None)
-    if status is None:
-        # httpx.HTTPStatusError keeps it on the response instead, and its MRO carries no transport
-        # marker, so without this it would be neither retried nor classified.
-        status = getattr(getattr(exc, "response", None), "status_code", None)
-    if status is None or isinstance(status, bool):
+def _response_of(exc: BaseException) -> Any:
+    """The response an exception carries, by attribute or by mapping key — both are shapes in the wild."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        response = getattr(exc, "_response", None)
+    if response is None and isinstance(getattr(exc, "__dict__", None), Mapping):
+        response = exc.__dict__.get("response")
+    return response
+
+
+def _field(source: Any, name: str) -> Any:
+    """One field of a duck-typed object, read as an attribute or as a mapping key."""
+    value = getattr(source, name, None)
+    if value is None and isinstance(source, Mapping):
+        value = source.get(name)
+    return value
+
+
+def _read_status(value: Any) -> int | None:
+    """One status value as an int, or ``None`` when it is not a status at all."""
+    if value is None or isinstance(value, bool):
         return None
     try:
-        return int(status)
-    except (TypeError, ValueError):
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        # ``int(float("inf"))`` raises OverflowError, and a duck client is free to put anything in the
+        # attribute: an unreadable status is an absent one, never a reason to fail the call here.
         return None
+
+
+def _status_code(exc: BaseException) -> int | None:
+    """The provider's HTTP status, when the exception carries one in a readable form."""
+    status = _read_status(_field(exc, "status_code"))
+    if status is None:
+        # httpx.HTTPStatusError keeps it on the response instead, and its MRO carries no transport
+        # marker, so without this it would be neither retried nor classified. A response is consulted
+        # whenever the direct attribute is missing *or* unreadable: the response is the more reliable
+        # of the two, and skipping it on a malformed direct value loses a status that was right there.
+        status = _read_status(_field(_response_of(exc), "status_code"))
+    return status
+
+
+def _should_retry(exc: BaseException) -> bool | None:
+    """What the provider asked for through ``x-should-retry``, when it said anything at all.
+
+    Both official SDKs give this header precedence over their status defaults: OpenAI returns it when
+    a request is worth repeating despite the status, and Anthropic does the same, so a gateway in
+    front of either can decide for the client. Reading it as a plain status rule makes the opposite
+    decision on both counts.
+    """
+    headers = _field(exc, "headers")
+    if _header(headers, _SHOULD_RETRY) is None:
+        headers = _field(_response_of(exc), "headers")
+    asked = _header(headers, _SHOULD_RETRY)
+    if asked is None:
+        return None
+    return asked.strip().casefold() == "true"
 
 
 def _is_transient(exc: BaseException) -> bool:
-    if _status_code(exc) in TRANSIENT_STATUS_CODES:
+    decided = _should_retry(exc)
+    if decided is not None:
+        return decided
+    if _is_transient_status(_status_code(exc)):
         return True
+    # Matched whole, not by substring: a caller's own ``ConnectionProgrammingError`` is a programming
+    # error, and repeating the request cannot make it go away. The set is the httpx transport family
+    # (whose failures are named after neither "Connection" nor "Timeout", which is why their base
+    # classes are listed too), the two SDKs' connection errors, and the standard library's.
     names = {cls.__name__ for cls in type(exc).__mro__}
-    # Transport failures of the httpx family (ConnectError, ReadError, RemoteProtocolError, ...) are
-    # named after neither "Connection" nor "Timeout"; their base classes are the reliable marker.
-    if names & _TRANSIENT_TRANSPORT_CLASSES:
-        return True
-    return any(marker in name for name in names for marker in _TRANSIENT_NAME_MARKERS)
+    return bool(names & _TRANSIENT_EXCEPTION_CLASSES) or isinstance(exc, (TimeoutError, ConnectionError))
 
 
 def _retry_delay(policy: RetryPolicy, attempt: int, exc: BaseException | None = None) -> float:
@@ -244,21 +337,34 @@ def _retry_delay(policy: RetryPolicy, attempt: int, exc: BaseException | None = 
     return delay
 
 
+def _sleep_before_retry(delay: float, policy: RetryPolicy) -> None:
+    """Wait out the delay, degrading to the policy's own ceiling if this runtime cannot sleep it.
+
+    ``MAX_RETRY_AFTER`` is the ceiling measured on the platforms this library runs on, but a runtime
+    whose ``time_t`` is narrower still exists (32-bit musl), and there ``time.sleep`` raises
+    ``OverflowError`` instead of sleeping. The caller's own ``max_delay`` is then the next best
+    answer: a wait nobody can take is not a wait worth dying over.
+    """
+    try:
+        time.sleep(delay)
+    except OverflowError:
+        time.sleep(min(policy.max_delay, delay))
+
+
 _RETRY_AFTER_MS = "retry-after-ms"
 _RETRY_AFTER = "retry-after"
 
 
 def _header(headers: Any, name: str) -> str | None:
-    """One response header as text, from an ``httpx.Headers`` or a plain mapping.
+    """One response header as text, from an ``httpx.Headers``, a plain mapping, or a pair sequence.
 
     HTTP field names are case-insensitive, and a plain mapping is not: a client that hands its
     exceptions a ``{"RETRY-AFTER": "120"}`` dict is saying the same thing as one that spells it
-    ``Retry-After``, so the lookup compares names case-folded rather than probing two spellings.
+    ``Retry-After``, so the lookup compares names case-folded rather than probing two spellings. A
+    list of ``(name, value)`` pairs is the third shape a hand-rolled client ends up with — it has no
+    ``.get`` at all, and a header jevper cannot see is one it cannot obey.
     """
     if headers is None:
-        return None
-    getter = getattr(headers, "get", None)
-    if getter is None:
         return None
     wanted = name.casefold()
     items = getattr(headers, "items", None)
@@ -268,11 +374,18 @@ def _header(headers: Any, name: str) -> str | None:
                 if str(key).casefold() == wanted and isinstance(value, str) and value.strip():
                     return value.strip()
             return None
-        for key in (name, name.title()):
-            value = getter(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    except (AttributeError, KeyError, TypeError, ValueError):  # not a mapping after all
+        if isinstance(headers, Mapping):
+            for key in (name, name.title()):
+                value = headers.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            return None
+        for entry in headers:  # a sequence of pairs, or anything else iterable
+            if not isinstance(entry, (tuple, list)) or len(entry) < 2:
+                continue
+            if str(entry[0]).casefold() == wanted and isinstance(entry[1], str) and entry[1].strip():
+                return entry[1].strip()
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):  # not headers at all
         return None
     return None
 
@@ -280,21 +393,26 @@ def _header(headers: Any, name: str) -> str | None:
 _RETRY_AFTER_MS = "retry-after-ms"
 _RETRY_AFTER = "retry-after"
 
-# The longest wait a retry will take from a header, and a validity bound rather than a policy cap:
-# ``max_delay`` still does not apply to a header jevper honors. It is the largest integer a float
-# holds exactly, which every 64-bit runtime can sleep and which no real provider approaches — a
-# date in 2099 is about 2.3e9 seconds away. Above it the header is not an instruction any client can
-# carry out, and honoring it literally is the ``OverflowError`` ``time.sleep`` raises for a delay
-# outside the platform's range, so the backoff curve answers instead.
-MAX_RETRY_AFTER = float(2**53)
+# The longest wait a retry will take from a header: an operational ceiling, not a policy cap, so
+# ``max_delay`` still does not apply to a header jevper honors. A day is longer than any provider asks
+# for — OpenAI and Anthropic rate-limit windows are seconds to a minute, and a gateway that says
+# "come back when the quota resets" means hours — and short enough that a header nobody sane sends
+# cannot wedge a call for a century: a provider (or a proxy with a bug) answering ``Retry-After:
+# 4294967295`` would otherwise park a thread for 136 years, which is representable as a float and as
+# a C ``time_t`` and is therefore not caught by any representability check. Past the ceiling the
+# header is not an instruction any client should carry out, and the backoff curve answers.
+MAX_RETRY_AFTER = 24 * 60 * 60.0
 
 
 def _retry_after_seconds(exc: BaseException) -> float | None:
     """How long the failed response asked jevper to wait, when it said.
 
     ``retry-after-ms`` is the millisecond form OpenRouter and Anthropic send; ``Retry-After`` is
-    either delta-seconds or an HTTP date, which is how a proxy states the same wait. Anything
-    unreadable falls back to the backoff rather than being guessed at.
+    either delta-seconds or an HTTP date, which is how a proxy states the same wait. Delta-seconds are
+    read as the integer the HTTP grammar defines — ``1*DIGIT`` — so a header spelled ``1e3``, ``+2`` or
+    ``1.5`` is not a wait of a thousand, two or one and a half seconds, it is a header that is not
+    one of the two documented forms. Anything unreadable falls back to the backoff rather than being
+    guessed at.
 
     Only an exception the SDK raised for a failed status carries a response to read the headers from.
     A provider failure carried in the body of a ``200`` — OpenRouter's way of reporting an overloaded
@@ -302,16 +420,14 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
     """
     headers = getattr(exc, "headers", None)
     if _header(headers, _RETRY_AFTER_MS) is None and _header(headers, _RETRY_AFTER) is None:
-        headers = getattr(getattr(exc, "response", None), "headers", None)
+        headers = _field(_response_of(exc), "headers")
     for name, scale in ((_RETRY_AFTER_MS, 1e-3), (_RETRY_AFTER, 1.0)):
         raw = _header(headers, name)
         if raw is None:
             continue
-        try:
-            seconds = float(raw) * scale
-        except ValueError:
-            if name != _RETRY_AFTER:
-                continue
+        if raw.isdigit():
+            seconds = int(raw) * scale
+        elif name == _RETRY_AFTER:
             try:
                 when = parsedate_to_datetime(raw)
             except (TypeError, ValueError, OverflowError):
@@ -320,6 +436,8 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
                 when = when.replace(tzinfo=timezone.utc)
             # A date already past means come back now, which is what the header asked for.
             seconds = max(0.0, when.timestamp() - time.time())
+        else:
+            continue
         if 0 <= seconds <= MAX_RETRY_AFTER:
             return seconds
     return None
@@ -383,17 +501,45 @@ def _add_count(current: int | None, value: Any) -> int | None:
     if value is None or isinstance(value, bool) or current is None:
         return None
     try:
-        return current + int(value)
+        count = int(value)
     except (TypeError, ValueError, OverflowError):
         # ``int(float("inf"))`` raises OverflowError, which is the same kind of provider bug as a word
         # in a token count: "not reported" is the honest answer, and a raw OverflowError escaping the
         # call would not be.
         return None
+    if count < 0:
+        # No provider counts the tokens it did not use. A negative total is a provider bug, and
+        # reporting one says less than "not reported" — and two of them can cancel into a plausible
+        # positive number, which is worse than either.
+        return None
+
+    return current + count
+
+
+def _exception_text(exc: BaseException, limit: int = 500) -> str:
+    """The exception's own text, bounded, and without letting its ``__str__`` fail the call.
+
+    Two things go wrong when a provider's message is interpolated as-is. A duck-typed client can
+    raise an exception whose ``__str__`` raises, which turns a provider failure into a programming
+    error somewhere else entirely; and a gateway that answers with a megabyte of HTML makes every
+    error message, every attempt record and every log line that quotes it a megabyte too. The first
+    few hundred characters carry the status, the field and the reason — which is all a reader uses.
+    """
+    try:
+        text = str(exc)
+    except Exception:  # noqa: BLE001 - an exception that cannot describe itself is still an exception
+        return f"<{type(exc).__name__} raised while formatting its own message>"
+    return text if len(text) <= limit else text[:limit] + f"… (+{len(text) - limit} chars)"
+
+
+def _describe(exc: BaseException) -> str:
+    """The failure as one line: its class, and its own bounded text."""
+    return f"{type(exc).__name__}: {_exception_text(exc)}"
 
 
 def _error_evidence(exc: BaseException) -> str:
     """Everything the provider said about the failure: its message, and the param/code it named."""
-    parts = [str(exc)]
+    parts = [_exception_text(exc, limit=2000)]
     for attr in ("param", "code"):
         value = getattr(exc, attr, None)
         if isinstance(value, str) and value:
@@ -515,13 +661,13 @@ def _dump_model(obj: Any) -> Any:
     """
     dump = getattr(obj, "model_dump", None)
     if callable(dump):
-        try:
-            return dump(mode="json", warnings=False)
-        except TypeError:  # pragma: no cover - a model_dump() without those keywords
+        for keywords in ({"mode": "json", "warnings": False}, {"mode": "json"}, {}):
             try:
-                return dump(mode="json")
+                return dump(**keywords)
             except TypeError:
-                return dump()
+                continue  # this dump does not take those keywords; try the next spelling
+            except Exception:  # noqa: BLE001 - debug data never decides whether a call succeeded
+                return obj
     return obj
 
 
@@ -712,7 +858,7 @@ class _BaseClient:
             question_id,
             surface=transport.surface,
             request=transport.kwargs(spec, context.model),
-            error=f"{type(exc).__name__}: {exc}",
+            error=_describe(exc),
         )
         return _is_transient(exc)
 
@@ -942,7 +1088,7 @@ class _BaseClient:
         being remembered. A server error that survived every retry is only a bad minute, so it is not.
         """
         if (context.auto or context.api_auto) and spec.logprobs:
-            failure = f"{type(exc).__name__}: {exc}"
+            failure = _describe(exc)
             if _logprobs_rejected(exc, spec, transport.surface):
                 capability = _logprobs_unsupported(exc, spec, transport.surface)
                 note = (
@@ -955,7 +1101,7 @@ class _BaseClient:
                     capability=capability,
                     surface=transport.surface,
                 )
-            if _status_code(exc) in _SERVER_ERROR_STATUS_CODES:
+            if _is_server_error(_status_code(exc)):
                 return _LogprobsUnavailable(
                     f"the provider failed every attempt at the logprob request ({failure})",
                     capability=False,
@@ -970,7 +1116,7 @@ class _BaseClient:
             exc.attempts = log.attempts
             return exc
         return ProviderError(
-            f"{type(exc).__name__}: {exc}",
+            _describe(exc),
             attempts=log.attempts,
             status_code=_status_code(exc),
         )
@@ -1104,9 +1250,21 @@ class _BaseClient:
             _pick_examples(self.examples, question_id),
         ):
             if candidate:
+                if isinstance(candidate, (str, bytes)) or not isinstance(candidate, Iterable):
+                    raise InvalidQuestionError(
+                        f"question {question_id!r}: examples must be a sequence of Example objects, "
+                        f"got {type(candidate).__name__}"
+                    )
                 resolved = tuple(candidate)
                 break
         for index, example in enumerate(resolved):
+            if not isinstance(example, Example):
+                # A tuple or a dict here is a caller guessing at the shape: the AttributeError that
+                # reading `.answer` would raise is the least useful way to hear about it.
+                raise InvalidQuestionError(
+                    f"question {question_id!r}: example {index} must be an Example, "
+                    f"got {type(example).__name__}"
+                )
             try:
                 example_answer_label(question, labels, example.answer, index)
                 if example.probabilities is not None:
@@ -1206,6 +1364,13 @@ class _BaseClient:
             result = yield CallSpec(
                 messages=analysis, reasoning=context.analysis_reasoning, prompt_cache_key=cache_key
             )
+            unavailable = methods.answer_failure(result)
+            if unavailable is not None:
+                # The analysis is a request like any other: a trace cut off by the output budget, or
+                # filtered, is not a trace. Quoting a partial one into the answer prompt teaches the
+                # model to answer from a half-thought, and the second call would be spent proving it.
+                unavailable.attempts = log.attempts
+                raise unavailable
             native_reasoning = result.reasoning
             # A model that reasons without writing output leaves `text` empty; its reasoning items are
             # then the analysis. An empty assistant turn is never sent: several OpenAI-compatible
@@ -1482,7 +1647,7 @@ class SystemOneClient(_BaseClient):
                     # itself would print as its own cause.
                     raise failure from (None if failure is exc else exc)
                 log.n_retries += 1
-                time.sleep(_retry_delay(self.retry, attempt, exc))
+                _sleep_before_retry(_retry_delay(self.retry, attempt, exc), self.retry)
                 attempt += 1
                 continue
             log.add_result(result)

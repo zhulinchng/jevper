@@ -566,3 +566,129 @@ def test_a_recorded_message_cache_hit_is_read(server):
 
     assert result.cached_tokens == reported
     assert reported is not None and reported > 0
+
+
+# --- a 200 that is not simply an answer ---------------------------------------------------------
+
+
+def _answers() -> dict[str, Any]:
+    return {"probabilities": {"billing": 0.8, "technical": 0.1, "sales": 0.1}}
+
+
+@pytest.mark.parametrize("surface", ["chat_completions", "responses", "messages"])
+def test_an_error_carried_in_a_200_beats_a_readable_answer(stub_server, surface):
+    """A body that says both "here is your answer" and "the upstream failed" is not an answer.
+
+    OpenRouter reports an overloaded upstream in a 200 with no choices at all; a gateway that adds a
+    stale body beside the error is the same failure wearing a usable mask. Reading the answer would
+    report a decision the provider never made.
+    """
+    key = {"chat_completions": "chat", "responses": "responses", "messages": "messages"}[surface]
+    body: dict[str, Any] = {"error": {"message": "upstream failed", "code": 503}}
+    if surface == "chat_completions":
+        body.update(chat_body(content="A", logprobs=[("A", -0.1), ("B", -2.0), ("C", -3.0)]))
+    elif surface == "responses":
+        from fakes import responses_body
+
+        body.update(responses_body(text=json.dumps(_answers())))
+    else:
+        from fakes import messages_body
+
+        body.update(messages_body(text=json.dumps(_answers())))
+    stub = stub_server(**{key: lambda _b: (200, body, {})})
+    sdk = anthropic_client(stub) if surface == "messages" else openai_client(stub)
+    client = SystemOneClient(
+        sdk, model="stub", api=surface, method="structured", retry=NO_RETRIES
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        client.system_one(state="s", questions={"q": Choice(criteria=QUESTIONS["intent"].criteria)})
+
+    assert "upstream failed" in str(raised.value)
+    assert len(stub.requests) == 1
+
+
+def test_a_numeric_error_code_sent_as_a_string_is_still_transient(stub_server):
+    """OpenRouter sends ``"code": "503"`` as often as a number, and a transient it stays."""
+    calls: list[int] = []
+
+    def script(_body):
+        calls.append(1)
+        if len(calls) == 1:
+            return 200, {"error": {"message": "temporarily overloaded", "code": "503"}}, {}
+        return 200, chat_body(content="A", logprobs=[("A", -0.1), ("B", -2.0), ("C", -3.0)])
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        retry=RetryPolicy(n_retries=2, base_delay=0.0),
+    )
+
+    response = client.system_one(
+        state="s", questions={"q": Choice(criteria=QUESTIONS["intent"].criteria)}
+    )
+
+    assert response.usage.n_retries == 1
+    assert response.answers["q"].choice == "billing"
+
+
+@pytest.mark.parametrize("stop", [[], {}, 3.5, True])
+def test_a_stop_reason_that_is_not_a_name_is_an_incomplete_answer(stub_server, stop):
+    """The field is documented as a string; a list or a dict there must not be a ``TypeError``."""
+    body = chat_body(content="A", finish_reason=stop)
+    stub = stub_server(chat=lambda _b: (200, body, {}))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", method="logprobs"
+    )
+
+    with pytest.raises(IncompleteAnswerError) as raised:
+        client.system_one(
+            state="s", questions={"q": Choice(criteria=QUESTIONS["intent"].criteria)}
+        )
+
+    assert "stopped before the answer was complete" in str(raised.value)
+
+
+def test_a_choice_that_carries_only_the_legacy_text_is_read(stub_server):
+    """A proxy answering a chat request with the completions shape puts the answer in ``text``."""
+    body = {
+        "id": "x",
+        "object": "text_completion",
+        "choices": [{"index": 0, "text": json.dumps(_answers()), "finish_reason": "stop"}],
+    }
+    stub = stub_server(chat=lambda _b: (200, body, {}))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", method="structured"
+    )
+
+    response = client.system_one(
+        state="s", questions={"q": Choice(criteria=QUESTIONS["intent"].criteria)}
+    )
+
+    assert response.answers["q"].choice == "billing"
+
+
+def test_a_partial_model_dump_falls_back_to_the_attributes():
+    """A duck client whose ``model_dump`` leaves fields out has not lost the answer."""
+
+    class Message:
+        def __init__(self):
+            self.content = "A"
+            self.refusal = None
+
+    class ChoiceModel:
+        def __init__(self):
+            self.message = Message()
+            self.finish_reason = "stop"
+            self.logprobs = None
+
+        def model_dump(self, **kwargs):
+            return {}
+
+    normalize = SURFACES["chat_completions"][1]
+    result = normalize({"id": "x", "choices": [ChoiceModel()]}, {})
+
+    assert result.text == "A"
+    assert result.stop == "stop"

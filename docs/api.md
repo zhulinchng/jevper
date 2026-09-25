@@ -147,16 +147,18 @@ Score(instructions=None, criteria=["level description"], examples=())
 Example(state=..., answer="billing" | "B" | 2 | True, probabilities={"billing": 0.6, ...} | None = None)
 ```
 
-`answer` may be a label (`"B"`), a `Choice` criteria key, a `Score` level index, or a bool for `Noul`. The
-label is tried first, so an option key that is itself a label is read as the label. `probabilities` is only
-read by `method="structured"` and defaults to a one-hot distribution over `answer`.
+`answer` may be a label (`"B"`), a `Choice` criteria key, a `Score` level index, or a bool for `Noul`. An
+exact criteria key is tried first and a label second, so an option key that is itself a label (`"a"` beside
+`"A"`) is read as the key the caller wrote. `probabilities` is only read by `method="structured"` and defaults
+to a one-hot distribution over `answer`.
 
 When given, `probabilities` is validated, because the example is replayed into the prompt as the answer the
 model is asked to imitate:
 
 - it must carry exactly the option keys of a `Choice`, the level indexes of a `Score`, or a `True`/`False`
   (`"true"`/`"false"`) key for a `Noul` — a wrong key set raises `InvalidQuestionError` naming the example
-  index;
+  index, and so does a `Noul` mapping with no key at all, or two keys that name the same answer
+  (`{1: 0.9, "1": 0.1}`), because the rendered demonstration can carry only one of them;
 - values must be finite (rejected by the `Example` model itself) and `>= 0`, and a `Noul` value must be in
   `[0, 1]`.
 
@@ -247,29 +249,36 @@ that produced the final answer.
 RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0, respect_retry_after=True)
 ```
 
-Applies per provider call. A failure is transient when the exception exposes a `status_code` reading as one of
-`{408, 429, 500, 502, 503, 504, 529}` (an int, an `http.HTTPStatus`, or a digit string, taken from the
-exception or from `exc.response.status_code` when only the response carries it), or when its class — or any
-class in its MRO — contains `Connection` or
-`Timeout`, or is an `httpx`-family transport failure (`TransportError`, `TimeoutException`). That last clause
-is what covers `httpx.ConnectError`, `ReadError` and `RemoteProtocolError`, whose names carry neither marker;
-a client-side `LocalProtocolError` is not retried.
+Applies per provider call. A failure is transient when its HTTP status is 408, 409, 429 or any 5xx — the
+set both official SDKs retry, read as an int, an `http.HTTPStatus` or a digit string, from the exception or
+from `exc.response.status_code` (which is also read when the exception's own attribute is missing or
+unreadable, and whether that response is an object or a plain mapping) — unless the response carries
+`x-should-retry: false`, which outranks the status in OpenAI's and Anthropic's SDKs and here too, the way
+`x-should-retry: true` makes a 400 worth repeating. It is also transient when the exception's class, or any
+class in its MRO, is one of the transport and timeout types the SDKs and the standard library raise
+(`TransportError`, `ConnectError`, `ReadError`, `RemoteProtocolError`, `APIConnectionError`,
+`APITimeoutError`, `URLError`, …) or a builtin `TimeoutError`/`ConnectionError`. Those names are matched
+whole, so a caller's own `ConnectionProgrammingError` is a programming error and is not repeated; a
+client-side `httpx.LocalProtocolError` is not retried either.
 
-The wait is whatever the provider asked for when it said: a `Retry-After` (delta-seconds or an HTTP date)
-or the millisecond `retry-after-ms` some providers send instead replaces the computed backoff, which is
-what the TypeSafe clients do by default — coming back sooner than a rate limit asked is one way to extend
-it. Header names are matched case-insensitively, as HTTP requires, so a client that hands its exceptions a
-plain `{"RETRY-AFTER": "120"}` dict is heard the same as one that carries an `httpx.Headers`, and a date
-already past means come back now — a wait of zero. `max_delay` caps jevper's own curve, not the server's
-instruction, so a header asking for minutes is waited out in minutes, up to `jevper.client.MAX_RETRY_AFTER` (2^53
-seconds: the largest integer a float holds exactly, and no real provider's idea of a wait). Past that the
-header is not an instruction any runtime can carry out, so the curve answers rather than `time.sleep`
-raising `OverflowError`. `respect_retry_after=False` goes back to the curve alone, and `n_retries=0` fails
-on the first rate-limited response. A header jevper cannot read — not a number, not a date, negative — is
-the backoff's business, never a reason to skip the wait. Only an exception the SDK raised for a failed
-status carries headers to read: a provider failure carried in the body of a `200` (OpenRouter's
-overloaded-upstream answer) is a plain model object with no headers on it, so that case waits out the
-curve too.
+The wait is whatever the provider asked for when it said: a `Retry-After` — delta-seconds, which are read
+as the `1*DIGIT` the HTTP grammar defines, or an HTTP date — or the millisecond `retry-after-ms` some
+providers send instead replaces the computed backoff, which is what the TypeSafe clients do by default:
+coming back sooner than a rate limit asked is one way to extend it. Header names are matched
+case-insensitively, as HTTP requires, and headers may be a mapping, an `httpx.Headers`, or a sequence of
+`(name, value)` pairs — a hand-rolled client has no `.get` to ask — so a client that hands its exceptions
+a plain `{"RETRY-AFTER": "120"}` dict, or `[("Retry-After", "120")]`, is heard the same as one that carries
+real header objects, and a date already past means come back now, a wait of zero. `max_delay` caps jevper's
+own curve, not the server's instruction: a header asking for hours is waited out in hours, up to
+`jevper.client.MAX_RETRY_AFTER` (24 hours — longer than any provider asks for, including a gateway that
+means "come back when the quota resets", and short enough that a header nobody sane sends cannot park a
+call for a century). Past the ceiling the header is not an instruction any client should carry out, so
+the curve answers. `respect_retry_after=False` goes back to the curve alone, and `n_retries=0` fails on the
+first rate-limited response. A header jevper cannot read — not delta-seconds, not a date, not a number
+within the grammar — is the backoff's business, never a reason to skip the wait. Only an exception the SDK
+raised for a failed status carries headers to read: a provider failure carried in the body of a `200`
+(OpenRouter's overloaded-upstream answer) is a plain model object with no headers on it, so that case
+waits out the curve too.
 
 Without a readable header the delay before retry `n` is `min(base_delay · 3ⁿ, max_delay)` (so 0.5s, 1.5s, …
 by default). Anything else — and a transient failure with the retries exhausted — is raised as
@@ -279,13 +288,17 @@ field (`NaN`, `inf`), or a `retry` that is not a `RetryPolicy`, raises `JevperEr
 ## `ReasoningConfig`
 
 ```python
-ReasoningConfig(effort=None, summary=None, context=None, mode="auto")
+ReasoningConfig(effort=None, summary=None, context=None, mode="auto", budget_tokens=None)
 ```
 
 - `effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`
 - `summary`: `auto`, `concise`, `detailed`
 - `context`: `auto`, `current_turn`, `all_turns`
 - `mode`: `auto`, `native`, `two_step`
+- `budget_tokens`: the Messages surface's own thinking budget, and the only reason to select that
+  surface's native mode under `mode="auto"`. jevper sizes `max_tokens` above it (the API requires the
+  budget to be strictly below `max_tokens`) and refuses locally when a caller's own `max_tokens` cannot
+  hold it. Chat Completions and Responses ignore it — they carry `reasoning_effort` instead.
 
 See [reasoning.md](reasoning.md) for how the mode resolves per surface.
 
@@ -295,14 +308,14 @@ All inherit from `JevperError`.
 
 | Error | Raised when |
 | --- | --- |
-| `InvalidQuestionError` | question or example is locally invalid; also raised when `logprobs`/`grammar` get a `Choice` with more than 26 options |
-| `UnsupportedMethodError` | `method="grammar"` and the selected surface is not Chat Completions |
-| `ClientCapabilityError` | the client lacks the attribute a surface needs, or a response carried no choices and no explanation of why |
-| `LabelReadoutError` | no logprobs at all, no alternatives for the answer token, no non-whitespace token, a first token that is not a label, no logprob for the answer token, a non-finite logprob, or no probability mass on any label. The first two are the provider's doing, so they are not corrective-retried and `method="auto"` answers with `structured` instead |
-| `MalformedAnswerError` | JSON answer missing/extra keys, a non-finite or out-of-range number, an unknown label, a score that is not a level index |
-| `IncompleteAnswerError` | the provider stopped generating before the answer was complete — `finish_reason: "length"`, `stop_reason: "max_tokens"`, a Responses `status: "incomplete"`, or a filtered answer. A `ProviderError` subclass, and terminal: a cut-off generation is not a malformed answer to correct, because another attempt spends a call to be cut off the same way |
-| `ModelRefusalError` | the model declined to answer and the provider said so — OpenAI's `refusal` field or content part, `stop_reason: "refusal"`. A `ProviderError` subclass, and terminal: a refusal is complete, not broken, so a corrective retry would only be refused again |
-| `ProviderError` | provider failure after transient retries; `.attempts` holds the attempt records and `.status_code` the status the provider reported, including one carried inside a `200` body. Also raised when every surface `api="auto"` could try answered `404` (the route is missing, so the failure is the provider's, not a private verdict's), and when a Responses call reports a `status` that is neither `completed` nor `incomplete` — `failed`, `cancelled` — which is a generation the provider did not finish, not a malformed answer to correct |
+| `InvalidQuestionError` | question or example is locally invalid — including an `examples` container or element that is not a sequence of `Example`, and probability keys that name the same answer key twice (`{1: 0.9, "1": 0.1}`); also raised when `logprobs`/`grammar` get a `Choice` with more than 26 options |
+| `UnsupportedMethodError` | `method="grammar"` on a surface that is not Chat Completions, and `method="logprobs"`/`"grammar"` pinned to the Messages surface, which returns no logprobs at all |
+| `ClientCapabilityError` | the client lacks the attribute a surface needs (or raises while being asked), or a response carried no choices and no explanation of why |
+| `LabelReadoutError` | no logprobs at all, no usable alternatives for the answer token, no non-whitespace token, a first token that is not a label, a logprob that is not finite or is positive (which no log probability can be), a sampled token that contradicts an answer text naming another label, or no probability mass on any label. The first two are the provider's doing, so they are not corrective-retried and `method="auto"` answers with `structured` instead |
+| `MalformedAnswerError` | JSON answer missing/extra keys, more than one JSON object in the answer, a number too large to be a float, a non-finite or out-of-range number, an unknown label, a score that is not a level index |
+| `IncompleteAnswerError` | the provider stopped generating before the answer was complete — `finish_reason: "length"`, `stop_reason: "max_tokens"`, `model_context_window_exceeded`, a Responses `status: "incomplete"`, or any stop reason that is not one the surface documents. The message names the surface's own budget field (`max_output_tokens` on the Responses surface, `max_tokens` elsewhere). A `ProviderError` subclass, and terminal: a cut-off generation is not a malformed answer to correct, because another attempt spends a call to be cut off the same way |
+| `ModelRefusalError` | the model declined to answer and the provider said so — OpenAI's `refusal` field or content part, `stop_reason: "refusal"`, or a safety filter (`finish_reason: "content_filter"`, a Responses `incomplete_details.reason` of the same). A `ProviderError` subclass, and terminal: a refusal is complete, not broken, so a corrective retry would only be refused again |
+| `ProviderError` | provider failure after transient retries; `.attempts` holds the attempt records and `.status_code` the status the provider reported, including one carried inside a `200` body — which wins over any answer the same body carries, and whose `code` is read as a number or as a digit string. Also raised when every surface `api="auto"` could try answered `404` (the route is missing, so the failure is the provider's, not a private verdict's), and when a Responses call reports a `status` that is neither `completed` nor `incomplete` — `failed`, `cancelled` — which is a generation the provider did not finish, not a malformed answer to correct |
 | `JevperError` | base class, and the type used for constructor misuse, bad `state` messages, and content that is not JSON-serializable or contains a non-finite number |
 
 The provider-side logprob failures — a rejected logprob request, no logprobs at all, no alternatives for the

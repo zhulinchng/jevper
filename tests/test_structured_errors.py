@@ -11,9 +11,26 @@ from __future__ import annotations
 import json
 
 import pytest
-from fakes import chat_body, openai_client
+from fakes import (
+    StubServer,
+    anthropic_client,
+    chat_body,
+    messages_body,
+    openai_client,
+    responses_body,
+)
 
-from jevper import Choice, MalformedAnswerError, Noul, Score, SystemOneClient
+from jevper import (
+    Choice,
+    Example,
+    IncompleteAnswerError,
+    InvalidQuestionError,
+    MalformedAnswerError,
+    ModelRefusalError,
+    Noul,
+    Score,
+    SystemOneClient,
+)
 
 STATE = "My invoice shows a charge I do not recognize and I need it explained."
 CRITERIA = {"billing": None, "technical": None, "sales": None}
@@ -306,3 +323,130 @@ def test_a_malformed_answer_is_retried_and_the_reason_names_the_failure(stub_ser
     correction = stub.bodies("/chat/completions")[1]["messages"][-1]
     assert correction["role"] == "user"
     assert "'choice' must be one of the labels" in correction["content"]
+
+
+# --- a generation the provider withheld ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("body", "reported"),
+    [
+        (chat_body(content=None, finish_reason="content_filter"), "content_filter"),
+        (chat_body(content='{"choice": "billing"}', finish_reason="content_filter"), "content_filter"),
+    ],
+)
+def test_a_safety_filter_is_a_refusal_not_an_incomplete_answer(stub_server, body, reported):
+    """A filtered generation was withheld on purpose; that is a refusal, not a cut-off answer.
+
+    OpenAI reports it as ``finish_reason: "content_filter"`` and the Responses surface as an
+    ``incomplete`` whose reason is the same word. Reading either as "stopped before the answer was
+    complete" sends the caller looking for an output budget that was never the problem.
+    """
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="structured",
+        api="chat_completions",
+        n_retry_malformed=2,
+    )
+
+    with pytest.raises(ModelRefusalError) as raised:
+        client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
+
+    message = str(raised.value)
+    assert "filtered the content for safety" in message
+    assert reported in message
+    assert len(stub.bodies("/chat/completions")) == 1
+
+
+def test_a_responses_incomplete_reason_of_content_filter_is_a_refusal(stub_server):
+    """The Responses surface says the same thing in ``incomplete_details.reason``."""
+    body = {**responses_body(text=""), "status": "incomplete"}
+    body["incomplete_details"] = {"reason": "content_filter"}
+    stub = StubServer(responses=lambda _: (200, body, {}))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="structured", api="responses", n_retry_malformed=2
+    )
+
+    with pytest.raises(ModelRefusalError) as raised:
+        client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "content_filter" in str(raised.value)
+    assert len(stub.bodies("/responses")) == 1
+
+
+# --- the advice in a truncation error -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("surface", "reason", "knob"),
+    [
+        ("chat_completions", "length", "max_tokens"),
+        ("messages", "max_tokens", "max_tokens"),
+        ("responses", "max_output_tokens", "max_output_tokens"),
+    ],
+)
+def test_a_truncation_error_names_the_surfaces_own_budget_field(stub_server, surface, reason, knob):
+    """The three surfaces do not share a name for the output budget, and the advice has to follow.
+
+    The Responses surface calls it ``max_output_tokens`` and refuses a ``max_tokens`` it does not
+    know, so advice that names the Chat spelling is advice the caller cannot act on.
+    """
+    if surface == "chat_completions":
+        stub = StubServer(chat=lambda _: (200, chat_body(content="", finish_reason=reason), {}))
+        sdk = openai_client(stub)
+    elif surface == "messages":
+        stub = StubServer(messages=lambda _: (200, messages_body(text="", stop_reason=reason), {}))
+        sdk = anthropic_client(stub)
+    else:
+        body = {**responses_body(text=""), "status": "incomplete"}
+        body["incomplete_details"] = {"reason": reason}
+        stub = StubServer(responses=lambda _: (200, body, {}))
+        sdk = openai_client(stub)
+    client = SystemOneClient(
+        sdk, model="stub", method="structured", api=surface, n_retry_malformed=1
+    )
+
+    with pytest.raises(IncompleteAnswerError) as raised:
+        client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
+
+    assert f"extra_body={{{knob!r}: 2048}}" in str(raised.value)
+
+
+# --- an example's own distribution -----------------------------------------------------------------
+
+
+def test_probability_keys_that_collide_after_normalization_are_refused(stub_server):
+    """``{1: 0.9, "1": 0.1}`` are two keys in Python and one in JSON, so the demonstration would lie.
+
+    The rendered assistant turn can only carry one number per option; picking either silently drops
+    the other, and the model is then shown a distribution its caller never wrote.
+    """
+    stub = stub_server(chat=lambda _: (200, chat_body(content="{}")))
+    client = SystemOneClient(openai_client(stub), model="stub", method="structured")
+    question = Choice(
+        criteria={"1": None, "2": None},
+        examples=[
+            Example(state="s", answer="1", probabilities={1: 0.9, "1": 0.1, 2: 0.8})
+        ],
+    )
+
+    with pytest.raises(InvalidQuestionError) as raised:
+        client.system_one(state=STATE, questions={"q": question})
+
+    assert "use one spelling" in str(raised.value)
+    assert stub.requests == []
+
+
+def test_an_empty_noul_probability_mapping_is_refused(stub_server):
+    """A Noul example that carries no distribution renders a demonstration the renderer cannot read."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content="{}")))
+    client = SystemOneClient(openai_client(stub), model="stub", method="structured")
+    question = Noul(examples=[Example(state="s", answer=True, probabilities={})])
+
+    with pytest.raises(InvalidQuestionError) as raised:
+        client.system_one(state=STATE, questions={"q": question})
+
+    assert "True or False key" in str(raised.value)
+    assert stub.requests == []

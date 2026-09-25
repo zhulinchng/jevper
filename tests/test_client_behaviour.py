@@ -8,6 +8,7 @@ import json
 import threading
 import time
 import warnings
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -2052,11 +2053,14 @@ def test_an_unreadable_retry_after_falls_back_to_the_curve(stub_server, monkeypa
 
 def test_an_http_date_retry_after_is_waited_out(stub_server, monkeypatch):
     """A proxy states the same wait as a date rather than as seconds; both mean the same thing."""
+    from email.utils import format_datetime
+
     sleeps: list[float] = []
     monkeypatch.setattr(time, "sleep", sleeps.append)
 
     def script(_body):
-        return 429, {"error": {"message": "slow down"}}, {"Retry-After": "Wed, 21 Oct 2099 07:28:00 GMT"}
+        when = datetime.now(timezone.utc) + timedelta(hours=6)
+        return 429, {"error": {"message": "slow down"}}, {"Retry-After": format_datetime(when)}
 
     stub = stub_server(chat=script)
     client = SystemOneClient(
@@ -2070,7 +2074,7 @@ def test_an_http_date_retry_after_is_waited_out(stub_server, monkeypatch):
         client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
 
     assert len(sleeps) == 1
-    assert sleeps[0] > 1_000  # decades away, and waited out anyway: the server's number, not jevper's
+    assert sleeps[0] == pytest.approx(6 * 60 * 60, abs=30)  # the server's number, not jevper's
 
 
 def test_a_header_name_is_case_insensitive_on_a_plain_mapping():
@@ -2147,13 +2151,23 @@ def test_a_retry_after_no_runtime_can_sleep_falls_back_to_the_curve(
     assert sleeps == [0.25]
 
 
-def test_a_far_future_date_is_still_waited_out(stub_server, monkeypatch):
-    """The bound is what a runtime can sleep, not a policy cap: 2099 is a wait jevper keeps."""
+@pytest.mark.parametrize(
+    "value", ["172800", "Wed, 21 Oct 2099 07:28:00 GMT", 2**32 - 1]
+)
+def test_a_wait_past_the_day_ceiling_falls_back_to_the_curve(stub_server, monkeypatch, value):
+    """Past a day the header is not an instruction any client should carry out.
+
+    Two days, seventy-three years and 2**32-1 seconds are all perfectly representable — as a float
+    and as a C ``time_t`` — so nothing but a deliberate ceiling stops a provider (or a proxy with a
+    bug) from parking a call for a century. jevper keeps the caller's lever instead: the curve is
+    waited, the attempts still show what the server said, and ``Retry-After: 43200`` — half a day, the
+    longest wait anything real asks for — is still honored in full.
+    """
     sleeps: list[float] = []
     monkeypatch.setattr(time, "sleep", sleeps.append)
 
     def script(_body):
-        return 429, {"error": {"message": "slow down"}}, {"Retry-After": "Wed, 21 Oct 2099 07:28:00 GMT"}
+        return 429, {"error": {"message": "slow down"}}, {"Retry-After": value}
 
     stub = stub_server(chat=script)
     client = SystemOneClient(
@@ -2166,8 +2180,29 @@ def test_a_far_future_date_is_still_waited_out(stub_server, monkeypatch):
     with pytest.raises(ProviderError):
         client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
 
-    assert len(sleeps) == 1
-    assert sleeps[0] > 1_000
+    assert sleeps == [0.5]
+
+
+def test_a_half_day_retry_after_is_waited_out_in_full(stub_server, monkeypatch):
+    """The longest wait anything real asks for is inside the ceiling, and honored as asked."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    def script(_body):
+        return 429, {"error": {"message": "quota resets in half a day"}}, {"Retry-After": "43200"}
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        retry=RetryPolicy(n_retries=1, base_delay=0.5, max_delay=8.0),
+    )
+
+    with pytest.raises(ProviderError):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert sleeps == [43200.0]
 
 
 @pytest.mark.parametrize("status", [502, 504, 529])
@@ -2482,3 +2517,351 @@ def test_a_real_answer_survives_the_same_bounds():
     """The bounds are the readouts' own, so a genuine answer passes them by construction."""
     assert ChoiceAnswer(choice="billing", probabilities={"billing": 0.9, "sales": 0.1}, confidence=0.8)
     assert Usage(input_tokens=10, output_tokens=2, n_calls=1, latency=0.4)
+
+
+# --- what a provider failure may look like ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", [409, 500, 501, 502, 504, 529])
+def test_the_sdk_rule_for_a_transient_status_is_the_rule_jevper_uses(stub_server, status):
+    """Both official SDKs retry 408, 409, 429 and every 5xx; jevper retries the same set.
+
+    409 is OpenAI's lock timeout and 501 is a server that is not the one you asked for — neither is
+    in the list of statuses anyone writes down, which is why a hand-kept enumeration misses them: a
+    gateway answering 409 for a busy lock killed the call that the official client would have retried.
+    """
+    seen: list[int] = []
+
+    def script(_body):
+        seen.append(status)
+        if len(seen) == 1:
+            return status, {"error": {"message": "later"}}
+        return 200, chat_body(content="A", logprobs=CHOICE_LOGS)
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        retry=RetryPolicy(n_retries=1, base_delay=0.0),
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
+    assert response.usage.n_retries == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "header", "expected_requests"),
+    [(400, {"x-should-retry": "true"}, 2), (500, {"x-should-retry": "false"}, 1)],
+)
+def test_the_provider_decides_a_retry_with_its_own_header(
+    stub_server, monkeypatch, status, header, expected_requests
+):
+    """``x-should-retry`` outranks the status default in both SDKs, so it outranks it here.
+
+    A gateway in front of a provider knows things the status does not — a 400 that is really a race,
+    a 500 that must not be repeated — and both official clients take its word for it. Reading the
+    status alone makes the opposite decision in both directions.
+    """
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    def script(_body):
+        if len(stub.bodies("/chat/completions")) < expected_requests:
+            return status, {"error": {"message": "as the provider says"}}, header
+        return 200, chat_body(content="A", logprobs=CHOICE_LOGS)
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        retry=RetryPolicy(n_retries=1, base_delay=0.25),
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert len(stub.bodies("/chat/completions")) == expected_requests
+    assert sleeps == ([0.25] if expected_requests == 2 else [])
+    assert response.answers["q"].choice == "billing"
+
+
+def test_a_programming_error_named_like_a_transport_one_is_not_retried(stub_server):
+    """A class whose name merely contains "Connection" is somebody's own error, not a network one.
+
+    Repeating a request that cannot succeed differently spends the caller's money to tell them
+    nothing new, and the failure it hides is the one they need to see.
+    """
+
+    class ConnectionProgrammingError(Exception):
+        """A local client bug that happens to be named like a transport failure."""
+
+    stub = stub_server(chat=None)
+    client = SystemOneClient(
+        RaisingClient(ConnectionProgrammingError("built the request wrong")),
+        model="stub",
+        api="chat_completions",
+        retry=RetryPolicy(n_retries=2, base_delay=0.0),
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "ConnectionProgrammingError" in str(raised.value)
+    assert stub.requests == []
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [("Retry-After", "3")],
+        (("RETRY-AFTER", "3"), ("content-type", "application/json")),
+        {"response": [("Retry-After", "3")]},
+    ],
+)
+def test_a_retry_after_in_a_pair_sequence_is_honored(stub_server, monkeypatch, headers):
+    """A hand-rolled client hands its exceptions a list of pairs; it has no ``.get`` to ask.
+
+    A header jevper cannot see is one it cannot obey, and the backoff it falls back to can be either
+    longer or shorter than the provider asked for — which is the whole point of reading the header.
+    """
+    from jevper.client import _retry_after_seconds
+
+    class Limited(Exception):
+        status_code = 429
+
+        def __init__(self, headers):
+            super().__init__("429 slow down")
+            if isinstance(headers, dict) and "response" in headers:
+                self.response = SimpleNamespace(
+                    headers=headers["response"], status_code=429
+                )
+            else:
+                self.headers = headers
+
+    assert _retry_after_seconds(Limited(headers)) == 3.0
+
+
+def test_a_mapping_shaped_response_carries_its_status_and_headers():
+    """A duck exception can carry its response as a plain dict; that is still the provider's answer."""
+    from jevper.client import _retry_after_seconds, _status_code
+
+    class Limited(Exception):
+        status_code = 429
+
+        def __init__(self):
+            super().__init__("slow down")
+            self.response = {"status_code": 429, "headers": {"Retry-After": "2"}}
+
+    exc = Limited()
+    assert _status_code(exc) == 429
+    assert _retry_after_seconds(exc) == 2.0
+
+
+def test_an_unreadable_status_attribute_falls_through_to_the_response():
+    """``status_code=float("inf")`` is not a status, and the response beside it may still be one."""
+    from jevper.client import _status_code
+
+    class Broken(Exception):
+        def __init__(self):
+            super().__init__("upstream said 429")
+            self.status_code = float("inf")
+            self.response = SimpleNamespace(status_code=429)
+
+    assert _status_code(Broken()) == 429
+
+
+@pytest.mark.parametrize("value", ["1e3", "+2", "1.5", "0x10", " 2 s"])
+def test_a_retry_after_outside_the_delta_seconds_grammar_is_not_one(stub_server, monkeypatch, value):
+    """Delta-seconds are ``1*DIGIT``; anything else is a date or a header nobody defined.
+
+    ``float()`` would read ``1e3`` as a thousand seconds and ``1.5`` as one and a half, so a header
+    that is not the documented form would become a wait nobody asked for.
+    """
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    def script(_body):
+        return 429, {"error": {"message": "slow down"}}, {"Retry-After": value}
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="chat_completions",
+        retry=RetryPolicy(n_retries=1, base_delay=0.25, max_delay=8.0),
+    )
+
+    with pytest.raises(ProviderError):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert sleeps == [0.25]
+
+
+def test_an_exception_that_cannot_describe_itself_is_still_a_provider_error(stub_server):
+    """A duck client can raise an exception whose ``__str__`` raises; that is still a provider failure."""
+
+    class Unprintable(Exception):
+        def __str__(self):
+            raise RuntimeError("no text for you")
+
+    client = SystemOneClient(
+        RaisingClient(Unprintable()), model="stub", api="chat_completions", retry=RetryPolicy(n_retries=0)
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "raised while formatting its own message" in str(raised.value)
+
+
+def test_a_megabyte_of_provider_html_does_not_land_in_the_message_twice(stub_server):
+    """A gateway's error page is quoted once, briefly: the status and the field are what a reader uses."""
+    page = "<html>" + "x" * 1_000_000 + "</html>"
+
+    def script(_body):
+        return 500, page
+
+    stub = stub_server(chat=script)
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", retry=RetryPolicy(n_retries=0)
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    message = str(raised.value)
+    assert len(message) < 1_000
+    assert "chars)" in message
+
+
+@pytest.mark.parametrize("examples", [42, [("state", "question", "answer")], [{"state": "s"}], ["nope"]])
+def test_examples_that_are_not_examples_are_refused_before_any_request(stub_server, examples):
+    """A guessed shape is a caller mistake, and the local check is where it belongs.
+
+    Reading ``.answer`` off a tuple, or iterating an int, raises ``AttributeError``/``TypeError`` from
+    inside a method the caller was told raises ``JevperError`` subclasses.
+    """
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS), {}))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    with pytest.raises(InvalidQuestionError):
+        client.system_one(
+            state="s", questions={"q": Choice(criteria=CRITERIA)}, examples=examples
+        )
+
+    assert stub.requests == []
+
+
+def test_a_client_whose_capability_lookup_raises_is_a_capability_error():
+    """A closed SDK client raises from its properties; the answer to "can this client?" is still no."""
+
+    class Closed:
+        @property
+        def chat(self):
+            raise RuntimeError("client is closed")
+
+    client = SystemOneClient(Closed(), model="stub", api="auto")
+
+    with pytest.raises(ClientCapabilityError) as raised:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "responses.create" in str(raised.value)
+
+
+def test_a_response_whose_own_dump_raises_still_answers(stub_server):
+    """``debug`` data never decides whether a call succeeded: a dump that raises is unreadable data."""
+
+    class Message:
+        def __init__(self):
+            self.content = '{"probabilities": {"billing": 0.8, "technical": 0.1, "sales": 0.1}}'
+            self.refusal = None
+
+    class ChoiceModel:
+        def __init__(self):
+            self.message = Message()
+            self.finish_reason = "stop"
+            self.logprobs = None
+
+        def model_dump(self, **kwargs):
+            raise RuntimeError("dump exploded")
+
+    class Dumpable(dict):
+        def model_dump(self, **kwargs):
+            raise RuntimeError("dump exploded")
+
+    class Answer(dict):
+        pass
+
+    class SDK:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    return Answer(
+                        id="x",
+                        object="chat.completion",
+                        choices=[ChoiceModel()],
+                        usage=Dumpable(),
+                    )
+
+    client = SystemOneClient(SDK(), model="stub", api="chat_completions", method="structured")
+
+    response = client.system_one(
+        state="s",
+        questions={"q": Choice(criteria=CRITERIA)},
+    )
+
+    assert response.answers["q"].choice == "billing"
+
+
+def test_a_negative_token_count_is_reported_as_absent(stub_server):
+    """No provider counts the tokens it did not use, and two negative counts can cancel into a lie."""
+    body = chat_body(content="A", logprobs=CHOICE_LOGS)
+    body["usage"] = {"prompt_tokens": -1, "completion_tokens": "-5", "total_tokens": -6}
+    stub = stub_server(chat=lambda _: (200, body, {}))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.usage.input_tokens is None
+    assert response.usage.output_tokens is None
+
+
+def test_an_incomplete_analysis_is_not_quoted_into_the_answer(stub_server):
+    """Two-step reasoning reads its first response as a trace; a trace cut off is not a trace.
+
+    Quoting half an analysis into the answer prompt teaches the model to answer from a half-thought,
+    and the second call is spent finding out.
+ """
+    calls: list[int] = []
+
+    def script(body):
+        # The first request is the analysis; it comes back cut off by the output budget.
+        calls.append(1)
+        if len(calls) == 1:
+            partial = responses_body(text="the invoice looks")
+            partial["status"] = "incomplete"
+            partial["incomplete_details"] = {"reason": "max_output_tokens"}
+            return 200, partial
+        return 200, responses_body(
+            text='{"probabilities": {"billing": 0.8, "technical": 0.1, "sales": 0.1}}'
+        )
+
+    stub = stub_server(responses=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        api="responses",
+        method="structured",
+        reasoning=ReasoningConfig(mode="two_step"),
+        retry=RetryPolicy(n_retries=0),
+    )
+
+    with pytest.raises(IncompleteAnswerError) as raised:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "max_output_tokens" in str(raised.value)
+    assert len(stub.bodies("/responses")) == 1
