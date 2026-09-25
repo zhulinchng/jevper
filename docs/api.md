@@ -23,6 +23,19 @@ SystemOneClient(client, **options)
 Anthropic SDK's, pointed at any server that implements the Messages API); it stays owned by the caller
 (`close()` only shuts down jevper's own thread pool).
 
+The `responses` surface speaks both OpenAI's Responses API and the [OpenResponses](https://www.openresponses.org)
+specification, which LM Studio (0.3.39 and later), llama.cpp, vLLM and SGLang serve at the same
+`/v1/responses` path: every input turn carries the item `type` that spec's union requires, and the reader
+accepts its content parts, reasoning part types, per-item statuses and message phases alongside OpenAI's
+own shapes. What jevper does with the two dialects is measured per server in
+[local-servers.md](local-servers.md).
+
+Two rules about the client object itself. A client with a retry loop of its own — the official SDKs retry
+twice by default — is used through a copy with that loop off, so `RetryPolicy` is the only retry loop and
+`usage.n_retries` counts every request the provider saw; the caller's own client keeps its setting. And the
+two facades do not mix: `SystemOneClient` refuses an asynchronous client and `AsyncSystemOneClient`
+refuses a blocking one, before any request, naming the class to use instead.
+
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `model` | required | Model id sent with every call; overridable per `system_one` call |
@@ -39,13 +52,25 @@ Anthropic SDK's, pointed at any server that implements the Messages API); it sta
 | `temperature` | `None` | Not sent unless set. `0.0` is recommended for `structured`/`discrete`; `logprobs` needs no setting. Left out of a Messages request that enables `thinking`, which the API refuses alongside a non-default temperature |
 | `prompt_cache_key` | `None` | The provider's cache-routing key. Unset, jevper derives one per question from the parts of the prompt that do not change between calls, so a rubric's requests are routed together; set it to group (or account for) requests your own way |
 | `extra_body` | `None` | Merged into every request body (the grammar field is merged here too). A key it names is the value that reaches the wire — the SDK merges `extra_body` *after* the typed parameters — so jevper leaves that field alone rather than sending a typed value the caller's own key would override. `response_format`/`text`/`output_config` named here therefore also puts the JSON Schema in the prompt, since no schema of jevper's is in the request. On the Messages surface, `max_tokens` comes from here — jevper always sends one there, defaulting to `DEFAULT_MAX_TOKENS` (1024), or 1024 plus `ReasoningConfig(budget_tokens=…)`; a `max_tokens` that cannot hold the thinking budget asked for raises `JevperError` locally, naming both numbers, rather than earning the API's own refusal. Every other key travels on all three surfaces, whether or not a temperature was set |
-| `extra_headers` | `None` | Sent with every request |
+| `extra_headers` | `None` | Sent with every request. A name spelled differently from the client's own (`authorization` against the SDK's `Authorization`) is renamed to the client's spelling, so it replaces the default header instead of joining it on the wire |
+
+Two `extra_body` keys are refused outright, before any request: `model` (the wire model would disagree with
+the cache key, the learned verdicts and the public response — pass `model=` to the constructor or to
+`system_one()` instead) and a truthy `stream` (jevper reads the answer from one non-streaming response, and
+a server that streamed anyway would hand the SDK an event stream no reader here understands). A
+`logprobs: false` here switches the Responses logprob fields off the way it does on Chat Completions.
 
 Constructor validation is eager: an unknown `method`/`api`, `top_logprobs` outside `[0, 20]` or below 2 with a
 pinned `logprobs`/`grammar`, `max_concurrency < 1`, a negative `n_retry_malformed`, a non-`ReasoningConfig`
 `reasoning`, a `retry` that is not a `RetryPolicy` or has a negative or non-finite field, a `prompt_cache_key`
 that is not a non-empty string of at most `MAX_PROMPT_CACHE_KEY` characters, and an `extra_body` or
 `extra_headers` that is not a mapping all raise `JevperError`.
+
+Text that cannot be encoded as UTF-8 is refused the same way, with the field named: an unpaired surrogate —
+which JSON can carry as a `\udXXX` escape, and which Python's `json` module decodes into a string no
+encoder accepts — in the `state`, a question's instructions or option keys, `prompt_cache_key`,
+`extra_body` or the model id raises before any request, rather than from inside the SDK's serializer where
+the only description on offer would be a provider failure.
 
 ### `system_one`
 
@@ -227,12 +252,14 @@ SGLang's `--enable-cache-report` for its Chat Completions route. See
 | `method` | The call-level method: what `method="auto"` resolved to for this call, or the method you pinned. A question that skips the probe — a `Choice` past 26 options is answered in JSON without ever asking for logprobs — reports its own method in `methods`, so read that when they can differ |
 | `methods` | `{question_id: method}` — only for `method="auto"`, since the method is then chosen per question |
 | `api` | Surface actually used (`"chat_completions"`, `"responses"` or `"messages"`) |
+| `apis` | Only when the questions were answered on more than one surface — which concurrent questions on a shared context can arrange, one worker's 404 moving the client while another is still answering: `{question_id: surface}`. `api` is the surface the call ended on |
 | `reasoning_mode` | `"off"`, `"native"` or `"two_step"` |
 | `llm_attempts` | One record per provider call: `question_id`, `surface`, `request`, `response`, `error`, `readout` |
 | `retry_reasons` | Corrective-retry messages, in order |
 | `probability_errors` | `{question_id: abs(sum − 1)}` for `structured` distributions outside `1e-6` |
 | `original_probabilities` | The model's raw distribution, only for questions that were rescaled |
 | `server_limits` | Only when the server refused a capability field: `structured` (`"schema"`/`"object"`/`"none"`), `output_config` (the Messages API's schema field), `reasoning`, `include`, `cache_key` and `thinking` as it last accepted them |
+| `server_limits_by_api` | The same per-surface limits as `server_limits`, for a call whose questions used more than one surface |
 | `labels_missing` | Labels the provider did not report a logprob for, per question |
 
 Every key is always present — except `methods`, which only `method="auto"` adds — and the last three are empty
@@ -284,6 +311,11 @@ Without a readable header the delay before retry `n` is `min(base_delay · 3ⁿ,
 by default). Anything else — and a transient failure with the retries exhausted — is raised as
 `ProviderError` carrying `.attempts` and `.status_code`. A `RetryPolicy` with a negative or non-finite
 field (`NaN`, `inf`), or a `retry` that is not a `RetryPolicy`, raises `JevperError` at construction.
+
+A provider failure carried in the body of a `200` arrives as a `ProviderError` with `.embedded` true and
+`.status_code` set from the body's own code when it has one. That flag is what keeps `api="auto"` from
+treating a body's `404` as a missing route: the status came from inside a successful response, not from the
+status line.
 
 ## `ReasoningConfig`
 
@@ -344,7 +376,8 @@ the surface it implies, and a provider failure that survived its retries moves n
 `jevper.client.AUTO_METHOD` (`"logprobs"`) and `jevper.client.FALLBACK_METHOD` (`"structured"`) are what
 `method="auto"` tries and falls back to.
 `jevper.client.TRANSIENT_STATUS_CODES`, `jevper.client.MAX_TOP_LOGPROBS` (`20`),
-`jevper.client.MAX_PROMPT_CACHE_KEY` (`256`, the cap jevper enforces on a caller's cache key),
+`jevper.client.MAX_PROMPT_CACHE_KEY` (`256`, the cap jevper enforces on a caller's cache key; OpenAI and
+the OpenResponses schema cap the field itself at 64 characters, so a longer key is the server's to refuse),
 `jevper.labels.MAX_LABEL_OPTIONS` (`26`, the single-token alphabet), `jevper.labels.MAX_CHOICE_OPTIONS` and
 `jevper.types.CHOICE_MAX_OPTIONS` (`255`), `jevper.types.CHOICE_MIN_OPTIONS` (`1`),
 `jevper.types.SCORE_MIN_LEVELS` (`2`), `jevper.types.SCORE_MAX_LEVELS` (`10`) and

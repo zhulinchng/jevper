@@ -585,6 +585,66 @@ def test_a_sampled_token_that_contradicts_the_answer_text_is_refused(stub_server
     assert "contradicts the answer text" in str(raised.value)
 
 
+def test_a_sampled_token_that_contradicts_a_punctuated_label_is_refused(stub_server):
+    """``A.`` names label ``A``; punctuation after the letter is not prose that hides the claim."""
+    body = chat_body(content="A.", logprobs=[("B", -0.12), ("A", -2.47), ("C", -3.48)])
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="logprobs",
+        api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(LabelReadoutError) as raised:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert "contradicts the answer text" in str(raised.value)
+
+
+def test_a_label_with_punctuation_is_read_as_that_label(stub_server):
+    """The same matcher on both sides: ``A.`` in the text and ``A`` sampled agree, and answer."""
+    body = chat_body(content="A.", logprobs=[("A", -0.12), ("B", -2.47)])
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", method="logprobs", api="chat_completions"
+    )
+
+    response = client.system_one(
+        state="s", questions={"q": Choice(criteria={"billing": None, "sales": None})}
+    )
+
+    assert response.answers["q"].choice == "billing"
+
+
+def test_a_positive_alternative_beside_a_non_option_token_is_refused(stub_server):
+    """A log probability is never positive, whatever token it belongs to.
+
+    The value used to be filtered by label first, so a broken number on a token outside the option
+    set was dropped quietly and the remaining one-hot stood.
+    """
+    body = chat_body(content="A", logprobs=[("A", -0.1)])
+    body["choices"][0]["logprobs"]["content"][0]["top_logprobs"].append(
+        {"token": "X", "logprob": 0.9, "bytes": [88]}
+    )
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="logprobs",
+        api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(LabelReadoutError) as raised:
+        client.system_one(
+            state="s", questions={"q": Choice(criteria={"billing": None, "sales": None})}
+        )
+
+    assert "positive" in str(raised.value)
+
+
 def test_an_answer_text_that_is_not_a_label_does_not_contradict_anything(stub_server):
     """A JSON answer on the logprob channel is not a rival claim: the text is prose, the token is the label."""
     body = chat_body(
@@ -609,6 +669,8 @@ def test_an_answer_text_that_is_not_a_label_does_not_contradict_anything(stub_se
     [
         '{"probabilities": {"billing": 0.1, "technical": 0.1, "sales": 0.8}}',
         ' and then {"probabilities": {"billing": 0.1, "technical": 0.1, "sales": 0.8}}',
+        # A brace in prose is not an answer, and must not hide the second one behind it.
+        ' example {not-json}; correction: {"probabilities": {"billing": 0.1, "technical": 0.1, "sales": 0.8}}',
     ],
 )
 def test_two_json_objects_in_one_answer_are_malformed(stub_server, second):
@@ -627,6 +689,25 @@ def test_two_json_objects_in_one_answer_are_malformed(stub_server, second):
         client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
 
     assert "more than one JSON object" in str(raised.value)
+
+
+def test_a_brace_in_prose_before_the_answer_is_stepped_over(stub_server):
+    """A model that shows the shape it was asked for has still answered; the object after it is read."""
+    answer = '{"probabilities": {"billing": 0.8, "technical": 0.1, "sales": 0.1}}'
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content="I will use this shape: {example}; answer: " + answer))
+    )
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="structured",
+        api="chat_completions",
+        n_retry_malformed=0,
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.answers["q"].choice == "billing"
 
 
 @pytest.mark.parametrize("digits", [400, 5000])

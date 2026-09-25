@@ -217,6 +217,9 @@ class StubServer:
         self.paths: list[str] = []
         self.headers: list[dict[str, Any]] = []
         """Request headers per call, so a test can prove an ``extra_headers`` value reached the wire."""
+        self.header_pairs: list[list[tuple[str, str]]] = []
+        """Header name/value pairs per call, duplicates included — the SDK's case-sensitive merge can
+        put two spellings of one header on the wire, and a dict view would hide that."""
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -229,6 +232,7 @@ class StubServer:
                 stub.requests.append(body)
                 stub.paths.append(self.path)
                 stub.headers.append(dict(self.headers))
+                stub.header_pairs.append(list(self.headers.items()))
                 if self.path.endswith("/responses"):
                     script = stub.responses
                 elif self.path.endswith("/messages"):

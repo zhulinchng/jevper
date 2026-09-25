@@ -180,7 +180,7 @@ def test_two_step_falls_back_to_reasoning_text_when_the_analysis_is_silent(stub_
     response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
 
     answer = stub.bodies("/responses")[1]
-    assert answer["input"][-2] == {"role": "assistant", "content": TRACE}
+    assert answer["input"][-2] == {"type": "message", "role": "assistant", "content": TRACE}
     assert response.answers["q"].choice == "billing"
     # the provider's own item carries the trace: no synthetic part, so no duplicated text
     assert len(response.reasoning) == 1
@@ -243,7 +243,8 @@ def test_a_reasoning_part_without_a_dict_is_skipped():
             class Completions:
                 def create(self, **kwargs: Any) -> Any:
                     message = SimpleNamespace(content='{"choice": "A"}', reasoning=[part])
-                    return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=None)
+                    choice = SimpleNamespace(message=message, finish_reason="stop")
+                    return SimpleNamespace(choices=[choice], usage=None)
 
             class Chat:
                 completions = Completions()

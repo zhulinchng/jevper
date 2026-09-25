@@ -163,6 +163,52 @@ Three of these decide behaviour jevper implements rather than documents:
   carries the full distribution; `api="auto"` moves the label readout there, marks the surface, and later
   calls start where the distribution is.
 
+## The OpenResponses route
+
+`/v1/responses` is not one wire format but two that share a path: OpenAI's Responses API and the
+[OpenResponses](https://www.openresponses.org) specification (current release `2026-04-24`), which
+vLLM says its route "aligns with" and which LM Studio has implemented since 0.3.39. jevper's
+`api="responses"` reads both and sends the portable form: every input turn carries the item `type`
+the spec's union requires, with its content as a plain string, which that union also allows. The
+table is what each server did with exactly that, measured with raw HTTP; the reasoning knobs were
+asked for with `reasoning: {"effort": "none"}` and the logprob carrier with
+`include: ["message.output_text.logprobs"], top_logprobs: 5`.
+
+| | ollama 0.34.3 | llama.cpp b11139 | LM Studio 0.4.1 | vLLM 0.30.1 | SGLang 0.5.20 |
+| --- | --- | --- | --- | --- | --- |
+| input items with `type: "message"`, content as a string | 200 | 200 | 200 | 200 | 200 |
+| the same with `input_text` content parts | 200 | 200 | 200 | 200, but the model receives the parts as objects and answers from them (their input normalization is catching up, #35508) — the string form is the one that renders | 200 |
+| strict `text.format` `json_schema` with `minimum: 0` | 200, `strict` ignored | 200, field ignored | 200, field ignored | 200, **enforced** | 200, **enforced** |
+| `include` + `top_logprobs: 5` | `logprobs: []` | **`400 top_logprobs requires logprobs to be set to true`** | real logprobs on the `output_text` part, one entry per token, each with its `bytes` | real logprobs on the part | real logprobs on the part, one entry per generated token — the thinking trace included (1.1 MB for one answer) |
+| `max_output_tokens: 8` | `completed`, reasoning only | `completed`, reasoning only, no message | `completed` — a cut-off answer, or one in the wrong shape when jevper's own question is asked (the schema field is ignored there) | `incomplete` / `max_output_tokens` | `incomplete` / `max_output_tokens` |
+| unknown model id | `404` naming it | ignored, `200` | ignored, `200` | `404` naming it | `404`, `invalid_request_error`, `code: 404` |
+| `reasoning.encrypted_content` in `include` | 200 | 200 | 200 | 200 | 200 |
+| reasoning items | `summary` absent, `content: [{"type": "reasoning_text"}]` | the same, plus `status: "completed"` | not returned | `summary: []`, `content: [{"type": "reasoning_text"}]` | `summary` absent, `content: [{"type": "reasoning_text"}]` |
+
+Three of these decide what jevper does rather than what it documents:
+
+- **A logprob list is the carrier, and each server carries it differently.** An empty list and a
+  refusal are both "no distribution here": `api="auto"` answers that question in JSON and marks the
+  surface, while a real list — byte-level tokens and all — is read as one. A server that answers
+  `400` for the fields is remembered the same way.
+- **A spent budget is only a truncation where the server says so.** vLLM and SGLang report
+  `status: "incomplete"` with `incomplete_details.reason: "max_output_tokens"`, and jevper's error
+  names that field. The other three report `completed` — with the trace and no answer, or with an
+  answer cut off mid-string — so what the caller is told is a malformed answer, which is what the
+  body is. There is no signal in those bodies to read, and a caller who needs the distinction should
+  set a budget the model cannot reach.
+- **Reasoning text is decoration and is read wherever it appears.** The five part names the two
+  specs use are normalized to the two the public model has, so a trace is not lost to a spelling,
+  and a trace that cannot be encoded as UTF-8 is dropped rather than left in a response the caller
+  cannot serialize.
+
+The specification also defines a WebSocket transport and a `/responses/compact` endpoint. jevper
+reads one whole response per request and needs neither: its surface is the non-streaming HTTP one.
+The specification's own compliance suite (`bun run test:compliance`) covers phases, streaming,
+tools, images, WebSocket and compaction, and says nothing about structured outputs, logprobs or
+the error envelope — passing it is not evidence for the paths jevper uses, which is why the table
+above is measured rather than cited.
+
 ## Prompt caching
 
 Every one of these servers caches the prefix of a prompt and reuses it for the next request that starts the

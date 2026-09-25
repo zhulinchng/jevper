@@ -20,7 +20,7 @@ from pydantic import (
     model_validator,
 )
 
-from .errors import InvalidQuestionError
+from .errors import InvalidQuestionError, JevperError
 from .labels import MAX_CHOICE_OPTIONS
 from .reasoning import ReasoningContentPart
 
@@ -107,6 +107,34 @@ class Score(BaseModel):
         return self
 
 
+def ensure_encodable(value: Any, *, where: str, error: type[JevperError] = JevperError) -> None:
+    """Refuse text a request could never carry, before anything tries to send it.
+
+    Python strings may hold unpaired surrogates — the code points a broken decoder leaves behind —
+    and JSON can carry them as ``\\udXXX`` escapes, so a state read from a file, or an answer echoed
+    back into the next question, can hold one. Nothing downstream can encode such a string: the
+    SDK's serializer raises ``UnicodeEncodeError`` from inside the provider call, where the only
+    description on offer is a provider failure, and hashing one for the prompt-cache key raises the
+    same error before a request is even built. Both are local mistakes, so they are reported as
+    local ones, with the field named and nothing sent.
+    """
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise error(
+                f"{where} contains a character that cannot be encoded as UTF-8 ({exc.reason} at "
+                f"position {exc.start}); replace it before handing it to jevper"
+            ) from None
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            ensure_encodable(key, where=where, error=error)
+            ensure_encodable(item, where=where, error=error)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            ensure_encodable(item, where=where, error=error)
+
+
 Question = Noul | Choice | Score
 
 Method = Literal["logprobs", "grammar", "structured", "discrete"]
@@ -132,6 +160,15 @@ def validate_question(question: Question, question_id: str | None = None) -> Non
             raise InvalidQuestionError(
                 f"{where}: score needs {SCORE_MIN_LEVELS}..{SCORE_MAX_LEVELS} levels, got {count}"
             )
+    # Every string the question puts on the wire — its instructions, its option keys and their
+    # descriptions — has to be encodable, and the cache key derived from them is hashed before the
+    # first request. A lone surrogate in any of them is a question no request could carry.
+    try:
+        ensure_encodable(
+            question.model_dump(mode="python"), where=where, error=InvalidQuestionError
+        )
+    except JevperError as exc:
+        raise InvalidQuestionError(str(exc)) from None
 
 
 QuestionAdapter = TypeAdapter(Annotated[Noul | Choice | Score, Field(discriminator="type")])

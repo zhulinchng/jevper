@@ -193,6 +193,12 @@ refuses everything still ends in a `ProviderError`, and `debug["server_limits"]`
 field the caller put in `extra_body` is dropped with it: the SDK merges `extra_body` last, so leaving it there
 would re-send the refused field under another name.
 
+The `include` list carries two entries on a Responses call that asks for both a label readout and
+reasoning, and a server that refuses only the reasoning one says so: `include[1]: expected one of
+"message.output_text.logprobs"` is a refusal of `reasoning.encrypted_content`, not of the carrier, so jevper
+re-asks without that entry and keeps the method. The list a server prints is read for what it accepts,
+not for the word "logprob" in it — that word is how a server names what it *will* carry.
+
 Two `extra_body` fields interact with jevper's own rather than replacing it, and both are read as the
 caller's configuration rather than as a reason to fail. `logprobs` and `top_logprobs` are two separate
 fields: naming only `logprobs` (any truthy value) still gets the alternatives jevper's label readout needs,

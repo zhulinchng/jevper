@@ -84,6 +84,7 @@ from .types import (
     ScoreAnswer,
     SystemOneResponse,
     Usage,
+    ensure_encodable,
     parse_question,
 )
 
@@ -460,6 +461,7 @@ def _require_prompt_cache_key(key: Any) -> None:
         raise JevperError(
             f"prompt_cache_key must be at most {MAX_PROMPT_CACHE_KEY} characters, got {len(key)}"
         )
+    ensure_encodable(key, where="prompt_cache_key")
 
 
 def _require_count(name: str, value: Any, *, minimum: int | None = None, maximum: int | None = None) -> None:
@@ -488,6 +490,7 @@ def _require_model(model: Any) -> None:
     """
     if not isinstance(model, str) or not model.strip():
         raise JevperError(f"model must be a non-empty string, got {model!r}")
+    ensure_encodable(model, where="the model id")
 
 
 def _add_count(current: int | None, value: Any) -> int | None:
@@ -529,6 +532,10 @@ def _exception_text(exc: BaseException, limit: int = 500) -> str:
         text = str(exc)
     except Exception:  # noqa: BLE001 - an exception that cannot describe itself is still an exception
         return f"<{type(exc).__name__} raised while formatting its own message>"
+    # A provider message can carry a lone surrogate (a body with a ``\udXXX`` escape decodes into
+    # one), and an error message the caller cannot print is a second failure on top of the first:
+    # ``backslashreplace`` keeps the characters visible as the escapes the wire carried.
+    text = text.encode("utf-8", "backslashreplace").decode("utf-8")
     return text if len(text) <= limit else text[:limit] + f"… (+{len(text) - limit} chars)"
 
 
@@ -558,6 +565,11 @@ def _route_missing(exc: BaseException, *, surface: Surface, model: str) -> bool:
         return False
     evidence = _error_evidence(exc)
     names_the_model = model.lower() in evidence
+    if getattr(exc, "embedded", False):
+        # The status came from the body of a ``200``, not from the status line: a body that says
+        # ``404`` is the provider reporting a failure inside a successful response, and treating it
+        # as a missing route would answer the question on another surface and hide the error.
+        return False
     return not (names_the_model and any(marker in evidence for marker in _MODEL_404_MARKERS))
 
 
@@ -584,6 +596,12 @@ def _include_value_refused(evidence: str) -> bool:
     encrypted_content"`` for ``path: ["include", 0]`` — it has listed what it accepts, and the logprob
     entry is not on the list, so no rearrangement of the other entries will satisfy it.
     """
+    if "message.output_text.logprobs" in evidence:
+        # A server that lists the logprob entry among the values it accepts is refusing the *other*
+        # entry — OpenRouter and vLLM answer ``include[1]: expected one of
+        # "message.output_text.logprobs"`` for ``reasoning.encrypted_content`` — and the logprob
+        # word in that sentence is the server naming what it will carry, not what it refuses.
+        return False
     return any(marker in evidence for marker in _INCLUDE_REJECTION_MARKERS)
 
 
@@ -663,12 +681,29 @@ def _dump_model(obj: Any) -> Any:
     if callable(dump):
         for keywords in ({"mode": "json", "warnings": False}, {"mode": "json"}, {}):
             try:
-                return dump(**keywords)
+                return _sanitize_debug(dump(**keywords))
             except TypeError:
                 continue  # this dump does not take those keywords; try the next spelling
             except Exception:  # noqa: BLE001 - debug data never decides whether a call succeeded
                 return obj
     return obj
+
+
+def _sanitize_debug(value: Any) -> Any:
+    """The dumped provider object with every string printable, for a response that must serialize.
+
+    A body can carry an escaped lone surrogate, which the SDK decodes into a Python string no UTF-8
+    encoder accepts; left in ``debug`` it would make ``SystemOneResponse.model_dump_json()`` raise
+    long after the call succeeded. The escapes the wire carried are shown instead, so the debug
+    record still says what the provider sent.
+    """
+    if isinstance(value, str):
+        return value.encode("utf-8", "backslashreplace").decode("utf-8")
+    if isinstance(value, Mapping):
+        return {key: _sanitize_debug(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_debug(item) for item in value]
+    return value
 
 
 def _pick_examples(examples: Examples, question_id: str) -> Sequence[Example]:
@@ -887,6 +922,30 @@ class _BaseClient:
             self._auto_misses[(model, surface)] = misses
             return misses
 
+    def _next_surface(self, surface: Surface, method: Method) -> Surface | None:
+        """The next surface ``api="auto"`` may answer on after this one stopped answering.
+
+        The order is the documented one: Responses, then Chat Completions, then Messages, and the
+        search wraps — a surface the client can still speak and this server has not already given
+        a 404 for is worth a request wherever it sits in the order, because a label readout moving
+        off a surface without logprobs lands on the other one and needs to come back when that one
+        turns out to have no route. The 404 memory is what stops the walk from circling: a surface
+        that has answered 404 is never tried again. Messages carries no logprobs, so a pinned
+        ``logprobs`` or ``grammar`` method skips it and keeps looking.
+        """
+        order: tuple[Surface, ...] = ("responses", "chat_completions", "messages")
+        start = order.index(surface)
+        for step in range(1, len(order)):
+            candidate = order[(start + step) % len(order)]
+            if self._surface_missing(candidate):
+                continue
+            if not _has_attribute(self.client, f"{SURFACES[candidate][2]}.create"):
+                continue
+            if candidate == "messages" and method in ("logprobs", "grammar"):
+                continue
+            return candidate
+        return None
+
     def _note_logprobs_present(self, model: str, surface: Surface) -> None:
         """A readable distribution retires the absences counted so far, and any verdict against it."""
         with self._auto_lock:
@@ -1101,7 +1160,7 @@ class _BaseClient:
                     capability=capability,
                     surface=transport.surface,
                 )
-            if _is_server_error(_status_code(exc)):
+            if _is_server_error(_status_code(exc)) and context.auto:
                 return _LogprobsUnavailable(
                     f"the provider failed every attempt at the logprob request ({failure})",
                     capability=False,
@@ -1144,6 +1203,8 @@ class _BaseClient:
     ) -> tuple[_CallContext, dict[str, Question]]:
         if not questions:
             raise InvalidQuestionError("at least one question is required")
+        if self.extra_body is not None:
+            ensure_encodable(self.extra_body, where="extra_body")
         if reasoning is not None and not isinstance(reasoning, ReasoningConfig):
             # Without this the mode lookup dereferences a string and the caller sees an AttributeError.
             raise JevperError(f"reasoning must be a ReasoningConfig, got {type(reasoning).__name__}")
@@ -1174,14 +1235,14 @@ class _BaseClient:
         # The surface is picked for the method auto tries first; the fallback runs on either surface.
         surface = select_surface(self.client, effective_api, AUTO_METHOD if auto else requested)
         if api_auto and self._surface_missing(surface):
-            # This server answered 404 for the route before: do not pay for the discovery again. The
-            # flip is only worth making if the client can speak the other surface — a messages-only
-            # client has no ``responses`` to move to, and moving anyway turned the provider's 404 into
-            # an AttributeError for an attribute the caller never had. Staying put re-asks the surface
-            # that is known to 404, and the in-call handler reports that 404, exactly as it did on the
-            # call that learned it.
-            other: Surface = "chat_completions" if surface == "responses" else "responses"
-            if _has_attribute(self.client, f"{SURFACES[other][2]}.create"):
+            # This server answered 404 for the route before: do not pay for the discovery again, and
+            # start on the next surface in the documented order. When there is none — a messages-only
+            # client, or a method that only an OpenAI surface can carry — staying put re-asks the
+            # surface that is known to 404, and the in-call handler reports that 404, exactly as it
+            # did on the call that learned it. Moving anyway used to turn the provider's 404 into an
+            # AttributeError for an attribute the caller never had.
+            other = self._next_surface(surface, requested)
+            if other is not None:
                 surface = other
         elif (
             api_auto
@@ -1330,10 +1391,8 @@ class _BaseClient:
                 if not context.api_auto:
                     raise
                 self._remember_surface_missing(exc.surface)
-                other: Surface = "chat_completions" if exc.surface == "responses" else "responses"
-                if self._surface_missing(other) or not _has_attribute(
-                    self.client, f"{SURFACES[other][2]}.create"
-                ):
+                other = self._next_surface(exc.surface, context.method)
+                if other is None:
                     # Nowhere left to go: this 404 is the answer, and it is a provider failure like any
                     # other — a public error carrying the status and the attempt history, not the
                     # private verdict this fallback runs on.
@@ -1552,6 +1611,27 @@ class _BaseClient:
             "original_probabilities": original_probabilities,
             "labels_missing": labels_missing,
         }
+        surfaces = {
+            attempt["surface"] for attempt in attempts if isinstance(attempt.get("surface"), str)
+        }
+        if len(surfaces) > 1:
+            # Questions run concurrently against one shared context, so a 404 on one surface can
+            # move the client while another question is still answering on the old one. The scalar
+            # ``api`` is the surface the call ended on; this says where each question was answered.
+            debug["apis"] = {
+                question_id: outcome.attempts[-1]["surface"]
+                for question_id, outcome in outcomes.items()
+                if outcome.attempts and isinstance(outcome.attempts[-1].get("surface"), str)
+            }
+            # The limits are per surface, and a mixed call learned some on each; the scalar
+            # ``server_limits`` speaks for the surface the call ended on.
+            debug["server_limits_by_api"] = {
+                name: {
+                    entry.name: getattr(self._limits_for(name), entry.name)
+                    for entry in dataclass_fields(Limits)
+                }
+                for name in sorted(surfaces)
+            }
         if context.auto:
             # The method was chosen rather than pinned, so report what each question actually used.
             debug["methods"] = {

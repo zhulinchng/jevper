@@ -449,4 +449,54 @@ def test_an_empty_noul_probability_mapping_is_refused(stub_server):
         client.system_one(state=STATE, questions={"q": question})
 
     assert "True or False key" in str(raised.value)
+
+
+def test_noul_keys_that_collide_after_normalization_are_refused(stub_server):
+    """``{True: 0.2, "true": 0.8}`` are two keys in Python and one answer, so one number would vanish."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content="{}")))
+    client = SystemOneClient(openai_client(stub), model="stub", method="structured")
+    question = Noul(
+        examples=[Example(state="s", answer=True, probabilities={True: 0.2, "true": 0.8})]
+    )
+
+    with pytest.raises(InvalidQuestionError) as raised:
+        client.system_one(state=STATE, questions={"q": question})
+
+    assert "one spelling" in str(raised.value)
     assert stub.requests == []
+
+
+@pytest.mark.parametrize("key", ["True", "FALSE", "yes", 2])
+def test_a_noul_key_the_renderer_cannot_find_is_refused(stub_server, key):
+    """Only the spellings the demonstration renderer looks up are answers: booleans, 0/1, 'true'/'false'.
+
+    ``{"True": 0.9}`` used to pass validation and then raise a ``KeyError`` while the prompt was
+    being rendered — after the questions ahead of it had already spent provider calls.
+    """
+    stub = stub_server(chat=lambda _: (200, chat_body(content="{}")))
+    client = SystemOneClient(openai_client(stub), model="stub", method="structured")
+    question = Noul(examples=[Example(state="s", answer=True, probabilities={key: 0.9})])
+
+    with pytest.raises(InvalidQuestionError) as raised:
+        client.system_one(state=STATE, questions={"q": question})
+
+    assert "True or False key" in str(raised.value)
+    assert stub.requests == []
+
+
+@pytest.mark.parametrize(
+    "key,expected", [(True, 0.9), ("true", 0.9), (1, 0.9), (False, 0.1), ("false", 0.1), (0, 0.1)]
+)
+def test_a_noul_key_the_renderer_can_find_is_rendered(stub_server, key, expected):
+    """Every accepted spelling reaches the demonstration with the caller's number, under its answer."""
+    import json as _json
+
+    answer = _json.dumps({"noul": 0.1})
+    stub = stub_server(chat=lambda _: (200, chat_body(content=answer)))
+    client = SystemOneClient(openai_client(stub), model="stub", method="structured")
+    question = Noul(examples=[Example(state="s", answer=True, probabilities={key: 0.9})])
+
+    client.system_one(state=STATE, questions={"q": question})
+
+    sent = stub.bodies("/chat/completions")[0]
+    assert _json.loads(sent["messages"][2]["content"])["noul"] == pytest.approx(expected)

@@ -329,8 +329,15 @@ def test_missing_logprob_on_the_answer_token_is_an_error_not_certainty(stub_serv
     assert len(stub.bodies("/chat/completions")) == 2  # one corrective retry, not a silent 1.0
 
 
-def test_alternative_without_a_logprob_is_reported_missing(stub_server):
-    body = _logprobs_body(
+def test_alternatives_without_a_logprob_are_not_a_distribution(stub_server):
+    """The sampled token repeated beside null rivals is absence of data, not certainty.
+
+    What is left once the null entries are dropped is the sampled token's own logprob; normalizing
+    over it alone would answer ``billing=1.0`` for a provider that never reported a rival, which is
+    the one-hot the pinned test below used to bless. A pinned label readout now refuses it, and one
+    usable rival among the nulls is still a distribution.
+    """
+    no_rival = _logprobs_body(
         [
             {
                 "token": "A",
@@ -339,15 +346,46 @@ def test_alternative_without_a_logprob_is_reported_missing(stub_server):
             }
         ]
     )
-    stub = stub_server(chat=lambda _: (200, body))
+    pinned_stub = stub_server(chat=lambda _: (200, no_rival))
+    pinned = SystemOneClient(
+        openai_client(pinned_stub),
+        model="stub",
+        api="chat_completions",
+        method="logprobs",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(LabelReadoutError) as error:
+        pinned.system_one(
+            state="s", questions={"q": Choice(criteria={"billing": None, "sales": None})}
+        )
+
+    assert "none of which was an alternative" in str(error.value)
+
+    one_rival = _logprobs_body(
+        [
+            {
+                "token": "A",
+                "logprob": -0.12,
+                "top_logprobs": [
+                    {"token": "A", "logprob": -0.12},
+                    {"token": "B", "logprob": -2.4},
+                    {"token": "C", "logprob": None},
+                ],
+            }
+        ]
+    )
+    stub = stub_server(chat=lambda _: (200, one_rival))
     client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
 
     response = client.system_one(
-        state="s", questions={"q": Choice(criteria={"billing": None, "sales": None})}
+        state="s", questions={"q": Choice(criteria={"billing": None, "sales": None, "other": None})}
     )
 
-    assert response.answers["q"].probabilities == {"billing": 1.0, "sales": 0.0}
-    assert response.debug["labels_missing"] == {"q": ["B"]}
+    probabilities = response.answers["q"].probabilities
+    assert probabilities["billing"] / probabilities["sales"] == pytest.approx(math.exp(2.4 - 0.12))
+    assert probabilities["other"] == 0.0
+    assert response.debug["labels_missing"] == {"q": ["C"]}
 
 
 def test_non_finite_logprobs_raise_instead_of_poisoning_the_distribution():

@@ -249,6 +249,148 @@
     "model": "qwen3-4b-instruct-2507"
    },
    "status": 200
+  },
+  {
+   "method": "POST",
+   "name": "responses-openresponses-items",
+   "path": "/v1/responses",
+   "status": 200,
+   "body": {
+    "id": "resp_3d8eef014dbc3f54a72ebfd669a945ccd872bd54c24daf0d",
+    "object": "response",
+    "created_at": 1790304191,
+    "completed_at": 1790304192,
+    "status": "completed",
+    "incomplete_details": null,
+    "model": "qwen3-4b-instruct-2507",
+    "previous_response_id": null,
+    "instructions": null,
+    "output": [
+     {
+      "id": "msg_z1g5dk58o7jxm8e61vqv",
+      "type": "message",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+       {
+        "type": "output_text",
+        "text": "{\"probabilities\":{\"billing\":{\"value\":1,\"type\":\"number\"},\"sales\":{\"value\":0,\"type\":\"number\"},\"technical\":{\"value\":0,\"type\":\"number\"}}}",
+        "annotations": [],
+        "logprobs": []
+       }
+      ]
+     }
+    ],
+    "error": null,
+    "tools": [],
+    "tool_choice": "auto",
+    "truncation": "auto",
+    "parallel_tool_calls": true,
+    "text": {
+     "format": {
+      "type": "text"
+     }
+    },
+    "top_p": 0.95,
+    "presence_penalty": 0,
+    "frequency_penalty": 1.1,
+    "top_logprobs": 0,
+    "temperature": 0.8,
+    "reasoning": {
+     "summary": null,
+     "effort": null
+    },
+    "usage": {
+     "input_tokens": 123,
+     "output_tokens": 35,
+     "total_tokens": 158,
+     "input_tokens_details": {
+      "cached_tokens": 122
+     },
+     "output_tokens_details": {
+      "reasoning_tokens": 0
+     }
+    },
+    "max_output_tokens": 64,
+    "max_tool_calls": null,
+    "store": false,
+    "background": false,
+    "service_tier": "default",
+    "metadata": {},
+    "safety_identifier": null,
+    "prompt_cache_key": null
+   }
+  },
+  {
+   "method": "POST",
+   "name": "responses-budget-truncated",
+   "path": "/v1/responses",
+   "status": 200,
+   "body": {
+    "id": "resp_d6c1a6c04309c8ce7cb8032d3e7ebb07ae1566b787769b08",
+    "object": "response",
+    "created_at": 1790304191,
+    "completed_at": 1790304191,
+    "status": "completed",
+    "incomplete_details": null,
+    "model": "qwen3-4b-instruct-2507",
+    "previous_response_id": null,
+    "instructions": null,
+    "output": [
+     {
+      "id": "msg_e8doo49kvuy4zyj6ve0q",
+      "type": "message",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+       {
+        "type": "output_text",
+        "text": "{\"probabilities\":{\"billing\":0.",
+        "annotations": [],
+        "logprobs": []
+       }
+      ]
+     }
+    ],
+    "error": null,
+    "tools": [],
+    "tool_choice": "auto",
+    "truncation": "auto",
+    "parallel_tool_calls": true,
+    "text": {
+     "format": {
+      "type": "text"
+     }
+    },
+    "top_p": 0.95,
+    "presence_penalty": 0,
+    "frequency_penalty": 1.1,
+    "top_logprobs": 0,
+    "temperature": 0.8,
+    "reasoning": {
+     "summary": null,
+     "effort": null
+    },
+    "usage": {
+     "input_tokens": 106,
+     "output_tokens": 8,
+     "total_tokens": 114,
+     "input_tokens_details": {
+      "cached_tokens": 100
+     },
+     "output_tokens_details": {
+      "reasoning_tokens": 0
+     }
+    },
+    "max_output_tokens": 8,
+    "max_tool_calls": null,
+    "store": false,
+    "background": false,
+    "service_tier": "default",
+    "metadata": {},
+    "safety_identifier": null,
+    "prompt_cache_key": null
+   }
   }
  ]
 }

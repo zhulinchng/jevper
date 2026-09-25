@@ -6,6 +6,7 @@ gets, and the normalizers turn either provider response object into one ``CallRe
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -185,6 +186,22 @@ def _caller_body(extra_body: Mapping[str, Any] | None, limits: Limits) -> dict[s
     without it" the ladder promises would send the same bytes a second time.
     """
     body = dict(extra_body or {})
+    if "model" in body:
+        # The wire model would then disagree with everything jevper keys state on: the derived
+        # prompt-cache key, the absence memory, the surface verdicts, and the model the public
+        # response reports. One model per client, named where jevper validates it.
+        raise JevperError(
+            "extra_body cannot carry 'model': pass model= to the constructor or to system_one(), "
+            "where it is validated and used for the cache key and the public response"
+        )
+    if body.get("stream"):
+        # The SDK would merge a stream request over the typed ``stream`` jevper never sets, and the
+        # server's event stream would reach a parser built for one whole response. Refused here,
+        # where it costs nothing, rather than as an unreadable answer after the call.
+        raise JevperError(
+            "extra_body cannot ask for a stream: jevper reads the answer from one non-streaming "
+            "response, so remove 'stream' (or set it to false)"
+        )
     if limits.structured != "schema":
         # The server refused the schema field once, so the caller's format field goes too — whatever it
         # holds, jevper can no longer promise it reaches a server that just rejected the field. The
@@ -265,6 +282,17 @@ def build_chat_kwargs(
     return kwargs
 
 
+def _responses_input(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    """The prompt turns as Responses input items, each carrying the item type its spec requires.
+
+    OpenAI accepts the ``{"role": ..., "content": ...}`` shorthand for an input message, but the
+    OpenResponses schema discriminates its input union on ``type`` and lists it as required, so a
+    server that validates against the spec refuses every turn without it. The type is what the
+    shorthand means; naming it costs nothing on OpenAI and is the portable form.
+    """
+    return [{"type": "message", **turn} for turn in messages]
+
+
 def build_responses_kwargs(
     spec: CallSpec,
     *,
@@ -276,11 +304,24 @@ def build_responses_kwargs(
 ) -> dict[str, Any]:
     limits = limits or Limits()
     body = _caller_body(extra_body, limits)
-    kwargs: dict[str, Any] = {"model": model, "input": spec.messages, "store": False}
-    if spec.logprobs:
+    # ``logprobs`` is Chat Completions' on/off switch; this surface carries the same request through
+    # ``top_logprobs`` plus the ``include`` entry, so the caller's switch is read here and the
+    # switch itself is left where the caller put it.
+    wanted_logprobs = spec.logprobs and bool(body.get("logprobs", True))
+    # A key the caller names in ``extra_body`` is the value that reaches the wire, so jevper does
+    # not also set the typed one: two keys for one field make the request recorded in ``debug``
+    # differ from the body the provider received.
+    kwargs: dict[str, Any] = {}
+    if "model" not in body:
+        kwargs["model"] = model
+    if "input" not in body:
+        kwargs["input"] = _responses_input(spec.messages)
+    if "store" not in body:
+        kwargs["store"] = False
+    if wanted_logprobs and "top_logprobs" not in body:
         kwargs["top_logprobs"] = spec.top_logprobs
     include: list[str] = []
-    if spec.logprobs:
+    if wanted_logprobs:
         include.append("message.output_text.logprobs")
     if spec.reasoning is not None and limits.include:
         include.append("reasoning.encrypted_content")
@@ -315,8 +356,10 @@ def build_responses_kwargs(
             schema_sent = True
         elif limits.structured != "none":
             kwargs["text"] = {"format": {"type": "json_object"}}
-    if spec.json_schema is not None and not schema_sent:
-        kwargs["input"] = _schema_in_prompt(spec.messages, spec)
+    if spec.json_schema is not None and not schema_sent and "input" not in body:
+        # The caller's own ``input`` is authoritative when they named one: rewriting the typed key
+        # would not reach the wire, so the schema travels only where jevper still owns the input.
+        kwargs["input"] = _responses_input(_schema_in_prompt(spec.messages, spec))
     if spec.prompt_cache_key is not None and limits.cache_key and "prompt_cache_key" not in body:
         kwargs["prompt_cache_key"] = spec.prompt_cache_key
     if spec.temperature is not None and "temperature" not in body:
@@ -378,9 +421,19 @@ def _usable_choice(choice: Any) -> bool:
     ``200`` with a shape it did not fill in. Reading that as a blank answer would hide an embedded
     provider error, which is how OpenRouter reports an overloaded upstream, and would turn a retryable
     failure into a malformed answer after the corrective retries were spent.
+
+    The carrier has to be there, not merely named: a ``message`` that is null, with no legacy
+    ``text`` beside it, is the shape a provider sends when it has nothing to say, and reading it as
+    an empty answer is a malformed-answer verdict spent on a body that never carried one. A
+    ``delta`` is a streaming chunk's carrier and is not this reader's; ``_chat_result`` names that
+    mismatch for what it is.
     """
     payload = _as_mapping(choice)
-    return bool(payload) and any(name in payload for name in ("message", "text", "delta"))
+    if not payload:
+        return False
+    if _get(choice, "message") is not None:
+        return True
+    return isinstance(_get(choice, "text"), str)
 
 
 def _chat_reasoning_tokens(usage: Any, details: Any) -> Any:
@@ -396,20 +449,62 @@ def _chat_reasoning_tokens(usage: Any, details: Any) -> Any:
     return _get(usage, "reasoning_tokens")
 
 
+_REASONING_TEXT_TYPES = ("summary_text", "reasoning_text", "output_text", "input_text", "text")
+"""Every part type the two specs put reasoning text in. OpenAI names them ``summary_text`` and
+``reasoning_text``; OpenResponses allows the same text under ``text``, ``output_text`` and
+``input_text``, and what the caller reads is the text either way."""
+
+
 def _reasoning_part(obj: Any) -> ReasoningContentPart | None:
     """One reasoning part, or ``None`` when the provider sent something unreadable.
 
-    Reasoning is decoration: a null ``summary``/``content``, or a part that is not a reasoning item at
-    all, must never cost the caller an answer that is otherwise right there.
+    Reasoning is decoration: a null ``summary``/``content``, a part that is not a reasoning item at
+    all, or text that cannot be encoded as UTF-8 must never cost the caller an answer that is
+    otherwise right there — nor leave a string in the public response that cannot be serialized.
+
+    The part types are normalized on the way in because the OpenResponses spec spells the same two
+    things several ways: a summary item is ``summary_text`` or plain ``text``, and reasoning content
+    is ``reasoning_text``, ``output_text`` or ``text``. What the caller reads — a summary text and a
+    reasoning text — is the same either way.
     """
     payload = _as_mapping(obj)
     for name in ("summary", "content"):
         if payload.get(name) is None and name in payload:
             payload[name] = []
+    _normalize_reasoning_items(payload, "summary", "summary_text", _REASONING_TEXT_TYPES)
+    _normalize_reasoning_items(payload, "content", "reasoning_text", _REASONING_TEXT_TYPES)
     try:
-        return ReasoningContentPart.model_validate(payload)
+        part = ReasoningContentPart.model_validate(payload)
     except ValueError:
         return None
+    for group in (part.summary, part.content):
+        for item in group:
+            if not _is_encodable(item.text):
+                return None
+    return part
+
+
+def _is_encodable(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _normalize_reasoning_items(
+    payload: dict[str, Any], name: str, canonical: str, accepted: tuple[str, ...]
+) -> None:
+    """Rewrite readable text parts of a reasoning item to the one type the public model validates."""
+    items = payload.get(name)
+    if not isinstance(items, (list, tuple)):
+        return
+    normalized: list[Any] = []
+    for item in items:
+        if isinstance(item, Mapping) and _get(item, "type") in accepted[1:]:
+            item = {**item, "type": canonical}
+        normalized.append(item)
+    payload[name] = normalized
 
 
 def _reasoning_parts(items: Any) -> tuple[ReasoningContentPart, ...]:
@@ -424,13 +519,31 @@ def _reasoning_parts(items: Any) -> tuple[ReasoningContentPart, ...]:
     return tuple(parts)
 
 
+def _logprob_token(entry: Any) -> str | None:
+    """The token's own text, read from the bytes the provider sent beside it when it sent any.
+
+    OpenAI's Chat Completions and the OpenResponses spec both carry a ``bytes`` array next to every
+    logprob token: the exact UTF-8 bytes of that token, whatever spelling the tokenizer uses. A
+    server whose tokens are byte-level (``ĠA`` for " A", ``ĊA`` for a newline before A) would have
+    its sampled token refused as unreadable and its alternatives dropped as non-labels, so the bytes
+    are the authority where they are there and the string is the fallback where they are not.
+    """
+    raw = _get(entry, "bytes")
+    if isinstance(raw, (list, tuple)) and raw and all(
+        isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 256 for value in raw
+    ):
+        return bytes(raw).decode("utf-8", "replace")
+    token = _get(entry, "token")
+    return None if token is None else str(token)
+
+
 def _token_logprobs(logprobs: Any) -> tuple[TokenLogprob, ...]:
     entries = _get(logprobs, "content")
     if not entries:
         return ()
     tokens: list[TokenLogprob] = []
     for entry in entries:
-        token = _get(entry, "token")
+        token = _logprob_token(entry)
         if token is None:
             continue
         logprob = _get(entry, "logprob")
@@ -438,7 +551,7 @@ def _token_logprobs(logprobs: Any) -> tuple[TokenLogprob, ...]:
         reported = 0
         for top in _get(entry, "top_logprobs") or ():
             reported += 1
-            top_token = _get(top, "token")
+            top_token = _logprob_token(top)
             top_logprob = _get(top, "logprob")
             if top_token is None or top_logprob is None:
                 continue
@@ -481,7 +594,7 @@ def _chat_refusal(message: Any) -> str | None:
 def _chat_reasoning(message: Any) -> tuple[ReasoningContentPart, ...]:
     for name in ("reasoning_content", "thinking", "reasoning"):
         value = _get(message, name)
-        if isinstance(value, str) and value.strip():
+        if isinstance(value, str) and value.strip() and _is_encodable(value):
             return (ReasoningContentPart(content=[ReasoningTextPart(text=value)]),)
         if isinstance(value, (list, tuple)) and value:
             parts = _reasoning_parts(value)
@@ -516,7 +629,7 @@ def _embedded_error(response: Any) -> ProviderError | None:
         status = code
     elif isinstance(code, str) and code.strip().isdigit():
         status = int(code.strip())
-    return ProviderError(f"provider reported an error: {detail}", status_code=status)
+    return ProviderError(f"provider reported an error: {detail}", status_code=status, embedded=True)
 
 
 def _stop_text(value: Any) -> str | None:
@@ -539,6 +652,12 @@ def _chat_result(response: Any, request: dict[str, Any]) -> CallResult:
     choices = _get(response, "choices") or []
     choice = choices[0] if choices else None
     if not _usable_choice(choice):
+        if _get(choice, "delta") is not None:
+            raise ProviderError(
+                "the provider answered a non-streaming Chat Completions request with a streaming "
+                "chunk (a choice carrying 'delta' and no message); jevper reads the whole answer "
+                "from one response, so this route cannot be read here"
+            )
         raise ClientCapabilityError("provider returned no choices")
     # ``text`` is the legacy completions carrier, and a proxy that answers a chat request with one
     # puts the answer there: the choice is already accepted as usable for carrying it, so read it.
@@ -548,6 +667,12 @@ def _chat_result(response: Any, request: dict[str, Any]) -> CallResult:
     usage = _get(response, "usage")
     details = _get(usage, "completion_tokens_details")
     prompt_details = _get(usage, "prompt_tokens_details")
+    finish = _get(choice, "finish_reason")
+    # Chat Completions types the field as a required, non-null literal, so a body without one is a
+    # generation whose completion the provider never reported — a snapshot, not an answer. Reading
+    # the text anyway would report a decision from a body that says it stopped for an unknown
+    # reason; the name carries the field the caller can look for.
+    stop = "finish_reason_missing" if finish is None else _stop_text(finish)
     return CallResult(
         text=_content_text(_get(message, "content")),
         token_logprobs=_token_logprobs(_get(choice, "logprobs")),
@@ -559,23 +684,77 @@ def _chat_result(response: Any, request: dict[str, Any]) -> CallResult:
         output_tokens=_get(usage, "completion_tokens"),
         reasoning_tokens=_chat_reasoning_tokens(usage, details),
         cached_tokens=_get(prompt_details, "cached_tokens"),
-        stop=_stop_text(_get(choice, "finish_reason")),
+        stop=stop,
         refusal=_chat_refusal(message),
     )
 
 
-def _responses_text(response: Any) -> str:
-    text = _get(response, "output_text")
-    if isinstance(text, str) and text:
-        return text
+def _message_text(item: Any) -> str:
+    """One message item's text, from every content part type the two specs give text on.
+
+    OpenAI names the answer part ``output_text``; OpenResponses also allows ``text`` and
+    ``input_text`` in a message's content union, all three carrying the same ``text`` field. Only a
+    part that is one of those and whose text is a string counts, so a refusal part and an image
+    stay out of the answer, as they do on the other two surfaces.
+    """
     chunks: list[str] = []
-    for item in _get(response, "output") or []:
-        if _get(item, "type") != "message":
+    for part in _get(item, "content") or []:
+        if _get(part, "type") not in ("output_text", "text", "input_text"):
             continue
-        for part in _get(item, "content") or []:
-            if _get(part, "type") == "output_text":
-                chunks.append(str(_get(part, "text") or ""))
+        text = _get(part, "text")
+        if isinstance(text, str):
+            chunks.append(text)
     return "".join(chunks)
+
+
+def _message_logprobs(item: Any) -> Any:
+    """The first logprob list on a message item's content parts, where the carrier puts it."""
+    for part in _get(item, "content") or []:
+        entries = _get(part, "logprobs")
+        if entries:
+            return entries
+    return None
+
+
+def _answer_messages(response: Any) -> list[Any]:
+    """The message items that carry the answer, with OpenResponses' ``phase`` honoured.
+
+    The 2026-04-24 spec lets a model emit several assistant messages in one response, each labelled
+    ``commentary`` (intermediate) or ``final_answer``. Reading them all as one answer concatenates
+    "here is my thinkingB" with the answer, so when any item is labelled ``final_answer`` only
+    those count; with no labels every message counts, as before. A response whose every message is
+    commentary has no answer to read, which the empty-answer path then reports.
+    """
+    messages = [item for item in _get(response, "output") or [] if _get(item, "type") == "message"]
+    final = [item for item in messages if _get(item, "phase") == "final_answer"]
+    if final:
+        return final
+    return [item for item in messages if _get(item, "phase") is None]
+
+
+def _answer_message(response: Any) -> Any:
+    """The output item that carries the answer: the last such message with text or logprobs."""
+    answer = None
+    for item in _answer_messages(response):
+        if _message_text(item) or _message_logprobs(item):
+            answer = item
+    return answer
+
+
+def _responses_text(response: Any) -> str:
+    messages = _answer_messages(response)
+    if messages:
+        item = _answer_message(response)
+        return _message_text(item) if item is not None else ""
+    if any(_get(item, "type") == "message" for item in _get(response, "output") or []):
+        # Every message is commentary: the response has items, and none of them is the answer. The
+        # SDK's convenience property would still join their text, so it is not consulted here.
+        return ""
+    try:
+        text = _get(response, "output_text")
+    except Exception:  # noqa: BLE001 - the SDK's convenience property walks output and joins it
+        text = None  # ``output`` null or shaped unlike a list; there is nothing else to read
+    return text if isinstance(text, str) else ""
 
 
 def _responses_refusal(response: Any) -> str | None:
@@ -598,16 +777,9 @@ def _responses_refusal(response: Any) -> str | None:
 
 
 def _responses_token_logprobs(response: Any) -> tuple[TokenLogprob, ...]:
-    for item in _get(response, "output") or []:
-        if _get(item, "type") != "message":
-            continue
-        for part in _get(item, "content") or []:
-            if _get(part, "type") != "output_text":
-                continue
-            entries = _get(part, "logprobs")
-            if entries:
-                return _token_logprobs({"content": entries})
-    return ()
+    item = _answer_message(response)
+    entries = _message_logprobs(item) if item is not None else None
+    return _token_logprobs({"content": entries}) if entries else ()
 
 
 def _responses_reasoning(response: Any) -> tuple[ReasoningContentPart, ...]:
@@ -615,6 +787,16 @@ def _responses_reasoning(response: Any) -> tuple[ReasoningContentPart, ...]:
 
 
 def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
+    if isinstance(response, (str, bytes)):
+        # A server that answers a non-streaming request with an event stream (the OpenResponses
+        # streaming dialect: ``event: response.completed`` with a ``data:`` line) is not sending a
+        # response object at all, and the SDK hands the raw text through. Reading that as an answer
+        # would spend every corrective retry on a protocol mismatch.
+        raise ProviderError(
+            "the provider answered with a streaming event stream instead of a response object; "
+            "jevper reads the answer from one non-streaming response, so a streaming route cannot "
+            "be read here"
+        )
     # An error carried in a 200 wins over anything the body also carries: a response that says both
     # "here is your answer" and "the upstream failed" is not an answer jevper can vouch for.
     failure = _embedded_error(response)
@@ -637,9 +819,27 @@ def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
     input_details = _get(usage, "input_tokens_details")
     # A Responses call that hit the output budget says so here rather than in a finish_reason.
     stop = None
-    if _get(response, "status") == "incomplete":
+    if status == "incomplete":
         reason = _get(_get(response, "incomplete_details"), "reason")
         stop = _stop_text(reason) or "incomplete"
+    # OpenResponses gives every output item its own lifecycle, and a message item that says it is
+    # ``incomplete`` says the model ran out of room mid-answer even when the response around it
+    # claims completion. Its partial text is not an answer — a cut-off JSON object that happens to
+    # parse is exactly the shape a model produces when the budget ran out mid-write.
+    item = _answer_message(response)
+    item_status = _stop_text(_get(item, "status")) if item is not None else None
+    if item_status is not None and item_status != "completed" and stop is None:
+        if item_status == "incomplete":
+            reason = _get(_get(response, "incomplete_details"), "reason")
+            stop = _stop_text(reason) or "incomplete"
+        else:
+            failure = _get(response, "error") or _get(item, "error")
+            detail = _get(failure, "message") or failure
+            raise ProviderError(
+                f"the provider left the answer item in status={item_status!r} before the answer "
+                "was complete"
+                + (f": {detail}" if isinstance(detail, str) and detail.strip() else "")
+            )
     return CallResult(
         text=_responses_text(response),
         token_logprobs=_responses_token_logprobs(response),
@@ -851,6 +1051,85 @@ SURFACES: dict[Surface, tuple[SurfaceBuilder, SurfaceNormalizer, str]] = {
 }
 
 
+def _without_sdk_retries(client: Any) -> Any:
+    """The client with its own retry loop switched off, where the client can be asked for that.
+
+    The official SDKs retry twice by default and understand nothing of jevper's policy, so a client
+    passed unchanged multiplies every attempt: three SDK tries inside each of jevper's three, nine
+    requests for one call, with the SDK's retries invisible in ``usage.n_retries``. jevper's loop
+    is the one that knows ``x-should-retry``, the attempt history and the backoff the caller chose,
+    so the SDK's is turned off on a copy — the caller's own client keeps the setting it was built
+    with. The check is on the type, so a mock that fabricates any attribute is left alone.
+    """
+    with_options = getattr(type(client), "with_options", None)
+    if not inspect.isfunction(with_options):
+        return client
+    try:
+        return client.with_options(max_retries=0)
+    except Exception:  # noqa: BLE001 - a client that cannot be copied is used as it is
+        return client
+
+
+_SDK_AUTH_HEADERS = {"openai": ("Authorization",), "anthropic": ("x-api-key",)}
+"""The credential header each official SDK adds per request, under its own spelling. They are not in
+``default_headers`` — the SDKs attach them when the request is built — so a caller's differently
+spelled override would otherwise be *added* to the credential rather than replacing it."""
+
+
+def _merge_headers(extra: Mapping[str, str] | None, client: Any) -> dict[str, str]:
+    """The caller's headers under the spelling the client already uses, one value per name.
+
+    The SDKs merge their default headers with the request's case-sensitively and only then hand
+    the result to a case-insensitive header mapping, so a caller who spells ``authorization`` where
+    the client sends ``Authorization`` puts two credentials on the wire. Renaming the caller's
+    header to the spelling the client uses makes it replace the default, which is what overriding a
+    header means.
+    """
+    if not extra:
+        return {}
+    merged = dict(extra)
+    defaults = getattr(client, "default_headers", None)
+    canonical = (
+        {str(name).lower(): name for name in defaults} if isinstance(defaults, Mapping) else {}
+    )
+    for cls in type(client).__mro__:  # a subclass of OpenAI is still an OpenAI client
+        names = _SDK_AUTH_HEADERS.get(cls.__module__.split(".")[0])
+        if names:
+            for name in names:
+                canonical.setdefault(name.lower(), name)
+            break
+    for name in list(merged):
+        spelling = canonical.get(name.lower())
+        if spelling is not None and spelling != name:
+            merged[spelling] = merged.pop(name)
+    return merged
+
+
+def _provider_error_from(exc: BaseException) -> BaseException:
+    """A strict-validation failure whose body carries the provider's error, as that error.
+
+    The SDKs parse the body before jevper sees it, and a client built with strict response
+    validation refuses a body that does not fit the typed model — so a ``200`` whose body is only
+    an error arrives as ``APIResponseValidationError`` and the embedded-error reader never runs.
+    The body is on the exception; reading the same error from it keeps the provider's message and
+    its status, which is what makes an overloaded upstream retryable rather than terminal.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status not in (200, None):
+        # A real status error already says everything: the SDK has the status, the headers and the
+        # body, and jevper's readers work from the exception. Only a successful response whose body
+        # failed to parse is a failure the embedded-error reader has not seen yet.
+        return exc
+    body = getattr(exc, "body", None)
+    if isinstance(body, Mapping):
+        failure = _embedded_error(body)
+        if failure is not None:
+            return failure
+    return exc
+
+
 class Transport:
     """One surface: the request builder, the response normalizer and where the call goes.
 
@@ -868,12 +1147,12 @@ class Transport:
         extra_headers: Mapping[str, str] | None = None,
         limits: Limits | None = None,
     ) -> None:
-        self.client = client
+        self.client = _without_sdk_retries(client)
         self.surface = surface
         self.build_kwargs, self.normalize, self.endpoint_path = SURFACES[surface]
         self.structured_outputs = structured_outputs
         self.extra_body = extra_body
-        self.extra_headers = extra_headers
+        self.extra_headers = _merge_headers(extra_headers, client)
         self.limits = limits or Limits()
 
     def kwargs(self, spec: CallSpec, model: str) -> dict[str, Any]:
@@ -894,11 +1173,49 @@ class Transport:
 
     def call(self, spec: CallSpec, model: str) -> CallResult:
         kwargs = self.kwargs(spec, model)
-        return self.normalize(self._endpoint().create(**kwargs), kwargs)
+        try:
+            response = self._endpoint().create(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - re-raised below, carrying the provider's own error
+            raise _provider_error_from(exc) from None
+        if inspect.isawaitable(response):
+            # An async client handed to the blocking facade: no request was made, and the coroutine
+            # would otherwise be left un-awaited with a warning nobody asked for.
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+            raise ClientCapabilityError(
+                "this client answers asynchronously; use AsyncSystemOneClient for it"
+            )
+        return self.normalize(response, kwargs)
 
     async def acall(self, spec: CallSpec, model: str) -> CallResult:
         kwargs = self.kwargs(spec, model)
-        return self.normalize(await self._endpoint().create(**kwargs), kwargs)
+        create = self._endpoint().create
+        if (
+            not inspect.iscoroutinefunction(create)
+            and type(self.client).__module__.split(".")[0] in ("openai", "anthropic")
+            and not inspect.iscoroutinefunction(getattr(type(self.client), "__aenter__", None))
+        ):
+            # An official blocking client in the async facade: asking anyway would make a blocking
+            # request on the event loop before the mismatch is noticed. Duck clients are left to the
+            # check on the result below, because a duck ``create`` may be an ordinary function that
+            # returns an awaitable, and a mock of one is neither.
+            raise ClientCapabilityError(
+                "this client answers synchronously; use SystemOneClient for it"
+            )
+        try:
+            response = create(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - re-raised below, carrying the provider's own error
+            raise _provider_error_from(exc) from None
+        if not inspect.isawaitable(response):
+            raise ClientCapabilityError(
+                "this client answers synchronously; use SystemOneClient for it"
+            )
+        try:
+            response = await response
+        except Exception as exc:  # noqa: BLE001 - re-raised below, carrying the provider's own error
+            raise _provider_error_from(exc) from None
+        return self.normalize(response, kwargs)
 
 
 def _has_attribute(client: Any, path: str) -> bool:

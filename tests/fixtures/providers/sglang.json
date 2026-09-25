@@ -3131,6 +3131,128 @@
     "top_logprobs": 5
    },
    "status": 200
+  },
+  {
+   "method": "POST",
+   "name": "responses-openresponses-items",
+   "path": "/v1/responses",
+   "status": 200,
+   "body": {
+    "id": "resp_c38094b6c4db469c81724b248e09626f",
+    "object": "response",
+    "created_at": 1790303245,
+    "model": "qwen3.5-9b",
+    "output": [
+     {
+      "id": "rs_ee581e08aca04a9e80087ec4effa1ee9",
+      "summary": [],
+      "type": "reasoning",
+      "content": [
+       {
+        "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Input: A message (\"My invoice 4471 was charged twice this month \u2014 please refund it.\").\n    *   Task: Classify the message into exactly one of th\u2026",
+        "type": "reasoning_text"
+       }
+      ],
+      "encrypted_content": null,
+      "status": null
+     }
+    ],
+    "status": "incomplete",
+    "usage": {
+     "input_tokens": 127,
+     "input_tokens_details": {
+      "cached_tokens": 64,
+      "cache_write_tokens": 0
+     },
+     "output_tokens": 62,
+     "output_tokens_details": {
+      "reasoning_tokens": 62
+     },
+     "total_tokens": 189
+    },
+    "parallel_tool_calls": true,
+    "tool_choice": "auto",
+    "tools": [],
+    "error": null,
+    "incomplete_details": {
+     "reason": "max_output_tokens"
+    },
+    "instructions": null,
+    "max_output_tokens": 64,
+    "previous_response_id": null,
+    "reasoning": {
+     "effort": null,
+     "summary": null
+    },
+    "store": false,
+    "temperature": null,
+    "text": null,
+    "top_p": null,
+    "truncation": "disabled",
+    "user": null,
+    "metadata": {}
+   }
+  },
+  {
+   "method": "POST",
+   "name": "responses-budget-truncated",
+   "path": "/v1/responses",
+   "status": 200,
+   "body": {
+    "id": "resp_f796f85e29c0476a84bba28466e403b0",
+    "object": "response",
+    "created_at": 1790303244,
+    "model": "qwen3.5-9b",
+    "output": [
+     {
+      "id": "rs_f8dc4faa58284abfa5087c1455c93418",
+      "summary": [],
+      "type": "reasoning",
+      "content": [
+       {
+        "text": "Thinking Process:\n\n1.",
+        "type": "reasoning_text"
+       }
+      ],
+      "encrypted_content": null,
+      "status": null
+     }
+    ],
+    "status": "incomplete",
+    "usage": {
+     "input_tokens": 109,
+     "input_tokens_details": {
+      "cached_tokens": 64,
+      "cache_write_tokens": 0
+     },
+     "output_tokens": 6,
+     "output_tokens_details": {
+      "reasoning_tokens": 6
+     },
+     "total_tokens": 115
+    },
+    "parallel_tool_calls": true,
+    "tool_choice": "auto",
+    "tools": [],
+    "error": null,
+    "incomplete_details": {
+     "reason": "max_output_tokens"
+    },
+    "instructions": null,
+    "max_output_tokens": 8,
+    "previous_response_id": null,
+    "reasoning": {
+     "effort": null,
+     "summary": null
+    },
+    "store": false,
+    "temperature": null,
+    "text": null,
+    "top_p": null,
+    "truncation": "disabled",
+    "user": null,
+    "metadata": {}
+   }
   }
  ]
 }

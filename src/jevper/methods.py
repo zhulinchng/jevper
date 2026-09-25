@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -347,6 +348,13 @@ def answer_failure(result: CallResult) -> ProviderError | None:
     return None
 
 
+_LABEL_SHAPED = re.compile(r"^([A-Z]+)(?=$|[\s.,:;!?)}\]])")
+"""A label at the very start of an answer, up to its first letter run and then nothing but a
+separator. The punctuation matters as much as the letters: a model that answers ``A.`` or ``A)``
+names label ``A``, and a check that stopped at the first non-letter would read the answer as prose
+and let a sampled token that contradicts it through."""
+
+
 def _agree_with_answer_text(sampled: str, text: str, labels: Sequence[str]) -> None:
     """Refuse a sampled token that contradicts an answer text that names a different label.
 
@@ -355,18 +363,24 @@ def _agree_with_answer_text(sampled: str, text: str, labels: Sequence[str]) -> N
     answer — a proxy stitching two responses, a server whose logprobs belong to another request — and
     reporting either as the answer would be a coin flip presented as a decision. The bounded
     correction path gets its turn instead.
+
+    Both sides are read the same way — the leading label run of each — so a server whose sampled
+    token carries the sentence's punctuation (``A.``) agrees with a text that says ``A``, and only
+    a genuine disagreement (``B`` against ``A.``) is refused.
     """
     stripped = text.strip()
     if not stripped:
         return
-    first = stripped[: max(len(sampled), 8)].strip().upper()
-    if not first or first not in labels:
+    named = _LABEL_SHAPED.match(stripped.upper())
+    if named is None or named.group(1) not in labels:
         return
-    if first != sampled.strip().upper():
-        raise LabelReadoutError(
-            f"the sampled token {sampled!r} contradicts the answer text, which starts with the label "
-            f"{first!r}; the provider's logprobs and its text are not from the same generation"
-        )
+    token = _LABEL_SHAPED.match(sampled.strip().upper())
+    if token is None or token.group(1) == named.group(1):
+        return
+    raise LabelReadoutError(
+        f"the sampled token {sampled!r} contradicts the answer text, which starts with the label "
+        f"{named.group(1)!r}; the provider's logprobs and its text are not from the same generation"
+    )
 
 
 def first_answer_token(result: CallResult, labels: Sequence[str], *, method: Method) -> TokenLogprob:
@@ -435,10 +449,37 @@ def _logprob_readout(
     answer_label = token.token.strip().upper()
     logprobs: dict[str, float] = {label: float("-inf") for label in labels}
     logprobs[answer_label] = token.logprob
+    rivals = 0
     for top_token, top_logprob in token.top_logprobs:
+        # A log probability is never positive and never NaN, whatever token it belongs to: a broken
+        # number beside the answer is a fact about the response, not a rival to drop quietly. The
+        # check is the same one ``softmax_over_labels`` applies, run before the label filter so a
+        # non-option token cannot smuggle an impossible value through.
+        if math.isnan(top_logprob) or top_logprob == float("inf"):
+            raise LabelReadoutError(
+                f"logprob for the alternative token {top_token!r} must be finite, got {top_logprob!r}"
+            )
+        if top_logprob > 0.0:
+            raise LabelReadoutError(
+                f"logprob for the alternative token {top_token!r} is positive ({top_logprob!r}), "
+                "which no log probability can be — the provider sent something other than logprobs"
+            )
         candidate = top_token.strip().upper()
         if candidate in logprobs and candidate != answer_label:
+            rivals += 1
             logprobs[candidate] = top_logprob
+    if not rivals:
+        # The provider listed several alternatives and every one of them was the sampled token again
+        # or a token outside the option set: what is left is the sampled token's own logprob, and
+        # normalizing over it alone would report certainty the provider never expressed.
+        raise _LogprobsUnavailable(
+            f"the provider returned {token.reported_alternatives} top_logprobs for the answer token "
+            f"{token.token!r} (method={method!r}), none of which was an alternative among the "
+            f"options {list(labels)!r}; use method='structured' for the model's own probabilities, "
+            f"or method='discrete' for one label",
+            evidence="readout",
+            surface=result.surface,
+        )
     missing = tuple(label for label in labels if logprobs[label] == float("-inf"))
     normalized = softmax_over_labels(logprobs)
     keys = label_to_key(question, labels)
@@ -475,35 +516,41 @@ def parse_json_object(text: str, note: str = "") -> dict[str, Any]:
     not — reads as a parse bug otherwise, when the actionable fact is the budget.
 
     Prose around the object is tolerated, because a model that says "here you go: {...}" has answered.
-    A *second* object is not: two answers in one response is a generation that contradicted itself,
-    and reading the first would report one of the two as the answer without ever saying the other
-    existed. The bounded correction path gets a turn at it instead.
+    Every ``{`` the text holds is tried in turn, so a brace in prose (``the shape is {example}``) is
+    stepped over rather than taken for the answer, and a later real object is still found. A
+    *second* object that decodes is not tolerated: two answers in one response is a generation that
+    contradicted itself, and reading the first would report one of the two as the answer without ever
+    saying the other existed. The bounded correction path gets a turn at it instead.
     """
     try:
         value = json.loads(text)
     except ValueError as first_error:  # JSONDecodeError, and the int-conversion limit it shares
-        start = text.find("{")
-        if start < 0:
+        index = text.find("{")
+        if index < 0:
             raise MalformedAnswerError(
                 f"no JSON object in the answer ({first_error}){note}"
             ) from first_error
-        try:
-            value, end = json.JSONDecoder().raw_decode(text[start:])
-        except ValueError as exc:
-            raise MalformedAnswerError(
-                f"could not parse a JSON object from the answer ({exc}){note}"
-            ) from exc
-        rest = text[start + end :]
-        next_object = rest.find("{")
-        if next_object >= 0:
+        decoder = json.JSONDecoder()
+        found: dict[str, Any] | None = None
+        first_failure: ValueError | None = None
+        while index >= 0:
             try:
-                json.JSONDecoder().raw_decode(rest[next_object:])
-            except ValueError:
-                pass  # a brace in prose is not a second answer
-            else:
-                raise MalformedAnswerError(
-                    f"the answer carries more than one JSON object{note}"
-                )
+                candidate, end = decoder.raw_decode(text[index:])
+            except ValueError as exc:
+                if first_failure is None:
+                    first_failure = exc
+                index = text.find("{", index + 1)
+                continue
+            if found is None:
+                found = candidate
+                index = text.find("{", index + end)
+                continue
+            raise MalformedAnswerError(f"the answer carries more than one JSON object{note}")
+        if found is None:
+            raise MalformedAnswerError(
+                f"could not parse a JSON object from the answer ({first_failure}){note}"
+            ) from first_failure
+        value = found
     if not isinstance(value, dict):
         raise MalformedAnswerError(f"expected a JSON object, got {type(value).__name__}{note}")
     return value

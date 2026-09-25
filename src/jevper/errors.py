@@ -87,7 +87,10 @@ class ProviderError(JevperError):
 
     ``status_code`` is the HTTP status the provider reported, when it reported one — including a
     status carried inside the body of a ``200``, which is how OpenRouter reports an upstream failure.
-    ``attempts`` holds one record per call attempt, the same records as ``debug["llm_attempts"]``.
+    ``embedded`` is true for such an error: it came from the body of a successful HTTP response, not
+    from the status line, and the two are told apart where it matters — a body's ``404`` is not a
+    route that is missing. ``attempts`` holds one record per call attempt, the same records as
+    ``debug["llm_attempts"]``.
     """
 
     def __init__(
@@ -96,10 +99,12 @@ class ProviderError(JevperError):
         *,
         attempts: list[dict[str, Any]] | None = None,
         status_code: int | None = None,
+        embedded: bool = False,
     ) -> None:
         super().__init__(message)
         self.attempts: list[dict[str, Any]] = attempts or []
         self.status_code = status_code
+        self.embedded = embedded
 
 
 class IncompleteAnswerError(ProviderError):

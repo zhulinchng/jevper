@@ -30,8 +30,11 @@ from fakes import (
 from jevper import (
     AsyncSystemOneClient,
     Choice,
+    ClientCapabilityError,
     IncompleteAnswerError,
+    JevperError,
     LabelReadoutError,
+    MalformedAnswerError,
     ProviderError,
     RetryPolicy,
     SystemOneClient,
@@ -692,3 +695,142 @@ def test_a_partial_model_dump_falls_back_to_the_attributes():
 
     assert result.text == "A"
     assert result.stop == "stop"
+
+
+@pytest.mark.parametrize("finish", [None, "absent"])
+def test_a_chat_answer_without_a_finish_reason_is_not_an_answer(stub_server, finish):
+    """Chat Completions types ``finish_reason`` as a required, non-null literal.
+
+    A body without one is a generation whose completion the provider never reported — a snapshot, not
+    an answer — and reading its text anyway would report a decision from a body that says it stopped
+    for an unknown reason.
+    """
+    body = chat_body(content=json.dumps(_answers()))
+    if finish == "absent":
+        body["choices"][0].pop("finish_reason")
+    else:
+        body["choices"][0]["finish_reason"] = None
+    stub = stub_server(chat=lambda _b: (200, body))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", method="structured",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(IncompleteAnswerError) as raised:
+        client.system_one(
+            state="s", questions={"q": Choice(criteria=QUESTIONS["intent"].criteria)}
+        )
+
+    assert "finish_reason_missing" in str(raised.value)
+
+
+def test_a_null_message_is_no_answer_rather_than_a_malformed_one(stub_server):
+    """``message: null`` is a choice with no carrier, which the capability verdict already names."""
+    body = {"id": "x", "object": "chat.completion", "choices": [{"index": 0, "finish_reason": "stop", "message": None}]}
+    stub = stub_server(chat=lambda _b: (200, body))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", method="structured",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(ClientCapabilityError) as raised:
+        client.system_one(
+            state="s", questions={"q": Choice(criteria=QUESTIONS["intent"].criteria)}
+        )
+
+    assert "no choices" in str(raised.value)
+
+
+def test_a_streaming_chunk_where_a_response_belongs_is_named(stub_server):
+    """A server that streams an answer nobody asked for gets a named error, not a malformed answer."""
+    body = {
+        "id": "x",
+        "object": "chat.completion.chunk",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "delta": {"role": "assistant", "content": json.dumps(_answers())},
+            }
+        ],
+    }
+    stub = stub_server(chat=lambda _b: (200, body))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", method="structured",
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        client.system_one(
+            state="s", questions={"q": Choice(criteria=QUESTIONS["intent"].criteria)}
+        )
+
+    assert "streaming chunk" in str(raised.value)
+    assert len(stub.requests) == 1
+
+
+# --- the OpenResponses bodies these servers answered ---------------------------------------------
+
+
+@pytest.mark.parametrize("server", SERVERS)
+def test_the_typed_input_body_each_server_answered_is_read(stub_server, server):
+    """The item shape jevper sends — every input turn carrying its ``type`` — is answered by all five.
+
+    What the server then does with it is its own business: a 4B model on a thinking run can spend the
+    budget on the trace, and what the caller gets then is a named failure, not a crash and not a
+    decision read from a body that carries no answer.
+    """
+    stub = served(
+        stub_server,
+        (server, "chat-thinking-off-logprobs"),
+        (server, "responses-openresponses-items"),
+    )
+    client = client_for(stub, api="responses", method="structured", n_retry_malformed=0)
+
+    try:
+        response = client.system_one(state=STATE, questions=QUESTIONS)
+    except JevperError as exc:
+        assert "no JSON object" in str(exc) or "output tokens" in str(exc), str(exc)
+        return
+
+    assert response.answers["intent"].choice in CRITERIA
+
+
+@pytest.mark.parametrize("server", ("vllm", "sglang"))
+def test_a_recorded_spent_budget_names_the_responses_budget(stub_server, server):
+    """vLLM and SGLang report an exhausted Responses call as ``incomplete`` with a reason."""
+    stub = served(
+        stub_server,
+        (server, "chat-thinking-off-logprobs"),
+        (server, "responses-budget-truncated"),
+    )
+    client = client_for(stub, api="responses", method="structured", n_retry_malformed=0)
+
+    with pytest.raises(IncompleteAnswerError) as raised:
+        client.system_one(state=STATE, questions=QUESTIONS)
+
+    assert "max_output_tokens" in str(raised.value)
+
+
+@pytest.mark.parametrize("server", ("ollama", "llamacpp", "lmstudio"))
+def test_a_server_that_reports_a_spent_budget_as_completed_is_taken_at_its_word(stub_server, server):
+    """These three answer a caller-set budget of eight tokens with ``status: "completed"``.
+
+    ollama and llama.cpp return the reasoning trace and no message; LM Studio returns an answer cut off
+    mid-string. There is no signal to read in any of them, so what the caller is told is what the body
+    says happened: a malformed answer, named as one, with the reasoning-only note when the answer is
+    empty.
+    """
+    stub = served(
+        stub_server,
+        (server, "chat-thinking-off-logprobs"),
+        (server, "responses-budget-truncated"),
+    )
+    client = client_for(stub, api="responses", method="structured", n_retry_malformed=0)
+
+    with pytest.raises(MalformedAnswerError) as raised:
+        client.system_one(state=STATE, questions=QUESTIONS)
+
+    assert "JSON object" in str(raised.value)
+    assert len(stub.requests) == 1
+

@@ -2844,6 +2844,80 @@
     "top_logprobs": 5
    },
    "status": 400
+  },
+  {
+   "method": "POST",
+   "name": "responses-openresponses-items",
+   "path": "/v1/responses",
+   "status": 200,
+   "body": {
+    "completed_at": 1790302726,
+    "created_at": 1790302726,
+    "id": "resp_OLTfZbbPhAKj2zXWX7Lt4gfuiJ9m5Ibj",
+    "model": "qwen3.5-9b",
+    "object": "response",
+    "output": [
+     {
+      "id": "rs_SW27gu8AFlEB7g0Z1g4m8fc2rjFcrygZ",
+      "summary": [],
+      "type": "reasoning",
+      "content": [
+       {
+        "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Task: Classify a given message into exactly one of three categories: `billing`, `sales`, or `technical`.\n    *   Output Format: A single JSON ob\u2026",
+        "type": "reasoning_text"
+       }
+      ],
+      "encrypted_content": "",
+      "status": "completed"
+     }
+    ],
+    "status": "completed",
+    "usage": {
+     "input_tokens": 127,
+     "output_tokens": 64,
+     "total_tokens": 191,
+     "input_tokens_details": {
+      "cached_tokens": 125
+     }
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "name": "responses-budget-truncated",
+   "path": "/v1/responses",
+   "status": 200,
+   "body": {
+    "completed_at": 1790302689,
+    "created_at": 1790302689,
+    "id": "resp_pP7ozdzBg1EwoAtdhRDEkE3UPuE5THQT",
+    "model": "qwen3.5-9b",
+    "object": "response",
+    "output": [
+     {
+      "id": "rs_mXhc6usKtfLDpzpgAqY8HJiLQI22SEWq",
+      "summary": [],
+      "type": "reasoning",
+      "content": [
+       {
+        "text": "Okay, let's see. The user",
+        "type": "reasoning_text"
+       }
+      ],
+      "encrypted_content": "",
+      "status": "completed"
+     }
+    ],
+    "status": "completed",
+    "usage": {
+     "input_tokens": 109,
+     "output_tokens": 8,
+     "total_tokens": 117,
+     "input_tokens_details": {
+      "cached_tokens": 0
+     }
+    }
+   }
   }
  ]
 }

@@ -2269,6 +2269,164 @@
     "top_logprobs": 5
    },
    "status": 200
+  },
+  {
+   "method": "POST",
+   "name": "responses-openresponses-items",
+   "path": "/v1/responses",
+   "status": 200,
+   "body": {
+    "id": "resp_247916",
+    "object": "response",
+    "created_at": 1790302397,
+    "completed_at": 1790302397,
+    "status": "completed",
+    "incomplete_details": null,
+    "model": "qwen3.5:9b",
+    "previous_response_id": null,
+    "instructions": null,
+    "output": [
+     {
+      "id": "rs_resp_247916",
+      "type": "reasoning",
+      "summary": [
+       {
+        "type": "summary_text",
+        "text": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Task: Classify a given message into exactly one of three categories: `billing`, `sales`, or `technical`.\n    *   Input Message: \"My invoice 4471\u2026"
+       }
+      ],
+      "encrypted_content": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Task: Classify a given message into exactly one of three categories: `billing`, `sales`, or `technical`.\n    *   Input Message: \"My invoice 4471\u2026"
+     },
+     {
+      "id": "msg_69952",
+      "type": "message",
+      "status": "completed",
+      "role": "assistant",
+      "content": [
+       {
+        "type": "output_text",
+        "text": "",
+        "annotations": [],
+        "logprobs": []
+       }
+      ]
+     }
+    ],
+    "error": null,
+    "tools": [],
+    "tool_choice": "auto",
+    "truncation": "disabled",
+    "parallel_tool_calls": true,
+    "text": {
+     "format": {
+      "type": "text"
+     }
+    },
+    "top_p": 1,
+    "presence_penalty": 0,
+    "frequency_penalty": 0,
+    "top_logprobs": 0,
+    "temperature": 1,
+    "reasoning": null,
+    "usage": {
+     "input_tokens": 127,
+     "output_tokens": 64,
+     "total_tokens": 191,
+     "input_tokens_details": {
+      "cached_tokens": 125
+     },
+     "output_tokens_details": {
+      "reasoning_tokens": 0
+     }
+    },
+    "max_output_tokens": 64,
+    "max_tool_calls": null,
+    "store": false,
+    "background": false,
+    "service_tier": "default",
+    "metadata": {},
+    "safety_identifier": null,
+    "prompt_cache_key": null
+   }
+  },
+  {
+   "method": "POST",
+   "name": "responses-budget-truncated",
+   "path": "/v1/responses",
+   "status": 200,
+   "body": {
+    "id": "resp_751619",
+    "object": "response",
+    "created_at": 1790302396,
+    "completed_at": 1790302396,
+    "status": "completed",
+    "incomplete_details": null,
+    "model": "qwen3.5:9b",
+    "previous_response_id": null,
+    "instructions": null,
+    "output": [
+     {
+      "id": "rs_resp_751619",
+      "type": "reasoning",
+      "summary": [
+       {
+        "type": "summary_text",
+        "text": "Thinking Process:\n\n1.  **"
+       }
+      ],
+      "encrypted_content": "Thinking Process:\n\n1.  **"
+     },
+     {
+      "id": "msg_182541",
+      "type": "message",
+      "status": "completed",
+      "role": "assistant",
+      "content": [
+       {
+        "type": "output_text",
+        "text": "",
+        "annotations": [],
+        "logprobs": []
+       }
+      ]
+     }
+    ],
+    "error": null,
+    "tools": [],
+    "tool_choice": "auto",
+    "truncation": "disabled",
+    "parallel_tool_calls": true,
+    "text": {
+     "format": {
+      "type": "text"
+     }
+    },
+    "top_p": 1,
+    "presence_penalty": 0,
+    "frequency_penalty": 0,
+    "top_logprobs": 0,
+    "temperature": 1,
+    "reasoning": null,
+    "usage": {
+     "input_tokens": 109,
+     "output_tokens": 8,
+     "total_tokens": 117,
+     "input_tokens_details": {
+      "cached_tokens": 0
+     },
+     "output_tokens_details": {
+      "reasoning_tokens": 0
+     }
+    },
+    "max_output_tokens": 8,
+    "max_tool_calls": null,
+    "store": false,
+    "background": false,
+    "service_tier": "default",
+    "metadata": {},
+    "safety_identifier": null,
+    "prompt_cache_key": null
+   }
   }
  ]
 }
