@@ -1,13 +1,10 @@
 """A client that is not an SDK: the whole structural contract, in one class.
 
-jevper never imports ``openai`` or ``anthropic``. It calls whatever object it is handed, reading
-attributes or mapping keys with the same helper, so a twenty-line object can stand in for a full
-SDK client. This is the smallest one that answers a question, and the "Using an existing or
-duck-typed client" page embeds it.
-
-Run it with no server at all — the model is a constant:
-
-    python duck_client.py
+jevper never imports ``openai`` or ``anthropic``. It calls whatever object it is
+handed, reading attributes or mapping keys with the same helper, so a
+twenty-line object can stand in for a full SDK client. This is the smallest one
+that answers a question, and the "Using an existing or duck-typed client" page
+embeds it.
 """
 
 from __future__ import annotations
@@ -18,11 +15,12 @@ from jevper import Noul, SystemOneClient
 
 
 class ConstantModel:
-    """``client.chat.completions.create(**kwargs)``, returning what jevper reads off a Chat
-    Completions answer: ``choices[0].message.content``, ``choices[0].finish_reason`` and
-    ``usage.prompt_tokens`` / ``usage.completion_tokens``. Every one may be a mapping key instead
-    of an attribute. A real client adds the rest — streaming, retries, auth — none of which
-    jevper requires."""
+    """``client.chat.completions.create(**kwargs)``, returning what jevper reads
+    off a Chat Completions answer: ``choices[0].message.content``,
+    ``choices[0].finish_reason`` and ``usage.prompt_tokens`` /
+    ``usage.completion_tokens``. Every one may be a mapping key instead of an
+    attribute. A real client adds the rest — streaming, retries, auth — none of
+    which jevper requires."""
 
     class _Completions:
         def create(self, **kwargs: object) -> dict[str, object]:
@@ -47,13 +45,17 @@ def main() -> None:
         ConstantModel(),
         model="constant-model",
         method="structured",  # ask for JSON, so the answer needs no logprobs
-        # api="auto" is the default and the surface follows the object: this one exposes no
-        # responses.create and no messages.create, so every call goes to chat_completions without
-        # probing a route that is not there.
+        # api="auto" is the default and the surface follows the object: this one
+        # exposes no responses.create and no messages.create, so every call goes
+        # to chat_completions without probing a route that is not there.
     ) as client:
         response = client.system_one(
             state="The status page says all systems are operational.",
-            questions={"is_outage": Noul(instructions="Is the service down right now?")},
+            questions={
+                "is_outage": Noul(
+                    instructions="Is the service down right now?"
+                )
+            },
         )
 
     answer = response.answers["is_outage"]

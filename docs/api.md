@@ -16,17 +16,25 @@ from jevper import SystemOneClient, AsyncSystemOneClient, Choice, Noul, Score, E
 ## `SystemOneClient`
 
 ```python
-SystemOneClient(client, **options)
+SystemOneClient(client, *, model, method="auto", api="auto", reasoning=None, examples=(),
+                structured_outputs=True, normalize_probabilities=True, top_logprobs=20,
+                max_concurrency=8, n_retry_malformed=1, retry=None, temperature=None,
+                extra_body=None, extra_headers=None, prompt_cache_key=None)
 ```
+
+Only `client` is positional; every option is keyword-only, and an unknown keyword is a `TypeError`
+from the constructor rather than an option.
 
 `client` is any object exposing `responses.create`, `chat.completions.create` and/or `messages.create` (the
 Anthropic SDK's, pointed at any server that implements the Messages API); it stays owned by the caller
 (`close()` only shuts down jevper's own thread pool).
 
 The `responses` surface speaks both OpenAI's Responses API and the [OpenResponses](https://www.openresponses.org)
-specification, and both are served at the same `/v1/responses` path — LM Studio has implemented the
-OpenResponses dialect since 0.3.39 and vLLM says its route "aligns with" it, while the others serve
-OpenAI's own dialect at that path. So the request is the portable form both accept: every input turn
+specification, and both are served at the same `/v1/responses` path. The OpenResponses site lists LM Studio
+among the ecosystem's implementers, and [vLLM says its route "aligns with" the spec](https://github.com/vllm-project/vllm/issues/32850)
+while extending it with fields of its own (`top_k`, `request_id`, `priority`); the others serve
+OpenAI's own dialect at that path.
+So the request is the portable form both accept: every input turn
 carries the item `type` the spec's union requires, with its content as a plain string, which that union
 also allows. The reader answers in either dialect — OpenAI's own shapes and the spec's content parts,
 reasoning part types, per-item statuses and message phases alike. What each server does with the two is
@@ -43,7 +51,7 @@ refuses a blocking one, before any request, naming the class to use instead.
 | `model` | required | Model id sent with every call; overridable per `system_one` call |
 | `method` | `"auto"` | `"auto"`, `"logprobs"`, `"grammar"`, `"structured"` or `"discrete"`; `"auto"` resolves per model and surface — see [methods.md](methods.md#auto) |
 | `api` | `"auto"` | `"auto"`, `"chat_completions"`, `"responses"` or `"messages"` (the Anthropic Messages API); `"auto"` prefers `responses`, then `chat_completions`, then `messages`, falling back when the server answers 404 for a route — see [methods.md](methods.md#auto) |
-| `reasoning` | `None` | A `ReasoningConfig`; `None` disables reasoning entirely. `mode="auto"` resolves to `native` on the Responses surface and `two_step` elsewhere, and `budget_tokens` is what the Messages surface sends as its `thinking` field — see [reasoning.md](reasoning.md) |
+| `reasoning` | `None` | A `ReasoningConfig`; `None` disables reasoning entirely. `mode="auto"` resolves to `native` on the Responses surface and on Messages when `budget_tokens` is set, and to `two_step` everywhere else; `budget_tokens` is what the Messages surface sends as its `thinking` field — see [reasoning.md](reasoning.md) |
 | `examples` | `()` | Default few-shot examples: a sequence for all questions, or a mapping keyed by question id |
 | `structured_outputs` | `True` | Send a strict `json_schema` response format — `response_format` on Chat Completions, `text.format` on Responses, and the Messages API's own `output_config.format`; `False` leaves the schema in the prompt instead (`{"type": "json_object"}` on the OpenAI surfaces). A server that refuses the strict schema gets the same fallback automatically |
 | `normalize_probabilities` | `True` | Rescale `structured` distributions that are off by more than `1e-6`; `False` returns the model's numbers verbatim |
@@ -51,19 +59,23 @@ refuses a blocking one, before any request, naming the class to use instead.
 | `max_concurrency` | `8` | Questions in flight at once (thread pool, or asyncio semaphore) |
 | `n_retry_malformed` | `1` | Corrective retries when an answer cannot be read |
 | `retry` | `None` | Transient-failure retries; `RetryPolicy()` (2 retries, 0.5s base, 8s cap) when unset |
-| `temperature` | `None` | Not sent unless set. `0.0` is recommended for `structured`/`discrete`; `logprobs` needs no setting. Left out of a Messages request that enables `thinking`, which the API refuses alongside a non-default temperature |
+| `temperature` | `None` | Not sent unless set. `0.0` is recommended for `structured`/`discrete`; `logprobs` needs no setting. On Messages it travels in the request body (the current `anthropic` SDK has no `temperature` parameter) and is left out whenever a `thinking` budget is sent; the newest Claude models refuse *any* non-default value with a `400`, thinking or not, so set it only for a provider that still reads it |
 | `prompt_cache_key` | `None` | The provider's cache-routing key. Unset, jevper derives one per question from the parts of the prompt that do not change between calls, so a rubric's requests are routed together; set it to group (or account for) requests your own way. It travels in the request *body* on both OpenAI surfaces: the field belongs to the API, and only newer SDK releases type it — `openai` grew `prompt_cache_key` on Chat Completions and Responses after 1.92, the floor this package declares — while the body is identical either way, since the SDK merges `extra_body` into the same JSON. A keyword a supported release does not type is a `TypeError` from inside the call, with the caller's remedy nowhere in the message |
 | `extra_body` | `None` | Merged into every request body (the grammar field is merged here too). A key it names is the value that reaches the wire — the SDK merges `extra_body` *after* the typed parameters — so jevper leaves that field alone rather than sending a typed value the caller's own key would override. `response_format`/`text`/`output_config` named here therefore also puts the JSON Schema in the prompt, since no schema of jevper's is in the request. On the Messages surface, `max_tokens` comes from here — jevper always sends one there, defaulting to `DEFAULT_MAX_TOKENS` (1024), or 1024 plus `ReasoningConfig(budget_tokens=…)`; a `max_tokens` that cannot hold the thinking budget asked for raises `JevperError` locally, naming both numbers, rather than earning the API's own refusal. Every other key travels on all three surfaces, whether or not a temperature was set |
 | `extra_headers` | `None` | Sent with every request. A name spelled differently from the client's own (`authorization` against the SDK's `Authorization`) is renamed to the client's spelling, so it replaces the default header instead of joining it on the wire. Names and values must be what a header can carry — an HTTP token name and a printable-ASCII value, horizontal tabs allowed — and a name or value that is not is refused here, not by the SDK's encoder from inside the request |
 
-OpenAI and the OpenResponses schema cap `prompt_cache_key` at 64 characters, so a longer key is the
-server's to refuse; OpenRouter does not (measured 2026-09-25: a 72-character key answered normally).
+The [OpenResponses schema](https://github.com/openresponses/openresponses/blob/main/public/openapi/openapi.json)
+documents a 64-character maximum for `prompt_cache_key`; OpenAI's own API reference states no length
+limit, so on that surface a longer key is the server's to refuse. OpenRouter does not refuse one
+(measured 2026-09-25: a 72-character key answered normally).
 
 Two `extra_body` keys are refused outright, before any request: `model` (the wire model would disagree with
 the cache key, the learned verdicts and the public response — pass `model=` to the constructor or to
 `system_one()` instead) and a truthy `stream` (jevper reads the answer from one non-streaming response, and
 a server that streamed anyway would hand the SDK an event stream no reader here understands). A
-`logprobs: false` here switches the Responses logprob fields off the way it does on Chat Completions.
+`logprobs: false` here switches jevper's own Responses logprob fields off — `top_logprobs` and the
+`include` entry — the way it does on Chat Completions; the key itself still reaches the body, because
+the Responses API has no `logprobs` field.
 
 Constructor validation is eager: an unknown `method`/`api`, `top_logprobs` outside `[0, 20]` or below 2 with a
 pinned `logprobs`/`grammar`, `max_concurrency < 1`, a negative `n_retry_malformed`, a non-`ReasoningConfig`
@@ -203,7 +215,8 @@ model is asked to imitate:
 - it must carry exactly the option keys of a `Choice`, the level indexes of a `Score`, or a `True`/`False`
   (`"true"`/`"false"`) key for a `Noul` — a wrong key set raises `InvalidQuestionError` naming the example
   index, and so does a `Noul` mapping with no key at all, or two keys that name the same answer
-  (`{1: 0.9, "1": 0.1}`), because the rendered demonstration can carry only one of them;
+  (`{True: 0.2, "true": 0.8}` for a `Noul`, `{1: 0.9, "1": 0.1}` for a `Score`), because the rendered
+  demonstration can carry only one of them;
 - values must be finite (refused by `Example` itself) and `>= 0`, and a `Noul` value must be in `[0, 1]`.
 
 A non-finite number or a non-JSON-serializable `state` is refused rather than rendered: `NaN`/`Infinity` are
@@ -257,12 +270,14 @@ analysis passes and corrective retries; `n_retries` counts transient-failure ret
 wall-clock seconds for the whole `system_one` call.
 
 `cached_tokens` is the prompt tokens the provider read from its own prompt cache, read from
-`usage.prompt_tokens_details.cached_tokens` on Chat Completions and `usage.input_tokens_details.cached_tokens`
-on the Responses surface. It is the one number that says caching worked; a provider that reports nothing
-leaves it `None`, which is not the same as a reported `0` — that is a server whose prefix cache is cold, or
-off. Not every server reports it at all, and two need a flag to: vLLM's `--enable-prompt-tokens-details` and
-SGLang's `--enable-cache-report` for its Chat Completions route. See
+`usage.prompt_tokens_details.cached_tokens` on Chat Completions, `usage.input_tokens_details.cached_tokens`
+on the Responses surface, and `usage.cache_read_input_tokens` on Messages, which reports no
+`*_tokens_details` object at all. It is the one number that says caching worked; a provider that reports
+nothing leaves it `None`, which is not the same as a reported `0` — that is a server whose prefix cache is
+cold, or off. Not every server reports it at all, and two need a flag to: vLLM's `--enable-prompt-tokens-details`
+and SGLang's `--enable-cache-report` for its Chat Completions route. See
 [local-servers.md](local-servers.md#prompt-caching).
+
 ### `debug`
 
 | Key | Content |
@@ -303,7 +318,8 @@ response can neither leak a credential nor fail to serialize:
 - Every string is escaped to printable UTF-8 (a lone surrogate is shown as the escape the wire carried) and
   bounded to 64 KiB, with the length it had noted; mappings are walked 24 levels deep and anything deeper
   is replaced by a marker. A provider object that cannot be dumped at all is recorded as
-  `{"undumpable": "<Type could not be dumped for debug>"}` rather than kept as the object itself, which
+  `{"undumpable": "<ChatCompletion is not data jevper can keep for debug>"}` — the class name is in the
+  text — rather than kept as the object itself, which
   `model_dump_json()` would then have to serialize.
 - Provider text quoted in an error is bounded the same way, and the caller's own credential values are
   removed from it: an `error` carried in a `200`, a status failure's detail and an exception's own message all
@@ -336,7 +352,7 @@ unreadable, and whether that response is an object or a plain mapping) — unles
 class in its MRO, is one of the transport and timeout types the SDKs and the standard library raise
 (`TransportError`, `ConnectError`, `ReadError`, `RemoteProtocolError`, `APIConnectionError`,
 `APITimeoutError`, `URLError`, …) or a builtin `TimeoutError`/`ConnectionError`. Those names are matched
-whole, so a caller's own `ConnectionProgrammingError` is a programming error and is not repeated; a
+whole, so a caller's own class named after one of them is a programming error and is not repeated, and a
 client-side `httpx.LocalProtocolError` is not retried either.
 
 The wait is whatever the provider asked for when it said: a `Retry-After` — delta-seconds, which are read
@@ -398,16 +414,17 @@ All inherit from `JevperError`.
 | `MalformedAnswerError` | JSON answer missing/extra keys, more than one JSON object in the answer, a number too large to be a float, a non-finite or out-of-range number, an unknown label, a score that is not a level index |
 | `IncompleteAnswerError` | the provider stopped generating before the answer was complete — `finish_reason: "length"`, `stop_reason: "max_tokens"`, `model_context_window_exceeded`, a Responses `status: "incomplete"`, or any stop reason that is not one the surface documents. The message names the surface's own budget field (`max_output_tokens` on the Responses surface, `max_completion_tokens` on Chat Completions — with the `max_tokens` a local server takes named beside it — and `max_tokens` on Messages). A `ProviderError` subclass, and terminal: a cut-off generation is not a malformed answer to correct, because another attempt spends a call to be cut off the same way |
 | `ModelRefusalError` | the model declined to answer and the provider said so — OpenAI's `refusal` field or content part, `stop_reason: "refusal"`, or a safety filter (`finish_reason: "content_filter"`, a Responses `incomplete_details.reason` of the same). A `ProviderError` subclass, and terminal: a refusal is complete, not broken, so a corrective retry would only be refused again |
-| `ProviderError` | provider failure after transient retries; `.attempts` holds the attempt records and `.status_code` the status the provider reported, including one carried inside a `200` body — which wins over any answer the same body carries, and whose `code` is read as a number or as a digit string. Also raised when every surface `api="auto"` could try answered `404` (the route is missing, so the failure is the provider's, not a private verdict's), and when a Responses call reports a `status` that is neither `completed` nor `incomplete` — `failed`, `cancelled` — which is a generation the provider did not finish, not a malformed answer to correct |
+| `ProviderError` | provider failure: a transient one after its `RetryPolicy` retries are exhausted, or a non-transient one at once. `.attempts` holds the attempt records and `.status_code` the status the provider reported, including one carried inside a `200` body — which wins over any answer the same body carries, and whose `code` is read as a number or as a digit string. Also raised when every surface `api="auto"` could try answered `404` (the route is missing, so the failure is the provider's, not a private verdict's), and when a Responses call reports a `status` that is neither `completed` nor `incomplete` — `failed`, `cancelled` — which is a generation the provider did not finish, not a malformed answer to correct |
 | `JevperError` | base class, and the type used for constructor misuse, bad `state` messages, and content that is not JSON-serializable or contains a non-finite number |
 
 The provider-side logprob failures — a rejected logprob request, no logprobs at all, no alternatives for the
-answer token — are raised as `_LogprobsUnavailable`, a private `LabelReadoutError` subclass. It is private
-because `method="auto"` is the only thing that reads it: its `capability` attribute records whether the failure
-is evidence about the provider (`True`, which `auto` remembers) or a bad minute (`False`, which it does not).
-Catch the public `LabelReadoutError`. `capability=True` from a rejection is remembered at once; the same verdict
-read out of an answer that carried no usable logprobs needs a second one, because a single anomalous response is
-not evidence about the provider — [`internals.md`](internals.md#invariants) has the rule.
+answer token — are raised as `_LogprobsUnavailable`, a private `LabelReadoutError` subclass, and only while
+`method="auto"` or `api="auto"` is in play: with both pinned, the provider's own refusal is what reaches you,
+as a `ProviderError`. The verdict's `capability` attribute records whether the failure is evidence about the
+provider (`True`, which is remembered) or a bad minute (`False`, which is not). Catch the public
+`LabelReadoutError`. `capability=True` from a rejection is remembered at once; the same verdict read out of an
+answer that carried no usable logprobs needs a second one, because a single anomalous response is not evidence
+about the provider — [`internals.md`](internals.md#invariants) has the rule.
 
 The surface has its own private verdict. An `openai` client object exposes `responses.create` whether or not the
 server behind it implements the route — every local server (ollama, llama.cpp, SGLang, vLLM without the route)

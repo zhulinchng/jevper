@@ -144,6 +144,19 @@ def _cells(line: str) -> list[str]:
     return [cell.strip() for cell in line.strip().strip("|").split("|")]
 
 
+def _fenced(text: str) -> str:
+    """The lines inside every fenced code block."""
+    inside: list[str] = []
+    fenced = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced:
+            inside.append(line)
+    return "\n".join(inside)
+
+
 @pytest.mark.parametrize("path", PAGES, ids=lambda path: path.name)
 def test_every_documented_table_is_well_formed(path: Path) -> None:
     """A table whose rows disagree on their columns does not render as a table, and a strict build
@@ -172,6 +185,81 @@ def test_every_documented_table_is_well_formed(path: Path) -> None:
         check(run)
 
     assert not problems, f"{path.name}: " + "; ".join(problems)
+
+
+_JEVPER_MODULES = (
+    "client",
+    "errors",
+    "labels",
+    "methods",
+    "normalize",
+    "prompts",
+    "reasoning",
+    "transport",
+    "types",
+)
+_JEVPER_SUFFIXES = ("Error", "Config", "Answer", "Response", "Part", "Policy", "Client", "Usage")
+
+
+# The provider and stdlib exception classes the pages name. Spelled out rather than imported, because
+# the suite also runs in environments where the SDKs are not installed at all, and the point of this
+# guard is jevper's own names, not theirs.
+_FOREIGN_NAMES = frozenset(
+    {
+        "APIConnectionError",
+        "APITimeoutError",
+        "ConnectError",
+        "ConnectTimeout",
+        "LocalProtocolError",
+        "PoolTimeout",
+        "ProtocolError",
+        "ProxyError",
+        "ReadError",
+        "ReadTimeout",
+        "RemoteProtocolError",
+        "TimeoutException",
+        "TransportError",
+        "URLError",
+        "WriteError",
+        "WriteTimeout",
+    }
+)
+
+
+def _names_outside_jevper() -> set[str]:
+    """Builtins and the provider classes the pages also name."""
+    import builtins
+
+    return set(dir(builtins)) | set(_FOREIGN_NAMES)
+
+
+@pytest.mark.parametrize("path", PAGES, ids=lambda path: path.name)
+def test_every_documented_jevper_name_exists(path: Path) -> None:
+    """A page naming a class or constant the library no longer has is documenting a rename away.
+
+    Only prose is checked, and only names shaped like jevper's own, so a provider field in a code
+    block and an SDK exception class named in passing are left alone.
+    """
+    import jevper
+
+    known = _names_outside_jevper() | set(jevper.__all__)
+    for name in _JEVPER_MODULES:
+        known.update(vars(importlib.import_module(f"jevper.{name}")))
+
+    text = path.read_text()
+    prose = "\n".join(_prose(text))
+    # A name a code example uses is the reader's business — the example imports it — so this guard
+    # is about prose naming something the library does not have.
+    in_examples = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text)) - set(
+        re.findall(r"[A-Za-z_][A-Za-z0-9_]*", prose)
+    )
+    in_examples |= set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", _fenced(text)))
+    missing = sorted(
+        name
+        for name in set(re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", prose))
+        if name.endswith(_JEVPER_SUFFIXES) and name not in known and name not in in_examples
+    )
+    assert not missing, f"{path.name}: documented names the library does not define: {missing}"
 
 
 def _slug(heading: str) -> str:

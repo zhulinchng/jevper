@@ -5,18 +5,21 @@
 > [their docs](https://docs.typesafe.ai).
 
 The [Jev](https://docs.typesafe.ai) interface — `state` in, typed `questions` (`noul`, `choice`, `score`) out,
-answers carrying probabilities and confidence — on top of any OpenAI-compatible model.
+`choice` and `score` answers carrying probabilities and confidence and a `noul` answer its `noul` — on top of
+any OpenAI-compatible model.
 
-Same call as `typesafe-sdk`, different backend: point `jevper` at a hosted LLM or a self-hosted llama.cpp
-server and code written for Jev keeps working, unchanged.
+The same call shape as `typesafe-sdk`, a different backend: point `jevper` at a hosted LLM or a self-hosted
+llama.cpp server and the `system_one(state=..., questions=...)` code reads the same, though the two packages
+are independent and neither imports the other.
 
 It does not call the hosted TypeSafe API and does not depend on `typesafe-sdk` or `openai` at runtime — the
 client object is duck-typed. Any object exposing `responses.create` or `chat.completions.create` works,
 including a self-hosted llama.cpp server.
 
 The `responses` surface speaks both OpenAI's Responses API and the [OpenResponses](https://www.openresponses.org)
-specification, and both live at the same `/v1/responses` path — LM Studio has implemented the
-OpenResponses dialect since 0.3.39, vLLM says its route "aligns with" it, and what each of the five
+specification, and both live at the same `/v1/responses` path — the OpenResponses site lists LM Studio among
+the ecosystem's implementers, [vLLM says its route "aligns with" it](https://github.com/vllm-project/vllm/issues/32850)
+while extending it with fields of its own, and what each of the five
 local servers does with the fields jevper sends is measured in
 [docs/local-servers.md](docs/local-servers.md).
 
@@ -96,7 +99,8 @@ flowchart LR
     J --> K
 ```
 
-Each question becomes its own provider call, so questions are independent and run concurrently
+Each question has its own provider call sequence — one request in the ordinary case, more when reasoning,
+fallback or a retry adds one — so questions are independent and run concurrently
 (`max_concurrency`, default 8). Answers come back keyed by your question ids, in insertion order.
 
 ## Questions
@@ -137,7 +141,8 @@ single-letter labels, so they cap at 26 options).
 | `discrete` | strict JSON schema, model returns one option | one-hot distribution | JSON-schema structured output |
 
 `auto` is the default because logprobs are not universal: OpenAI's reasoning models — the GPT-5.6 family
-included — do not offer them, Anthropic and Gemini's OpenAI-compatibility endpoints never had them, and a
+included — do not offer them, Anthropic's Messages API has no such field and Gemini's OpenAI-compatibility
+endpoint does not support the parameter, and a
 model that returns a logprob with no alternatives gives you no distribution at all. A gateway in front of
 one says so in as many words (`logprobs are not supported with reasoning models.`), and so does a
 Responses endpoint that refuses the `include` list the carrier travels in.
@@ -208,20 +213,22 @@ response.reasoning             # tuple[ReasoningContentPart, ...]
 response.debug                 # per-attempt requests/responses, retry reasons, normalization notes
 ```
 
-`response.model_dump_json()` serializes to the Jev answer shape — the answer field names and JSON keys match
-`POST /v1/systemone`. Token counts are `None` when any constituent call omitted them; `n_calls` counts the
+`response.model_dump_json()` keeps the Jev answer field names and JSON keys, and adds jevper's own `model`,
+`usage`, `reasoning` and `debug` around them. Token counts are `None` when any constituent call omitted them;
+`n_calls` counts the
 provider calls that returned a result, including analysis passes and corrective retries, while `n_retries`
 counts transient-failure retries only. A failed attempt appears in `debug["llm_attempts"]` but not in `usage`.
 Confidence is a share in `[0, 1]` and the call counters are counts, because jevper computes them; the
-probabilities beside them are the model's own numbers, passed through verbatim when
+probabilities beside them are the model's own numbers on the `structured` path when
 `normalize_probabilities=False`. See [docs/api.md](https://github.com/zhulinchng/jevper/blob/main/docs/api.md)
 for the full reference.
 
 ## Prompt caching
 
-Every provider that serves these calls caches the *prefix* of a prompt and reuses it for the next request
-that starts the same way, and jevper is shaped for it: the state comes last, so the system prompt, the
-few-shot examples and the question block are identical across every state classified with one rubric.
+Providers that cache prompt prefixes reuse them for the next request that starts the same way, and jevper is
+shaped for it: the state comes last — unless it ends with an assistant turn, which moves the question block
+after it — so the system prompt, the few-shot examples and the question block are identical across every
+state classified with one rubric.
 
 ```python
 client = SystemOneClient(OpenAI(), model="gpt-5.6")
@@ -232,9 +239,10 @@ client.system_one(state=record_b, questions=rubric)   # the shared prefix is reu
 
 Two things make it steerable and observable:
 
-- **`prompt_cache_key`** is sent with every request, derived per question from the parts of the prompt that do
-  not change between calls — model, method, examples, question block — so a rubric's requests are routed
-  together, and a `logprobs` request is not routed with a `structured` one whose prefix differs. Pass your own
+- **`prompt_cache_key`** is sent on the Chat Completions and Responses surfaces, derived per question from the
+  parts of the prompt that do not change between calls — model, method, examples, question block — so a
+  rubric's requests are routed together, and a `logprobs` request is not routed with a `structured` one whose
+  prefix differs. Pass your own
   to group or account for them your way, on the client (`prompt_cache_key="tenant-42"`) or per call. A server
   that refuses the field gets it dropped and the call re-asked, like the other optional fields.
 - **`usage.cached_tokens`** is the prompt tokens the provider read from its cache, summed over the call.
@@ -341,7 +349,7 @@ recipes: [docs/mlflow.md](https://github.com/zhulinchng/jevper/blob/main/docs/ml
 ## Verification
 
 ```sh
-pytest -q                      # the whole suite runs against a local stub HTTP server; no network, no API keys
+pytest -q                      # the offline suite runs against a local stub server; live tests skip without keys
 ruff check src tests           # clean except three PYI034 hints (see docs/internals.md)
 ```
 

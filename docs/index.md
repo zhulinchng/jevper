@@ -1,6 +1,6 @@
 # jevper
 
-**Typed questions for OpenAI-compatible models.** jevper turns a state string and `noul`, `choice`, or `score` questions into typed answers with probabilities and confidence.
+**Typed questions for OpenAI-compatible models.** jevper turns a state string and `noul`, `choice`, or `score` questions into typed answers: `choice` and `score` answers carry probabilities and confidence, and a `noul` answer its `noul`.
 
 jevper is an independent implementation of the documented System One wire format. It is not affiliated with, endorsed by, or supported by TypeSafe AI. The package does not call the hosted TypeSafe API and does not import an OpenAI or Anthropic SDK at runtime.
 

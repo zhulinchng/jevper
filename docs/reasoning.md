@@ -2,8 +2,8 @@
 
 *Independent implementation of the documented System One wire format — not affiliated with TypeSafe.*
 
-`reasoning=ReasoningConfig(...)` asks the model to think before it commits to an answer. There are two ways to
-get that, and the config's `mode` decides which one is used.
+`reasoning=ReasoningConfig(...)` selects jevper's native or two-step reasoning path. Whether the provider
+receives a reasoning parameter depends on the fields applicable to the selected surface and the model.
 
 ```python
 ReasoningConfig(effort="medium", summary="auto", mode="auto")
@@ -13,75 +13,103 @@ ReasoningConfig(effort="medium", summary="auto", mode="auto")
 - `summary` — `auto`, `concise`, `detailed`
 - `context` — `auto`, `current_turn`, `all_turns`
 - `mode` — `auto`, `native`, `two_step`
-- `budget_tokens` — the thinking budget for the Messages surface's `thinking` field; unset sends no
-  `thinking` at all, and `effort` is never translated into a budget, because the mapping between a name and
-  a token count is the caller's. Anthropic requires at least 1024 and strictly less than `max_tokens`, so
-  jevper's own `max_tokens` default grows by the budget whenever one is set: the answer keeps the whole
-  1024 and the thinking is paid for out of the extra. `extra_body={"max_tokens": n}` still wins outright.
+- `budget_tokens` — the manual thinking budget for the Messages surface's `thinking` field; with neither
+  this field nor caller-supplied `extra_body["thinking"]`, jevper sends no `thinking` block, and `effort`
+  is never translated into a budget. Claude 4.6 deprecated manual budgets, and Claude 4.7 and later reject
+  them with `400`; for 4.6 and newer, Anthropic's supported path is
+  `thinking={"type": "adaptive"}` (optionally with `display: "summarized"`) and
+  `output_config={"effort": ...}`, while 4.5 and earlier use the manual form. Callers can pass those
+  fields through `extra_body`; jevper does not construct them.
+  Where the manual form applies, Anthropic requires at least 1024 and a budget strictly below
+  `max_tokens`. The `interleaved-thinking-2025-05-14` beta on the Messages API with tools permits the
+  budget to exceed `max_tokens`, but jevper does not use that exception and refuses locally.
+  When native mode sends a `ReasoningConfig` budget, jevper grows the Messages `max_tokens` default to
+  `1024 + budget_tokens`; explicit `mode="two_step"` supplies no config `thinking` and leaves jevper's
+  default at `1024`. A caller-supplied manual thinking budget is sized the same way;
+  `extra_body={"max_tokens": n}` still wins, but `n` must be greater than the sent budget.
   A server that refuses the budget *value* — SGLang answers `budget_tokens: must be at least 1024` — gets
   its own error back rather than a silent re-ask without thinking, because a bad number is not a missing
-  field. The field is only dropped, and remembered as this server's limit, when the server says it does not
-  know `thinking` at all.
+  field. A field-capability refusal — evidence naming `reasoning`, `thinking`, or `budget_tokens` but none
+  of jevper's value markers — drops the field, re-asks, and remembers the limit for that model and
+  surface.
 
 ## Mode resolution
 
 | `mode` | Responses surface | Chat Completions surface | Messages surface |
 | --- | --- | --- | --- |
 | `auto` (default) | `native` | `two_step` | `two_step`, or `native` when `budget_tokens` is set |
-| `native` | provider reasoning on the answer call | `reasoning_effort` on the answer call | `thinking` on the answer call, when `budget_tokens` is set |
+| `native` | answer call; non-null effort/summary/context form `reasoning` | answer call; effort becomes `reasoning_effort` | answer call; budget becomes `thinking` |
 | `two_step` | analysis call, then answer call | analysis call, then answer call | analysis call, then answer call |
 | reasoning not configured | off | off | off |
 
-`response.debug["reasoning_mode"]` reports what was actually used.
+`response.debug["reasoning_mode"]` is the mode for the surface on which the call ended. When questions used
+more than one surface, `response.debug["reasoning_modes"]` maps each question id to the mode derived from
+that question's own last attempt.
 
 On the Messages surface a budget resolves `auto` to `native`, because a budget is the only reason to ask
-for that surface's own thinking: `two_step` sends no `thinking` field at all, so a caller who set
-`budget_tokens` and left the mode alone would be paying for a two-step prompt path instead of getting
-the thinking they asked for. On Chat Completions `auto` stays `two_step` — `reasoning_effort` there is a
-separate decision, and the surface has no thinking budget to infer one from.
+for that surface's own thinking. `two_step` supplies no reasoning config to either call, so it sends no
+`thinking` from `ReasoningConfig`; a caller-supplied `extra_body["thinking"]` remains authoritative. On Chat
+Completions `auto` stays `two_step` — `reasoning_effort` there is a separate decision, and the surface has
+no thinking budget to infer one from.
 
 ## Native
 
-One provider call, with the reasoning parameters attached. The provider's reasoning items are copied into
-`response.reasoning` unchanged.
+Native uses the answer call rather than a separate analysis call. jevper attaches whichever applicable
+reasoning fields are set — none when the config has no field for that surface — and corrective or
+capability retries can add provider calls. Readable provider reasoning is normalized into
+`ReasoningContentPart`; Responses and Messages extra fields are retained, nonstandard part types are
+canonicalized, and unreadable parts are skipped.
 
 ```mermaid
 sequenceDiagram
     participant C as jevper
     participant P as Responses API
-    C->>P: input, store=false, reasoning={effort,summary}, include=["reasoning.encrypted_content"]
+    C->>P: input, store=false, reasoning={effort,summary}, include=[message.output_text.logprobs, reasoning.encrypted_content]
     P-->>C: output_text + reasoning items
     Note over C: answer readout from output_text / logprobs
 ```
 
-On the Responses surface the request carries `reasoning={"effort": ..., "summary": ..., "context": ...}`
-(only the fields you set), `store=false`, and `include` gains `reasoning.encrypted_content` so the reasoning
-items can be replayed later. On Chat Completions only `reasoning_effort` is sent, and only when `effort` is
-set — `summary` and `context` have no chat equivalent.
+By default, Responses sends the non-null config fields as
+`reasoning={"effort": ..., "summary": ..., "context": ...}`; an `extra_body["reasoning"]` value replaces
+that typed object. Unless overridden in `extra_body`, Responses sends `store=false`; unless `include` is
+overridden or the server has refused the include field, jevper adds `reasoning.encrypted_content` and,
+for a logprobs readout, `message.output_text.logprobs`. Chat Completions sends jevper's
+`reasoning_effort` only when `effort` is set; an `extra_body` key wins and can send it when the config
+does not, while `summary` and `context` have no Chat equivalent. From `ReasoningConfig`, Messages supplies
+`thinking` only for `budget_tokens` and only until that field is refused; `effort` is not translated.
+Caller-supplied `extra_body["thinking"]` is authoritative.
 
-Reasoning text is picked up from the provider's own fields: `reasoning_content`, else `thinking`, else
-`reasoning` (as a string or as reasoning parts), else reasoning parts inside a list-shaped `message.content`.
-A string becomes a `ReasoningTextPart` inside a `ReasoningContentPart`, so `reasoning_text()` works the same
-across providers.
+On Claude Fable 5.1, Mythos 5.1, Fable 5, Mythos 5, Mythos Preview, Opus 5.5, Opus 5, Opus 4.8, Opus 4.7,
+and Sonnet 5, Anthropic rejects a non-default `temperature`, `top_p`, or `top_k` on every Messages request,
+whether thinking is on or off. On older models those restrictions apply only while thinking is on:
+`temperature` and `top_k` are incompatible, and `top_p` is allowed only from 0.95 through 1. The
+`anthropic` 1.8 SDK removed all three from `messages.create()`, so jevper sends its `temperature` option
+through `extra_body` when it is configured and no thinking budget is sent; caller sampling fields remain
+authoritative.
+
+Chat Completions reads `reasoning_content`, then `thinking`, then `reasoning`, then reasoning parts in a
+list-shaped `message.content`; a string becomes a `ReasoningTextPart`. Responses reads reasoning items
+from `output`, while Messages reads thinking content blocks.
 
 ## Two-step
 
-Two calls per question: an analysis pass, then the answer pass with the analysis replayed as an assistant
-turn.
+The base path uses two provider calls per question: an analysis pass, then the answer pass with the analysis
+replayed as an assistant turn.
 
 ```mermaid
 sequenceDiagram
     participant C as jevper
     participant P as provider
-    C->>P: analysis system prompt, few-shot, question block, state
+    C->>P: analysis system prompt, few-shot + question/state turns
     P-->>C: free-form considerations
     C->>P: answer messages + assistant(trace) + the answer cue
     P-->>C: label or JSON answer
     Note over C: readout, then finalize
 ```
 
-- The analysis call sends no schema and no logprobs: it is plain text, so the model reasons freely. It is also
-  where few-shot turns appear, exactly as in the answer call.
+- jevper adds no schema and no logprobs to the analysis call: it is plain text, so the model reasons
+  freely. Caller-supplied `extra_body` fields are still forwarded, and few-shot turns appear exactly as in
+  the answer call.
 - The answer call reuses the full message list, appends `{"role": "assistant", "content": trace}` and then the
   answer cue: `{"role": "user", "content": "Now reply with the label only."}` for `logprobs`/`grammar`, and
   `"Now reply with the JSON object only."` for `structured`/`discrete`, whose answers are JSON. Corrective
@@ -90,17 +118,20 @@ sequenceDiagram
   without sending an empty assistant turn, which several OpenAI-compatible servers reject. If the call did
   return reasoning, that reasoning text becomes the trace for the answer call; if it returned neither, the
   answer call runs straight from the question block to the cue.
-- The trace is `response.reasoning[0]` — a `ReasoningContentPart` whose summary text is the analysis output —
-  followed by any native reasoning items the two calls returned, so `reasoning_text(response.reasoning)`
-  returns the trace. When the analysis produced no text of its own, no synthetic part is added and the
-  provider's own item is the trace, so the text is not duplicated.
-- Both calls count towards `usage`: `n_calls` is 2 per question (plus corrective retries), and both calls'
-  tokens are summed. Two-step reasoning is therefore roughly twice the cost of a plain call.
+- For a one-question two-step response with analysis text, `response.reasoning[0].summary[0].text` is the
+  synthetic analysis trace. A multi-question response flattens all questions' reasoning in question
+  order, so only the first question's trace occupies index 0. `reasoning_text(response.reasoning)` returns
+  the trace plus any native summary texts because summaries take precedence over content texts. When the
+  analysis produced no text of its own, no synthetic part is added and the provider's own item is the
+  trace, so the text is not duplicated.
+- The base two-step path uses two provider calls and sums their reported token counts; `n_calls` also
+  includes capability and corrective retries. Monetary cost depends on the provider, model, generated
+  tokens, and cache reuse.
 
-One asymmetry to know about: the analysis call only receives reasoning parameters when the surface is the
-Responses API. On Chat Completions a two-step call sends no `reasoning_effort` at all — the analysis prompt
-*is* the reasoning step. If you want the provider's own reasoning on the chat surface, use
-`mode="native"`.
+jevper supplies reasoning config to the analysis call only on the Responses API. On Chat Completions it
+sends no typed `reasoning_effort` on that call — the analysis prompt *is* the reasoning step — although a
+caller-supplied `extra_body["reasoning_effort"]` is forwarded. If you want the provider's own reasoning on
+the Chat surface, use `mode="native"`.
 
 ## Models that always think
 
@@ -124,5 +155,7 @@ reasoning_text(response.reasoning)   # joined summary texts, else joined content
 replayed into a later request without loss. `reasoning_text` prefers summaries over content texts, and joins
 multiple parts with a blank line.
 
-Replaying a trace yourself is a matter of feeding the parts back into the next call's input; `store=false`
-means the provider keeps no state for you, and `encrypted_content` is what makes the reasoning items portable.
+Responses reasoning items can be dumped and replayed as later Responses input; `store=false` means the
+provider keeps no state for you, and `encrypted_content` makes the reasoning items portable. Messages
+thinking blocks are normalized for reading, so replaying one requires converting it back to Anthropic's
+original `{"type": "thinking", "thinking": ..., "signature": ...}` shape and preserving the block unchanged.

@@ -5,6 +5,9 @@ repo_name: zhulinchng/jevper
 repo_url: https://github.com/zhulinchng/jevper
 edit_uri: edit/main/docs/
 
+extra_css:
+  - stylesheets/extra.css
+
 theme:
   name: material
   palette:

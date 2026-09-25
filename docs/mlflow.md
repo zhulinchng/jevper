@@ -25,8 +25,10 @@ pytest tests/test_mlflow.py -q
 
 `mlflow.openai.autolog()` and `mlflow.anthropic.autolog()` patch the SDK **resource classes**, not the
 client constructors, so every call jevper makes through a caller-supplied *SDK* client is traced — including
-the attempts it makes before settling on one the provider accepts. A duck-typed client of your own is not an
-SDK client, so autolog cannot see it; wrap those calls in `@mlflow.trace` yourself if you need the span.
+the attempts it makes before settling on one the provider accepts. A client of your own is seen when it
+delegates to a real SDK resource — autolog patches the resource, not your constructor — but a wholly
+independent implementation is invisible to it; wrap those calls in `@mlflow.trace` yourself if you need the
+span.
 
 ```python
 import mlflow

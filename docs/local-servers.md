@@ -3,13 +3,21 @@
 jevper talks to anything that speaks the OpenAI wire format, so a local server is the same client with a
 different `base_url`. Three things differ between servers, and all three are decided by what you pass rather
 than by the library: **which surface carries logprobs**, **how thinking is turned off**, and **which request
-fields the server quietly ignores**. This page is the short version, checked against ollama 0.34, llama.cpp
-b11139, vLLM 0.30 and SGLang 0.5.20 serving `Qwen3.5-9B` at 4-bit on one 12 GB card.
+fields the server quietly ignores**.
 
-Every number here is measured, and it was measured by a consumer project that ships in this
-repository: `examples/incident-triage` — a support-ticket triage service that installs jevper as a
-dependency, whose `sweep` command runs 38 scenarios per server across all three surfaces. The
-tables below are what it measured.
+Unless a row or paragraph says otherwise, server-behaviour results and measurements on this page come from
+one recorded run on **2026-09-25**, against Ollama 0.34.3, llama.cpp b11139, vLLM 0.30.1, SGLang 0.5.20 and
+LM Studio 0.4.1. The main sweep served `Qwen3.5-9B` at 4-bit on one remote 12 GB GPU box; prose or a row that
+names a 4B model identifies that explicit exception. The consumer harness in `examples/incident-triage/` ran
+as `python -m incident_triage.cli sweep --server <server> --full --out /tmp/<server>.json`. Its `sweep`
+command defines 38 scenarios and runs each only on the surfaces and methods it declares. These are
+version-specific observations, not a promise about a later server build. Statements about what jevper sends,
+normalizes or raises are code behaviour; historical "first release" values marked unmeasured were not verified
+from this repository. Hosted OpenRouter and OpenAI observations name that endpoint and are not measurements
+of the local GPU box.
+
+In a harness response, `usage.n_calls` counts successful provider results. Failed attempts and fallback
+probes are recorded in `debug["llm_attempts"]`, so `n_calls` is not a count of every wire request.
 
 ```python
 from openai import OpenAI
@@ -18,7 +26,7 @@ from jevper import Choice, SystemOneClient
 client = SystemOneClient(
     OpenAI(base_url="http://127.0.0.1:11434/v1", api_key="local"),
     model="qwen3.5:9b",
-    extra_body={"reasoning_effort": "none"},  # thinking off — see below
+    extra_body={"reasoning": {"effort": "none"}},  # Responses thinking off; see below
 )
 
 response = client.system_one(
@@ -41,46 +49,48 @@ response.answers["intent"].probabilities  # a real distribution, read from the s
 
 | Server | `base_url` | `model` | Thinking off | Notes |
 | --- | --- | --- | --- | --- |
-| ollama | `http://127.0.0.1:11434/v1` | the tag you pulled, e.g. `qwen3.5:9b` | `extra_body={"reasoning_effort": "none"}` | Chat Completions carries logprobs; the Responses route exists but returns an empty logprob list |
-| llama.cpp | `http://127.0.0.1:8080/v1` | the `--alias` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--jinja` for the model's own template; the only server of the five that takes jevper's GBNF `grammar` field, so `method="grammar"` answers there (measured) |
-| vLLM | `http://127.0.0.1:8000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; `top_logprobs` is capped by `--max-logprobs` (20) |
-| SGLang | `http://127.0.0.1:30000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; its Responses route needs `top_logprobs` sent explicitly, which jevper always does |
+| ollama | `http://127.0.0.1:11434/v1` | the tag you pulled, e.g. `qwen3.5:9b` | `extra_body={"reasoning": {"effort": "none"}}` on Responses | Chat Completions carries logprobs; the Responses route exists but returns an empty logprob list. Use `reasoning_effort` only on Chat Completions; jevper does not translate it to the Responses field |
+| llama.cpp | `http://127.0.0.1:8080/v1` | the `--alias` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--jinja` for the model's own template; the only measured server of the five that takes jevper's GBNF `grammar` field, so `method="grammar"` answers there |
+| vLLM | `http://127.0.0.1:8000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; its `top_logprobs` limit is configured by `--max-logprobs` |
+| SGLang | `http://127.0.0.1:30000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; its Responses logprob readout needed `top_logprobs` explicitly. jevper sends it for `logprobs` and `grammar`, but not for `structured` or `discrete` |
 | LM Studio | `http://127.0.0.1:1234/v1` | the id `lms ls` prints, e.g. `qwen3-4b-instruct-2507` | nothing does — load a non-thinking model | all three surfaces on one box, as do the other four now; `logprobs` arrives on both OpenAI surfaces; its Responses route accepts `text.format` and ignores it, so structured answers belong on Chat Completions |
 
-All five answer the Anthropic Messages route as well (`/v1/messages`), so `api="auto"` has all three to
-choose from on any of them; ollama, llama.cpp, SGLang and LM Studio were exercised through it directly.
+All five answered the Anthropic Messages route (`/v1/messages`) in the recorded run, but that route needs the
+`anthropic` client and `api="messages"`; an OpenAI client does not expose it for `api="auto"` discovery.
 
-A caller-owned body field is the caller's own business, and a server that types it strictly will say so:
-`extra_body={"stream": 0}` is refused by llama.cpp with `400 Field 'stream': type must be boolean, but is
-number`, and jevper reports that refusal rather than reading a stream it did not ask for. Omit the field,
-or send `false`.
+jevper passes `extra_body={"stream": 0}` through because only a truthy `stream` is refused locally. The
+provider's response is reported as `ProviderError`; the exact status and text are server behaviour. Omit the
+field, or send `false`.
 
 Both facades have been run against every server here, and `AsyncSystemOneClient` has been run live against
 ollama's Responses route and against a hosted OpenAI-compatible endpoint (OpenRouter): a batch of three
 question types, two concurrent calls on two surfaces, a 26-option question and a `discrete` answer all come
 back the same way the blocking client returns them.
 
-`api="auto"` (the default) works against all five: it prefers the Responses surface, and when that route is
-missing — or answers without carrying logprobs through — it re-asks on Chat Completions and remembers the
-verdict. Passing `api="chat_completions"` skips the discovery entirely.
+Those hosted observations are endpoint-specific; the local blocking and async results are the versioned
+server results covered by the conditions above.
+
+`api="auto"` (the default) prefers Responses when that client surface exists, and when the route is missing
+— or answers without carrying logprobs through for a label readout — it re-asks on Chat Completions and
+remembers the verdict. Passing `api="chat_completions"` skips discovery.
 
 ### What a label readout costs on a wide question
 
 A `Choice` of 26 options is the widest a label readout can be asked for (past 26 the labels are two
-letters and `method="auto"` answers in JSON instead). At 26, a 4B model on vLLM or LM Studio answers the
-label prompt with prose — the first token came back as `no` — and jevper reports that as
-`LabelReadoutError` rather than reading a label out of a sentence, after the corrective retry has had its
-turn. SGLang answers the same 26-label question with a label and jevper reads all 26 probabilities from it,
-so this is the model, not the width. `method="structured"` is the safer method for a question that wide: it
-asks for a probability per option and reads the distribution, and a 26-option question answered that way
-came back with all 26 keys on SGLang and on OpenRouter. The same held for the score method wherever it was asked live: the reported `score` is exactly the
-expectation over the distribution the model reported (`{0: 0.1, 1: 0.9}` → `0.9`;
-`{2: 0.2, 3: 0.7, 4: 0.1}` → `2.9`), with `normalize_probabilities=False` so nothing was rescaled first.
+letters and `method="auto"` answers in JSON instead). In the recorded 4B-model runs, vLLM and LM Studio
+answered the label prompt with prose — the first token came back as `no` — so jevper raised
+`LabelReadoutError` after its corrective retry. SGLang answered the same 26-label question with a label,
+and jevper read all 26 probabilities from it. `method="structured"` does not need a logprob distribution;
+the recorded SGLang and OpenRouter runs returned all 26 keys.
 
-A `Noul` answer has the other half of the same contract: a number in `[0, 1]`, or nothing. ollama answered
-one probe `{"noul": 521304}` — a real generation, plainly out of range — and the caller was told
-`'noul' must be in [0, 1.0], got 521304.0` rather than handed a probability that is not one; the
-`discrete` form of the same question, asked immediately afterwards, answered `true`.
+For `Score`, `normalize_probabilities=False` preserves the provider's numbers in the returned
+`probabilities`, but jevper still computes `score` from a rescaled distribution. Rescaling is a no-op for
+the two displayed distributions, so their expectations remain `0.9` for `{0: 0.1, 1: 0.9}` and `2.9` for
+`{2: 0.2, 3: 0.7, 4: 0.1}`.
+
+A structured `Noul` readout requires `noul` in `[0, 1]`; the public `NoulAnswer.noul` field is an
+unrestricted float. In the recorded Ollama probe, the model generated `{"noul": 521304}`, and the structured
+readout raised `'noul' must be in [0, 1.0], got 521304.0`; the `discrete` follow-up answered `true`.
 
 ### A cache key longer than OpenAI's cap
 
@@ -92,11 +102,11 @@ cannot become an unbounded string on the wire.
 
 ## Thinking is the one decision you must make
 
-`logprobs` and `grammar` read a **one-token answer**, and every one of these servers reports logprobs for
-*every* generated token. With thinking on, that is the first token of the reasoning, not the label: the
-readout raises `LabelReadoutError`, spends one corrective retry, and raises again. `structured` and
-`discrete` are unaffected — they read answer text, not a token's probability — but thinking still costs
-a whole reasoning pass to produce one JSON object, so turn it off for classification work either way.
+`logprobs` and `grammar` read a **one-token answer**, and the measured label and grammar scenarios received
+logprobs for generated tokens. With thinking on, a label can start in the reasoning trace rather than at the
+label: the readout raises `LabelReadoutError`, spends one corrective retry, and raises again. `structured`
+and `discrete` do not need logprobs, but thinking can consume the output budget or leave no answer text, so
+turn it off for classification work.
 
 | Server | Request field that turns it off | Also available |
 | --- | --- | --- |
@@ -106,10 +116,11 @@ a whole reasoning pass to produce one JSON object, so turn it off for classifica
 | SGLang | `chat_template_kwargs: {"enable_thinking": false}` | `reasoning_effort` — but only with the values its parser accepts |
 | LM Studio | none reliably: omitting the field leaves the model's own template in charge, and `reasoning_effort: "none"` is ignored on its chat route (bug-tracker #2413; seen here — the trace still arrived, 1016 characters of it) | load an instruct model instead — `qwen3-4b-instruct-2507` answers without a reasoning trace |
 
-If you keep thinking on, `structured` and `discrete` are unaffected — they read the answer text, and the
-trace lands in `response.reasoning` (`message.reasoning` on ollama, `reasoning_content` on the others;
-jevper reads all three). A label readout also survives it when the server separates the trace *and* the token
-stream ends exactly with the answer text: jevper anchors on that tail and reads the answer's own first token.
+If you keep thinking on, `structured` and `discrete` still read answer text rather than a token
+probability, but thinking can spend the output budget or leave no answer. When returned, the trace lands in
+`response.reasoning`; jevper reads the Chat fields `reasoning_content`, `thinking`, and `reasoning`. A label
+readout also survives it when the server separates the trace *and* the token stream ends exactly with the
+answer text: jevper anchors on that tail and reads the answer's own first token.
 That anchor is deliberately strict — anything else is reported rather than guessed — with one allowance:
 vLLM and SGLang append their own end-of-turn token (`<|im_end|>`) to the logprob stream after the answer, so
 up to two trailing tokens that cannot be part of the answer are dropped before the tail is tested.
@@ -130,12 +141,12 @@ Unknown fields are accepted and dropped by all five, so a field that does not ap
   `max_tokens`.
 - `n` is rejected outright by llama.cpp (`1 <= value <= 1`); the others accept it, and vLLM and SGLang then
   return two choices where jevper reads the first.
-- A body field the caller's own types strictly is the caller's own business, and three of the five say so in
-  their own words about `extra_body={"stream": 0}`: llama.cpp answers `400 Field 'stream': type must be
-  boolean, but is number`, ollama `400 invalid stream value: json: cannot unmarshal number into Go value of
-  type bool`, LM Studio `400 Expected boolean, received number`. vLLM takes it, because its request model
-  coerces `0` to `false`. jevper refuses a truthy `stream` itself and reports those 400s as the caller's own
-  field being refused; omit the field, or send `false`.
+- A body field the caller's own types strictly is the caller's own business. In the recorded run,
+  `extra_body={"stream": 0}` produced these provider errors: llama.cpp answered `400 Field 'stream': type
+  must be boolean, but is number`; Ollama answered `400 invalid stream value: json: cannot unmarshal
+  number into Go value of type bool`; LM Studio answered `400 Expected boolean, received number`; and vLLM
+  accepted it. jevper passes `0` through and reports the provider failure as `ProviderError`. It refuses
+  only a truthy `stream` locally; omit the field, or send `false`.
 - A `developer` message is a `400` (`Unexpected message role.`) on SGLang, so keep `state` to
   `system`/`user`/`assistant` roles. jevper's own turns never use another role.
 - LM Studio's Responses route accepts `text.format` with a strict `json_schema` and **ignores it** — structured
@@ -183,14 +194,15 @@ Unknown fields are accepted and dropped by all five, so a field that does not ap
 
 ## What each server actually answers
 
-Recorded with raw HTTP against each server — 45 requests each, and the responses jevper has to read are kept
-in `tests/fixtures/providers/`. The shapes matter more than the verdicts: they are what a client has to
-tolerate, and the fixture tests replay them on every change.
+The following server responses were recorded with raw HTTP under the date, builds, model and hardware
+conditions stated above. The pruned fixtures in `tests/fixtures/providers/` preserve the response shapes
+that jevper reads and are replayed by fixture tests; they are not a request manifest. The shapes matter more
+than the verdicts: they are what a client has to tolerate.
 
 | | ollama 0.34.3 | llama.cpp b11139 | vLLM 0.30.1 | SGLang 0.5.20 |
 | --- | --- | --- | --- | --- |
 | `/v1/responses` route | yes | yes | yes | yes |
-| `/v1/messages` route | yes, since 0.14.0 | yes, since Nov 2025 | yes, since 0.11.1 ([release notes](https://github.com/vllm-project/vllm/releases/tag/v0.11.1)) | yes, since 0.5.9 |
+| `/v1/messages` route | yes | yes | yes | yes |
 | logprobs on Chat Completions | yes | yes | yes | yes |
 | logprobs on Responses | **empty list** | **`400`** | yes, with `include` | yes, with `top_logprobs` |
 | `top_logprobs` above 20 | `400` (`must be between 0 and 20`) | accepted | `400` | accepted |
@@ -219,11 +231,11 @@ Three of these decide behaviour jevper implements rather than documents:
 ## The OpenResponses route
 
 `/v1/responses` is not one wire format but two that share a path: OpenAI's Responses API and the
-[OpenResponses](https://www.openresponses.org) specification (current release `2026-04-24`), which
-vLLM says its route "aligns with" and which LM Studio has implemented since 0.3.39. jevper's
-`api="responses"` reads both and sends the portable form: every input turn carries the item `type`
-the spec's union requires, with its content as a plain string, which that union also allows. The
-table is what each server did with exactly that, measured with raw HTTP; the reasoning knobs were
+[OpenResponses](https://www.openresponses.org) specification (release `2026-04-24`, as cited by that page).
+vLLM describes its route as aligned with the specification; LM Studio's implementation history is unverified
+here. jevper's `api="responses"` reads both and sends the portable form: every input turn carries the item
+`type` the spec's union requires, with its content as a plain string, which that union also allows.
+The table records what each server did with exactly that in the dated raw-HTTP run. The reasoning knobs were
 asked for with `reasoning: {"effort": "none"}` and the logprob carrier with
 `include: ["message.output_text.logprobs"], top_logprobs: 5`.
 
@@ -270,14 +282,13 @@ above is measured rather than cited.
 
 ## Prompt caching
 
-Every one of these servers caches the prefix of a prompt and reuses it for the next request that starts the
-same way. None of them needs to be asked: prefix caching is on by default on all five (llama.cpp's
-`--cache-prompt`, vLLM's `enable_prefix_caching`, SGLang's RadixAttention, ollama's runner cache), and the
-request fields the hosted APIs use to steer it — `prompt_cache_key`, `prompt_cache_retention`, `cache_salt`,
-`session_id`, `prompt_cache_options`, `prompt_cache_breakpoint` — are accepted with `200` and ignored by all
-four. Sending one costs nothing; expecting it to do anything here does.
+The recorded four-server run reused prefixes without a cache-control field. Prefix caching was on in the
+serve configurations used for Ollama 0.34.3, llama.cpp b11139, vLLM 0.30.1 and SGLang 0.5.20. The hosted-style
+request fields `prompt_cache_key`, `prompt_cache_retention`, `session_id`, `prompt_cache_options`, and
+`prompt_cache_breakpoint` were accepted with `200` and ignored in that run; `cache_salt` is the exception below.
 
-What they do *not* agree on is telling you it happened:
+What those builds did *not* agree on was how to report the hit. Every cell below is an observation from the
+same dated run, with the flags shown in the cells; no later build is implied:
 
 | | ollama 0.34.3 | llama.cpp b11139 | vLLM 0.30.1 | SGLang 0.5.20 |
 | --- | --- | --- | --- | --- |
@@ -294,8 +305,9 @@ reports a plain `0` is reporting a cold or disabled cache, and that is preserved
 ### Message order is what decides the reuse
 
 A cached prefix is reused up to the first token that differs, so the part of a jevper prompt that changes
-between calls — the state — has to come last for a rubric's calls to share anything. Measured on one 2388-token
-prompt (two examples, a ~1300-token state), second call differing only in the state:
+between calls — the state — has to come last for a rubric's calls to share anything. In the dated cache run,
+one 2388-token prompt (two examples, a ~1300-token state) was called twice with only the state changed.
+The token counts below are that run's measurements, not a general cache guarantee:
 
 | Message order | ollama | llama.cpp | vLLM | SGLang |
 | --- | --- | --- | --- | --- |
@@ -328,10 +340,9 @@ Two consequences worth knowing:
 
 ### Isolating a cache
 
-`cache_salt` is the one cache field two of these servers do implement: vLLM and SGLang group reuse by salt, so
-requests with the same salt share cached prefixes and requests with different salts cannot see each other's.
-It is an isolation control, not a routing one, and jevper does not send it — pass it per deployment when
-tenants share a server:
+In the recorded run, `cache_salt` was the cache field vLLM 0.30.1 and SGLang 0.5.20 implemented: requests
+with the same salt shared cached prefixes and different salts did not. jevper does not add the field itself,
+but a caller can send it through `extra_body`; it is an isolation control, not a routing one.
 
 ```python
 SystemOneClient(client, model="qwen3.5-9b", extra_body={"cache_salt": tenant_id})
@@ -341,12 +352,12 @@ vLLM caps the salt at 128 characters and rejects `@`, `/`, `\` and NUL; llama.cp
 
 ## The Messages route
 
-All five servers here also implement the Anthropic Messages API (`POST /v1/messages`), so jevper's
-`api="messages"` works against each of them — the `anthropic` SDK pointed at the same host and port as the
-OpenAI one. What differs is how much of the protocol each server implements; the versions are the first
-release of each project that ships the route.
+In the dated run, all five servers answered the Anthropic Messages API (`POST /v1/messages`), so jevper's
+`api="messages"` worked against each with the `anthropic` SDK pointed at the same host and port as the OpenAI
+one. Protocol behaviour differs by build. The following table is a measurement under the conditions above;
+its `First release` column is unmeasured historical metadata, not a finding from that run.
 
-| Server | Since | `thinking` field | Thinking blocks back | `usage` cache counts |
+| Server | First release (unmeasured) | `thinking` field | Thinking blocks back | `usage` cache counts |
 | --- | --- | --- | --- | --- |
 | LM Studio | 0.4.1 | accepted, and the answer is still separated from it | `thinking` blocks when the model thinks | `cache_read_input_tokens`, including a reported `0` on a cold call |
 | llama.cpp | b7187 | accepted, and the budget grows `max_tokens` as below | reported | not documented |
@@ -354,13 +365,12 @@ release of each project that ships the route.
 | SGLang | 0.5.9 | **refused**: this version has no `thinking` field at all, so the request is answered `400` and jevper drops the field and re-asks, reporting `debug["server_limits"]["thinking"]` | `thinking` blocks | yes |
 | ollama | 0.14.0 | accepted, but `budget_tokens` is accepted and **not enforced** | `thinking` blocks | no cache fields at all |
 
-No server returns logprobs through this route — the API has no field for one — so `method="structured"` or
-`"discrete"` is how to use it, and `method="auto"` resolves to `structured` there without spending a request
-to find out. `max_tokens` is required by vLLM's and SGLang's implementations and has no default on any of
-them, so jevper always sends one: 1024, or 1024 plus the caller's `ReasoningConfig(budget_tokens=…)`, because
-this API also requires the thinking budget to be *strictly below* `max_tokens` and would refuse the 1024 its
-own documentation calls the floor. Measured on all five: a 1024 budget sends `max_tokens: 2048`, a 2048 budget
-sends `3072`, and a caller's own `extra_body={"max_tokens": 4096}` still wins outright.
+The Messages request shape has no logprob carrier, so `method="structured"` or `"discrete"` is how to use it;
+`method="auto"` resolves to `structured` on this surface without probing. Independently of what an individual
+local implementation requires, jevper always sends `max_tokens`: 1024 by default, or 1024 plus the caller's
+thinking budget. A caller-provided `max_tokens` wins. A 1024 thinking budget therefore sends 2048 and a 2048
+budget sends 3072, and jevper refuses a caller value that cannot hold the requested thinking budget. jevper
+also omits temperature whenever that thinking budget is present.
 
 Anthropic has since added mid-conversation `system` messages, but no server here implements them: they render
 a `system` turn positionally into the chat template, so jevper still moves it to the top-level `system` field,
@@ -420,8 +430,8 @@ covers the parser that turns the whole generation into reasoning.
 
 ## Sizing a 12 GB card
 
-A 9B model at 4-bit is 5.5-8.5 GB of weights, which leaves room for a small KV cache but not much else. What
-worked here, one server at a time (they cannot share the card):
+The recorded hardware run loaded one server at a time on the 12 GB GPU box. The weights, serve flags,
+startup time, KV-cache size and error text below are measurements from that run, not portable sizing rules:
 
 | Server | Weights | Serve flags that fit |
 | --- | --- | --- |

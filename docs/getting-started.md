@@ -77,7 +77,7 @@ Every question is independent. jevper runs multiple questions concurrently, retu
 - `reasoning` — reasoning content returned by the model, when configured; and
 - `debug` — resolved method and surface, attempts, retries, and server limits.
 
-The default `method="auto"` asks for logprobs first when the selected provider surface can return them. Providers and models without a usable distribution fall back to structured output. Pin `method="logprobs"` only when you want a provider refusal to be reported instead of relying on the fallback.
+The default `method="auto"` asks for logprobs first when the selected provider surface can return them. Providers and models without a usable distribution fall back to structured output. Pin `method="logprobs"` when you want a refusal reported instead of relying on the fallback — though under `api="auto"` a pinned label readout still moves to another OpenAI surface that can serve it before it reports anything.
 
 ## Sync or async?
 
@@ -107,7 +107,7 @@ sequenceDiagram
     participant P as Provider client
     A->>J: system_one(state, questions)
     J->>J: Validate, render, and select method/surface
-    J->>P: Provider request per question
+    J->>P: Provider request(s) per question
     P-->>J: Answer text, logprobs, usage, and optional reasoning
     J->>J: Read and validate typed answers
     J-->>A: SystemOneResponse

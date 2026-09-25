@@ -1,0 +1,5 @@
+.md-typeset table code {
+  overflow-wrap: normal;
+  white-space: nowrap;
+  word-break: normal;
+}

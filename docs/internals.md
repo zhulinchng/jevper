@@ -28,7 +28,7 @@ renderer. It runs after the module is loaded, so nothing changes for an importer
 
 ```mermaid
 flowchart TD
-    A["system_one(state, questions, ...)"] --> B["_prepare: validate questions, render the state turns, resolve method/api/reasoning/examples"]
+    A["system_one(state, questions, ...)"] --> B["_prepare: validate the questions and examples, render the state turns, resolve method/api/reasoning, build the transport"]
     B --> B2{"method == auto"}
     B2 -->|"yes"| B3["_auto_method(model, surface): what this client learned, else logprobs"]
     B2 -->|"no"| C
@@ -76,8 +76,8 @@ while True:
         spec = steps.send(result)
 ```
 
-`StopIteration.value` is the finished `_QuestionOutcome`. The sync and async clients differ only in their
-driver (`_call` uses the sync or async transport), which keeps the two implementations from drifting.
+`StopIteration.value` is the finished `_QuestionOutcome`. The orchestration is shared; the two facades differ
+in their `_run`, `_call` and `system_one` drivers, and `_call` is where the sync or async transport is chosen.
 
 `_question_steps` is a thin wrapper over `_answer_steps` that exists for one reason: the provider's verdict
 arrives in the driver, not inside the generator, so it is thrown back in (`steps.throw`). Under
@@ -126,11 +126,13 @@ not the Python.
 
 | Kind | Trigger | Counted in |
 | --- | --- | --- |
-| Transient | `status_code` in `{408, 429, 500, 502, 503, 504, 529}` (read from the exception or from `exc.response.status_code`), or `Connection`/`Timeout` in the name of the exception class or any base class, or an `httpx`-family `TransportError`/`TimeoutException` in the MRO | `usage.n_retries`, with delays `min(base_delay · 3ⁿ, max_delay)` |
+| Transient | `status_code` in `{408, 409, 429}` or any 5xx (read from the exception or from `exc.response.status_code`), an exact class name in the MRO matching `_TRANSIENT_EXCEPTION_CLASSES` — the httpx/SDK transport family, `TimeoutError`, `ConnectionError` — or an `x-should-retry` header that says so, which outranks the status | `usage.n_retries`, with delays `min(base_delay · 3ⁿ, max_delay)` unless a respected `Retry-After` supplies the server's own, uncapped, delay |
 | Corrective | `LabelReadoutError` or `MalformedAnswerError` on the answer call | `usage.n_calls` (each is a provider call) and `debug["retry_reasons"]` |
 
 Transient retries wrap the failing call; a non-transient error, or a transient one with the retries exhausted,
-becomes a `ProviderError` with the attempt history attached. A `200` whose body carries the provider's own
+becomes a `ProviderError` with the attempt history attached — except a `ClientCapabilityError`, which is raised
+as it is, and a 404 under `api="auto"`, which is a route verdict rather than a failure. A `200` whose body
+carries the provider's own
 `error` object — OpenRouter reports an overloaded upstream that way, with no `choices` at all — is read as that
 failure rather than as an unreadable surface, and the status inside the body decides whether it is retried.
 Corrective retries append a correction turn to the answer conversation — after the `ANSWER_CUE` turn in
@@ -145,7 +147,7 @@ the only one the provider chooses to send: OpenAI, OpenRouter, ollama and llama.
 needs `--enable-prompt-tokens-details`, SGLang needs `--enable-cache-report` on its Chat Completions route,
 and a server that says nothing leaves the total `None` rather than a flattering `0`.
 
-`debug` is assembled once, in `_assemble`, with all eight keys always present:
+`debug` is assembled once, in `_assemble`, with eight keys always present:
 
 | Key | Filled by |
 | --- | --- |
@@ -156,29 +158,36 @@ and a server that says nothing leaves the total `None` rather than a flattering 
 | `labels_missing` | Labels the provider reported no logprob for |
 
 A ninth key, `methods` (`{question_id: method}`), is added only for `method="auto"`, where the method is a
-decision per question rather than a pinned fact. Every other key is present either way, which is what keeps a
-pinned method's `debug` byte-identical across releases.
+decision per question rather than a pinned fact, and a mixed-surface call also gets `apis`,
+`server_limits_by_api` and `reasoning_modes`; `server_limits` itself appears only once a server has refused
+something. The eight baseline keys are what keeps a pinned method's `debug` shape the same from release to
+release.
 
 ## Invariants
 
 Worth keeping when editing:
 
-- No request ever carries `max_tokens`, `max_completion_tokens` or `max_output_tokens`. Reasoning tokens count
-  against those caps, and a small cap truncates a reasoning model.
+- No OpenAI-surface request carries an output budget of its own: neither `max_completion_tokens` nor
+  `max_output_tokens` is ever sent, because a small cap truncates a reasoning model before it answers. The
+  budget is the caller's, in `extra_body`, under the surface's own field name. Messages is the exception the
+  API forces: it has no default for `max_tokens`, so jevper always sends one — 1024, or 1024 plus a thinking
+  budget.
 - The builders emit only the fields the surface understands; anything else the provider accepts goes through
   `extra_body` (`grammar` is merged into it), never into `CallSpec`.
 - Labels are single letters up to 26 options, two letters above that. Only `structured` and `discrete` may use
   the two-letter range: multi-letter labels break first-token logprob readout, so `logprobs`/`grammar` raise
   `InvalidQuestionError` past 26 options (`methods.require_label_readout`), and `Choice` itself stops at the Jev
   API limit of 255.
-- `examples` never reaches the wire: `Field(exclude=True)` keeps question dumps and `SystemOneResponse` dumps
-  at the Jev shape.
-- The caller's state turns are preserved verbatim, and they come last — after the question block — so the
-  prefix every call about one rubric shares is the whole prompt except the state. The state is never repeated.
-  A state's own `system`/`developer` turns are folded into the leading system prompt by
-  `prompts.hoist_instructions` — llama.cpp's template raises `System message must be at the beginning.` for
-  one that is not first, and vLLM and SGLang answer `400` with the same words — so the rest of the state is
-  always last and always cacheable.
+- The `examples` field never appears in a dump: `Field(exclude=True)` keeps question dumps and
+  `SystemOneResponse` dumps at the Jev shape. The demonstrations themselves do reach the wire, as the
+  user/assistant turn pair they are rendered into.
+- The caller's state turns are preserved verbatim — except for the hoisting below — and they come last, after
+  the question block, so the prefix every call about one rubric shares is the whole prompt except the state.
+  The state is never repeated. A state's own `system`/`developer` turns are folded into the leading system
+  prompt by `prompts.hoist_instructions` — llama.cpp's template raises `System message must be at the
+  beginning.` for one that is not first, and vLLM and SGLang answer `400` with the same words — so the rest of
+  the state is always last and always cacheable. The one exception to "last": when the state's final turn is an
+  assistant turn, the question block moves after the state so the prompt still ends on the question.
 - The provider client is never closed by jevper. `close()` shuts down the thread pool only, and
   `AsyncSystemOneClient.aclose()` is a no-op.
 - Readouts raise `LabelReadoutError`/`MalformedAnswerError` for recoverable shapes and never guess; the client
@@ -197,7 +206,8 @@ Worth keeping when editing:
   deliver a distribution — it withheld logprobs, or refused the fields outright — is worth one request on the
   other surface, and is then marked so later calls start there; the mark is per model, survives the call, and
   is cleared by a distribution arriving on that surface. The move happens only while the reasoning plan
-  survives it (`native` reasoning exists only on Responses) and never for a provider failure that outlived its
+  survives it — and a native plan is not the Responses surface's alone, since Messages resolves to native
+  when a `budget_tokens` is set — and never for a provider failure that outlived its
   retries, which says nothing about the surface.
 - An empty assistant turn is never sent. Two-step analysis output that is blank falls back to the call's
   reasoning text, and if there is none the answer call goes from the question block straight to the cue.
@@ -207,7 +217,9 @@ Worth keeping when editing:
   rescaled (default) or passed through.
 - `method="auto"` never changes what a pinned method does. It resolves to a concrete method before any spec is
   built, so a provider that returns logprobs sees byte-identical requests whether the method was pinned or
-  resolved, and a pinned `logprobs` call still raises `ProviderError` on a rejection.
+  resolved. What pinning does not do is change the error: a refused logprob request is a `LabelReadoutError`
+  (under `api="auto"`, after the surface move), and only a provider failure that outlived the fallback arrives
+  as a `ProviderError`.
 - Only evidence about the provider is remembered, and a rejection is stronger evidence than a readout. A 4xx
   that *refuses the field* — naming it in the message, `param` or `code` alongside an unsupported/unknown
   signal — is cached per `(model, surface)` at once. A response with no logprobs, or one whose only logprob is
@@ -217,12 +229,13 @@ Worth keeping when editing:
   client. A 4xx that only complains about the value it was sent (a server whose `top_logprobs` cap
   is below the default) and a 5xx that survived the retries are `capability=False` and are *not* cached: the
   question is answered with a logprob-free method, but the next call tries logprobs again.
-- A request field jevper added for capability is dropped, not fatal. A 4xx that refuses structured output, the
-  reasoning parameters, the Responses `include` list, the cache key, the Messages `thinking` field or the
-  Messages `output_config` moves that field one step down its ladder — `json_schema` → `json_object` → nothing,
-  then reasoning, then include, then the key, then thinking, then the Messages schema field — and the same call
-  is re-asked, with the limit remembered per surface and reported in
-  `debug["server_limits"]`, which is derived from the `Limits` dataclass so a new rung cannot be forgotten
+- A request field jevper added for capability is dropped, not fatal. A 4xx that refuses the Responses `include`
+  list, the schema carrier, the reasoning parameters, the cache key, or the Messages `thinking` field moves
+  that field one step down its ladder, in that order: `include` first, then the schema (`json_schema` →
+  `json_object` → nothing on the OpenAI surfaces, `output_config` → nothing on Messages), then reasoning, then
+  the cache key, then thinking. The same call is re-asked, with the limit remembered per `(model, surface)` and
+  reported in `debug["server_limits"]` (or `server_limits_by_api` for a mixed-surface call),
+  which is derived from the `Limits` dataclass so a new rung cannot be forgotten
   there. None of them is needed to answer, so the question is answered instead of failing. The ladder is finite,
   so a server that refuses everything still ends in a `ProviderError`, and a rejection that names the logprob
   fields belongs to the readout fallback instead and never reaches it.
@@ -257,8 +270,9 @@ Worth keeping when editing:
   or a safety filter (`refusal`, `content_filter`) raises `ModelRefusalError`. Both are `ProviderError`
   subclasses and both are terminal, because a correction turn changes the prompt and not the budget the
   provider stopped at or the fact that the model declined or withheld the content. The truncation message names
-  the room that ran out and the knob that opens it — the surface's own field, `max_output_tokens` on the
-  Responses surface and `max_tokens` elsewhere — while a spent context window is told to shorten the state
+  the room that ran out and the knob that opens it — the surface's own field: `max_output_tokens` on the
+  Responses surface, `max_completion_tokens` on Chat Completions with the `max_tokens` a local server takes
+  named beside it, and `max_tokens` on Messages — while a spent context window is told to shorten the state
   rather than to raise `max_tokens`, which would lengthen the request. The readouts keep the reason on the
   errors they raise for an answer that did arrive but could not be read, including the two `parse_json_object`
   paths where the answer contained a `{` but could not be parsed. `CallResult.refusal` carries the model's own
@@ -301,11 +315,12 @@ The suite runs offline. `tests/test_live.py` is skipped unless both `LLM_MODEL` 
 are set, and then runs one `choice` question with `method="structured"` and one with `method="logprobs"`
 against the real endpoint.
 
-`tests/test_provider_surfaces.py` replays what four real servers answered. The bodies in
-`tests/fixtures/providers/` were recorded with raw HTTP from ollama, llama.cpp, vLLM and SGLang serving
-`Qwen3.5-9B` at 4-bit (recipes in `docs/local-servers.md`, and each file's `_meta` says how it was pruned:
-opaque fields removed, long generated text truncated, every field jevper reads left as recorded). Each case is
-served back through a real `openai` client, so the shapes those servers actually send — an empty logprob array,
+`tests/test_provider_surfaces.py` replays what five real servers answered. The bodies in
+`tests/fixtures/providers/` were recorded with raw HTTP from ollama, llama.cpp, vLLM, SGLang and LM Studio
+serving `Qwen3.5-9B` at 4-bit (recipes in `docs/local-servers.md`, and each file's `_meta` says how it was
+pruned: opaque fields removed, long generated text truncated, every field jevper reads left as recorded). Each
+case is served back through the real SDK client for its surface — `anthropic` for the Messages cases, `openai`
+for the other two — so the shapes those servers actually send — an empty logprob array,
 `reasoning` versus `reasoning_content`, `{"detail": "Not Found"}`, a 404 that names the model,
 `status: "incomplete"`, SGLang's bare JSON string errors — stay in front of every change without a GPU. To
 refresh them, capture again and prune the same way; a case whose shape moved is a test that should move with it.

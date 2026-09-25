@@ -3,8 +3,8 @@
 *Independent implementation of the documented System One wire format — not affiliated with TypeSafe.*
 
 `method=` picks how the model is asked to decide, and how its answer is turned back into a distribution. The
-default, `auto`, picks one of the four concrete methods per client, model and surface — `logprobs` where the
-provider returns them, `structured` where it does not (see [auto](#auto)). All four methods share the same
+default, `auto`, selects either `logprobs` or `structured` per client, model and surface; `grammar` and
+`discrete` are explicit choices (see [auto](#auto)). All four methods share the same
 label machinery: options are labelled `A`, `B`, `C`, … in criteria order, and `label_to_key` maps a label back
 to the option key (`Choice`), the zero-based level index (`Score`) or `True`/`False` (`Noul`). Switching
 methods never changes your question or answer types — only the request body and the readout.
@@ -30,8 +30,8 @@ Pick `logprobs` when the provider returns chat logprobs: it is one short call, a
 real distribution rather than a self-report. Pick `structured` when logprobs are unavailable or the provider
 supports strict JSON schema, and `discrete` when you only need the decision and want to skip probabilities.
 `grammar` exists for self-hosted Chat Completions servers that accept a `grammar` field. Leaving `method` at
-`auto` makes that choice for you, at the cost of one extra provider call per question that runs before the
-verdict is known (see [`auto`](#auto) below).
+`auto` normally adds one answer request for a failed logprob attempt before discovery, but transient retries
+and field downgrades can add more; two-step reasoning can add two calls per pass (see [`auto`](#auto) below).
 
 ## `auto`
 
@@ -40,49 +40,55 @@ where it does not, so the same code works against a logprob-capable server, a re
 that never implemented logprobs. The choice is made per (model, surface) by observation and remembered for the
 life of the client.
 
-Three things count as *this provider cannot do logprobs*:
+Four kinds of evidence count as *this provider cannot do logprobs*:
 
 | Evidence | Response |
 | --- | --- |
-| The provider rejects the logprob fields with a 4xx that names them — Gemini's OpenAI-compatibility layer answers `Unknown name "logprobs": Cannot find field.`, a reasoning model behind an OpenAI-shaped gateway answers `logprobs are not supported with reasoning models.` | Under `api="auto"`, ask on the surface that carries the readout — and remember the verdict, so later calls start there |
+| The provider rejects the logprob fields with HTTP 400, 403 or 422 and names them — Gemini's OpenAI-compatibility layer answers `Unknown name "logprobs": Cannot find field.`, while a reasoning model behind an OpenAI-shaped gateway answers `logprobs are not supported with reasoning models.` | Under `api="auto"`, ask on the surface that carries the readout — and remember the verdict, so later calls start there |
 | The provider refuses the `include` entry a Responses request carries them in, without ever writing the word "logprob" — OpenRouter answers `400 Invalid option: expected one of …` for `path: ["include", 0]`, and OpenAI's own wording for a model that offers no includable is `400 Unsupported parameter: 'include' is not supported with this model.` | same. The carrier is per surface: on Chat Completions it is the `logprobs` field, so a message that merely mentions `include` is about something else |
 | The answer carries no logprobs at all (`logprobs: null`, or a compatibility layer that drops the field) | same, once a second response confirms it |
 | The answer token's logprobs carry no alternatives — `top_logprobs` empty, or nothing but the sampled token — so there is no distribution to read | same |
 
-With no surface left to move to — a client that speaks only one, a route already known to be missing, a
-`grammar` request (a Chat Completions convention with no counterpart), or `reasoning="native"` — the readout
-falls back to `structured` and the verdict is remembered. A `method="logprobs"` asked for explicitly moves
-surfaces the same way, because the surface that refuses the readout is not the method the caller chose; it is
-never *swapped* for another readout, though — with nowhere to move it reports the provider's refusal.
+With `method="auto"`, a label readout that has no other usable surface — a client that speaks only one, a route
+already known to be missing, or `reasoning="native"` — answers that question with `structured`. A provider
+refusal is remembered immediately; a weak readout absence is remembered after the second one. `grammar` never
+enters this fallback because it is explicit. Pinned `logprobs` may move to another surface under `api="auto"`,
+but it is never swapped for `structured` and reports the provider failure when no surface is left. Pinned
+`grammar` is never substituted; surface selection and the grammar check determine whether its request is sent.
 
-A server error (5xx) that survives the transient retries also falls back for that question, because a request
-carrying `top_logprobs` is what some OpenAI models fail on; unlike the two rejections above it is *not*
-remembered, so one bad minute does not downgrade a working provider.
+Under `method="auto"`, a 5xx that survives the transient retries answers that question with `structured`, but
+is not remembered as a capability verdict, so the next question tries logprobs again. With a pinned `logprobs`
+method, the same failure reaches the caller as a provider error.
 
-The last two rows are the weak kind of evidence: a truncated answer, a reasoning-only reply or a provider
-hiccup looks exactly like a provider that never implemented logprobs. `auto` therefore answers that question
-with `structured` right away but only stops asking for logprobs once a second response says the same thing —
-and a readable distribution in between resets the count, because it proves the provider can do it.
+Only the last two table rows are weak evidence: they describe a response whose logprobs could not be read. A
+truncated answer is classified before readout and raises `IncompleteAnswerError`. A reasoning-only response
+that is not classified as truncated raises `LabelReadoutError` after its configured corrective retry; neither is
+treated as absent logprobs. `auto` answers a weak absence with `structured` right away but only stops asking
+for logprobs after a second such response. A readable distribution in between resets the count because it
+proves the provider can do it.
 
 Cost and consequences:
 
-- The discovery is paid once per (model, surface) per client — and by every question that is already in
-  flight when the first verdict lands. A four-question call at the default `max_concurrency=8` makes four
-  logprob attempts, not one; `max_concurrency=1` makes exactly one, because a question that has not started
-  yet takes the verdict for free. Every later call goes straight to the resolved method. Under `reasoning`
-  each question that probes pays twice, because the analysis pass is re-run for the new method.
+- At the default `max_concurrency=8`, up to four questions can each make a logprob attempt if they are already
+  in flight when discovery starts; the code does not guarantee exactly four. `max_concurrency=1` makes exactly
+  one logprob attempt because later questions take the verdict. After a field refusal or the second weak
+  absence, later `auto` calls start with the resolved method; the first weak absence answers with `structured`
+  but is not cached. On one surface, a failed two-step label attempt followed by the structured fallback uses
+  four successful responses — analysis, label answer, analysis, structured answer — before allowing for retries
+  and downgrades. Moving surfaces can change that count because it recomputes the reasoning mode.
 - The fallback asks for the model's own probabilities, which are a different quantity from a token
-  distribution. `debug["methods"]` says which method each question used, and
-  `debug["llm_attempts"][*]["readout"]["source"]` says which one produced a given attempt.
+  distribution. `debug["methods"]` says which method each question used, and the successful attempt's
+  `debug["llm_attempts"][-1]["readout"]["source"]` says which readout produced its answer. Failed attempts have
+  no readout source.
 - A `Choice` with more than 26 options is answered in JSON without ever asking for logprobs: one label token
   cannot distinguish `AA` from `A`.
 - The verdict lives on the client instance and is keyed by model and surface: a new client, or an explicit
   `method="logprobs"`, starts over. Passing `method` to `system_one` overrides it for that call.
-- Only a rejection that refuses the *field* is remembered at once; a response-level absence is remembered on the
-  second one (see above). A 4xx that complains about the value it was sent —
-  a server whose `top_logprobs` cap is lower than the default answers `Invalid 'top_logprobs': integer must be
-  between 0 and 5, but got 20.` — still falls back to `structured` for that question, but nothing is cached:
-  the next call tries logprobs again.
+- Only a provider's field-refusal verdict is remembered at once; a response-level absence is remembered on the
+  second one (see above). Under `method="auto"`, a 400, 403 or 422 that complains about the value sent — for
+  example, `Invalid 'top_logprobs': integer must be between 0 and 5, but got 20.` — answers that question
+  with `structured` without caching anything, so the next call tries logprobs again. With pinned `logprobs`,
+  the provider error reaches the caller instead.
 
 Provider support, as of this release — check your provider's docs, since this moves:
 
@@ -120,21 +126,25 @@ flowchart TD
     F -->|"no"| H{"client has chat.completions.create"}
     H -->|"yes"| D
     H -->|"no"| G
-    C -->|"404 that does not name the model"| D
+    C -->|"404 not identified as a model error"| D
 ```
 
 `api="auto"` (the default) prefers the Responses surface because it carries native reasoning and encrypted
 content, except for `grammar`, which only Chat Completions can carry. `messages` — the Anthropic-compatible
-API — is the last choice of all: no server returns logprobs through it, because the field does not exist in
-it, so a client whose only surface is `messages` answers with `structured` and an explicit `logprobs` or
-`grammar` raises `UnsupportedMethodError` before any request is sent. A missing attribute raises
+API — is the last choice. Its normalized responses carry no logprobs, so a client whose only surface is
+`messages` answers `auto` with `structured`; explicit `logprobs` raises `UnsupportedMethodError` before a
+request. An explicit `grammar` request with `api="messages"` raises `UnsupportedMethodError` after that surface
+is selected. With `api="auto"`, a messages-only client has no Chat Completions route, so `grammar` instead
+raises `ClientCapabilityError` during surface selection. A missing attribute likewise raises
 `ClientCapabilityError` naming the surface to pass explicitly.
 
 A client object cannot tell you whether the *server* implements the route: `openai.OpenAI` exposes
-`responses.create` either way, so a server that does not implement it answers 404 for that call. Under `auto`
-that 404 is read as "no Responses surface here" — unless the error names the model, which would fail the same
-way on either surface — and the call is re-issued on `chat_completions` and remembered for the rest of the
-client's life. An explicit `api="responses"` is a decision, not a preference: its 404 reaches you unchanged.
+`responses.create` either way, so a server that does not implement it answers 404 for that call. Under `auto`,
+that 404 is read as a missing route unless the error identifies a model error: it either has a recognized
+model-error code, or names the requested model together with a model-404 marker. An unknown-model code without
+the model id therefore does not switch surfaces. A route 404 is re-issued on `chat_completions` and remembered
+for the client's life. An explicit `api="responses"` is a decision, not a preference: its 404 reaches you
+unchanged.
 
 The remembered verdict only ever *skips* a route, so it moves the call only when the client can speak the
 other surface. A client whose only surface is `messages` stays on it, pays the 404 again, and reports it —
@@ -165,11 +175,12 @@ Request fields per surface:
 | JSON schema | `response_format={"type": "json_schema", "json_schema": {"name": ..., "schema": ..., "strict": true}}` | `text={"format": {"type": "json_schema", "name": ..., "schema": ..., "strict": true}}` |
 | schema fallback (`structured_outputs=False`) | `response_format={"type": "json_object"}` | `text={"format": {"type": "json_object"}}` |
 | grammar | `extra_body={"grammar": "..."}` | not available |
-| reasoning | `reasoning_effort` (only when `effort` is set) | `reasoning={effort, summary, context}` |
+| reasoning | `reasoning_effort` (only when `effort` is set) | `reasoning` with whichever of `effort`, `summary`, and `context` are set |
 
-Neither builder ever sends `max_tokens`, `max_completion_tokens` or `max_output_tokens`: reasoning tokens count
-against those caps, and a small cap silently truncates a reasoning model. Cost is bounded by reading only the
-first answer token. Any other provider field goes through `extra_body`.
+The Chat Completions and Responses builders do not set output-token caps. Label readouts inspect the first
+answer token, while `structured` and `discrete` parse the complete JSON answer. The Messages builder always
+sets the required `max_tokens`. On the two OpenAI surfaces, any other provider field goes through
+`extra_body`.
 
 The Messages surface has no logprobs at all, and it does have a schema field of its own: Anthropic's
 `output_config={"format": {"type": "json_schema", "schema": ...}}`, the counterpart of the two above and
@@ -182,44 +193,49 @@ The schema is also rewritten for Anthropic's documented subset on the way out (n
 `400` there), and the whole field travels in the request body rather than as an SDK keyword, since the
 oldest Anthropic SDK jevper supports has no such parameter.
 
-When a server refuses one of the fields above — `400 response_format is not supported`, the Responses
-`text.format`, the Messages `output_config`, `reasoning_effort`, or the `reasoning.encrypted_content`
-include — jevper treats it the way it treats a surface that cannot carry logprobs: the field is dropped and
-the same call is re-asked, one step down the ladder at a time (`json_schema` → `json_object` → no
-`response_format` at all, then reasoning, then the include), and the limit is remembered for the rest of the
-client's life. None of them is needed to answer — the prompt already asks for one JSON object and the
-readout validates it — so the question is answered instead of failing. The ladder is finite, so a server that
-refuses everything still ends in a `ProviderError`, and `debug["server_limits"]` reports what was learned. A
-field the caller put in `extra_body` is dropped with it: the SDK merges `extra_body` last, so leaving it there
-would re-send the refused field under another name.
+When a server refuses an optional request field, jevper drops it and re-asks, then remembers the limit for the
+rest of the client's life. The order is surface-specific. Responses evaluates the `include` list first: a
+refusal of `reasoning.encrypted_content` drops that entry before the schema and reasoning rungs are considered.
+Chat Completions and Responses use `json_schema` → `json_object` → no format field. Messages has no
+`json_object` rung, so refusing `output_config` drops directly to the prompt-only schema. After the schema rung,
+an unrecognized reasoning field, prompt-cache key or thinking field can be dropped, except when the complaint
+is about the value sent. The prompt already asks for one JSON object and the readout validates it, so a
+question is answered instead of failing. The ladder is finite, so a server that refuses every optional field
+ends in a `ProviderError`, and `debug["server_limits"]` reports what was learned. A caller-owned copy in
+`extra_body` is removed with the learned limit because the SDK merges `extra_body` last.
 
-The `include` list carries two entries on a Responses call that asks for both a label readout and
-reasoning, and a server that refuses only the reasoning one says so: `include[1]: expected one of
-"message.output_text.logprobs"` is a refusal of `reasoning.encrypted_content`, not of the carrier, so jevper
-re-asks without that entry and keeps the method. The list a server prints is read for what it accepts,
-not for the word "logprob" in it — that word is how a server names what it *will* carry.
+The `include` list carries two entries on a Responses call that asks for both a label readout and reasoning.
+For `include[1]: expected one of "message.output_text.logprobs"`, jevper reads the refusal as applying to
+`reasoning.encrypted_content`, disables that entry and re-asks with only the logprob carrier, keeping the
+method. It does not omit the whole `include` field. The accepted values printed by a server are read as the
+list it supports; the word "logprob" in that list is how the server names what it *will* carry.
 
-Two `extra_body` fields interact with jevper's own rather than replacing it, and both are read as the
-caller's configuration rather than as a reason to fail. `logprobs` and `top_logprobs` are two separate
-fields: naming only `logprobs` (any truthy value) still gets the alternatives jevper's label readout needs,
-and `logprobs: false` turns both off together, because `top_logprobs` without `logprobs` is a `400` on
-OpenAI. On the Messages surface a caller's own `thinking` object carries the same rule a
-`ReasoningConfig(budget_tokens=…)` does — the budget must be strictly below `max_tokens` — so jevper sizes
-`max_tokens` above it, leaves the temperature out beside it, and refuses locally when the caller's own
-`max_tokens` cannot hold the budget they named.
+Two `extra_body` fields interact with jevper's own rather than replacing it. `logprobs` and `top_logprobs` are
+separate: naming only a truthy `logprobs` still gets jevper's alternatives when `top_logprobs` is absent.
+With only `logprobs: false`, jevper omits its typed `top_logprobs`, but a caller-supplied `top_logprobs` key
+remains authoritative and is still sent.
 
-A refusal of the *value* is not a refusal of the field, and the difference decides whether the field may be
-dropped at all. `budget_tokens: must be at least 1024`, `Invalid 'top_logprobs': integer must be between 0 and
-5`, `reasoning_effort must be one of low, medium, high` — each names a field the server knows and a number it
-will not take. Dropping the field there would answer the question with the caller's reasoning quietly switched
-off, and remember that as the server's limit for a configuration the caller never repeated, so the provider's
-own error travels back instead and nothing is cached. Only a complaint about the field's *existence* — `Extra
-inputs are not permitted`, `is not supported`, `Cannot find field` — moves the ladder.
+On Messages, an enabled caller `thinking` object with an integer `budget_tokens` gets the same local rule as
+`ReasoningConfig(budget_tokens=…)`: the budget must be strictly below `max_tokens`, so jevper raises when a
+caller-supplied cap is too small. A disabled thinking object has no budget, and a caller-supplied
+`extra_body["temperature"]` remains authoritative. When jevper supplies the thinking block, it currently sends
+`{"type": "enabled", "budget_tokens": N}`. Anthropic now marks manual budgets deprecated on Claude 4.6 and
+rejects them on 4.7+, where `{"type": "adaptive"}` with `output_config.effort` is supported; the 1024 minimum
+and strict `max_tokens` ceiling still apply where manual mode is available.
+
+A refusal of a value is not automatically a refusal of the field. `budget_tokens: must be at least 1024`,
+`Invalid 'top_logprobs': integer must be between 0 and 5`, and `reasoning_effort must be one of low, medium,
+high` identify fields the server knows, so reasoning, cache-key and thinking downgrades are suppressed and the
+provider error travels back without a learned limit. Schema refusals are different: a complaint that reaches
+the schema markers advances the schema ladder even when it concerns the schema's contents. Other capability
+fields advance only when their field markers and the relevant capability evidence match.
 
 ## `logprobs`
 
-Request: the label prompt plus `logprobs=true` and `top_logprobs` (default 20, the provider maximum; `0` is
-allowed). On the Responses surface the logprobs arrive through `include=["message.output_text.logprobs"]`.
+Request: the label prompt plus `logprobs=true` and `top_logprobs` (default 20). The constructor accepts `0`, but
+pinned `logprobs` and `grammar` require at least 2 and reject smaller values before a request. `auto` can send
+`0`; if the provider returns no usable alternatives, it falls back to `structured`. Responses carries the
+readout in `include=["message.output_text.logprobs"]`.
 
 Readout:
 
@@ -286,13 +302,9 @@ reads on `/v1/chat/completions`. Readout is the `logprobs` readout, unchanged.
 
 Constraints:
 
-- Chat Completions only. `grammar` with `api="responses"` raises `UnsupportedMethodError` before any request is
-  sent:
-
-  ```
-  grammar requires a Chat Completions surface that accepts a `grammar` field (llama-cpp-python and
-  similar servers); pass api='chat_completions'
-  ```
+- Chat Completions only. With `api="responses"` or `api="messages"`, the selected non-Chat surface reaches the
+  grammar check and raises `UnsupportedMethodError` before a request. With `api="auto"`, surface selection
+  requires `chat.completions.create`; a messages-only client therefore raises `ClientCapabilityError` instead.
 - The server must still return logprobs; if it does not, the readout raises `LabelReadoutError` suggesting
   `method="discrete"`, which skips probabilities, and no corrective retry is spent — another turn cannot change
   what the provider reports.
@@ -324,16 +336,16 @@ uses the level indexes `"0"`, `"1"`, … as keys.
 
 Readout:
 
-1. Parse the answer as JSON: `json.loads`, falling back to decoding from the first `{` when the model wrapped
-   the object in prose or fences. A non-object raises `MalformedAnswerError`.
+1. Parse the answer with `json.loads`. If that fails, scan each `{`-delimited candidate in order until one
+   decodes, so prose braces and fences can be skipped; a second decodable object is rejected as contradictory.
 2. The object must carry exactly the one field this method asks for — `probabilities`, or `noul` for a
    `Noul` question. `choice` then requires exactly the option keys, each a finite number `>= 0`; `noul`
    requires `noul` in `[0, 1]` and expands to `{True: v, False: 1 − v}`; `score` requires exactly the level
    keys. A missing or extra key, a wrong key set, booleans, `NaN` and negatives are malformed — an object
    that answers twice (`{"probabilities": …, "choice": "technical"}`) is a model contradicting itself, and
-   reading the field jevper happened to pick would report one of the two as the answer. The message names the
-   keys, never the values, so a body padded with a megabyte of its own text cannot put that megabyte into
-   every error and retry reason.
+   reading the field jevper happened to pick would report one of the two as the answer. Key-set errors include
+   bounded key names; numeric-validation errors also include the invalid value. This keeps a body padded with
+   provider text from copying an unbounded payload into every error and retry reason.
 3. Normalization (not part of the readout): when `abs(sum − 1) > 1e-6` and `normalize_probabilities=True` (the
    default), the distribution is rescaled to sum 1 and both the error and the model's original numbers are
    recorded in `debug["probability_errors"]` and `debug["original_probabilities"]`. A zero total becomes
@@ -346,11 +358,11 @@ Readout:
    read off an unnormalized distribution leaves the `0..N-1` line the Jev answer schema documents, and
    this is the arithmetic the reference adapter uses.
 
-`structured_outputs=False` keeps the schema in the prompt but sends `{"type": "json_object"}` instead of a
-strict schema — the documented workaround when a provider rejects `response_format`. It is also automatic: a
-server that refuses the strict schema is re-asked once with `json_object`, and a server that refuses that too is
-answered with the schema in the prompt alone (see the request table above). The answer is still validated
-client-side, so an unusable shape raises `MalformedAnswerError` after the corrective retry.
+`structured_outputs=False` keeps the schema in the prompt but sends `{"type": "json_object"}` on Chat
+Completions and Responses. With strict outputs enabled, a server refusing the strict schema is re-asked with
+`json_object`; a server refusing that too is answered with the prompt-only schema. Messages has no
+`json_object` rung: refusing strict `output_config` drops directly to the prompt-only schema. The answer is
+validated client-side, so an unusable shape raises `MalformedAnswerError` after the corrective retry.
 
 `temperature=0.0` is worth setting here (and for `discrete`): the answer is a single sampled JSON object, so
 sampling noise moves the probabilities directly.
@@ -384,15 +396,16 @@ maximal confidence under both formulas. `noul` answers carry no confidence.
 
 ## Reading failures
 
-`LabelReadoutError` and `MalformedAnswerError` are recoverable: the client appends a correction turn — for
-labels, `Your previous reply was invalid: {reason}. Reply with exactly one of these labels and nothing else:
-A, B, C.`; for JSON, `Your previous reply was invalid: {reason}. Return only a JSON object matching the
-schema.` — and re-issues the answer call up to `n_retry_malformed` times (default 1). Reasons are recorded in
-`debug["retry_reasons"]`, and each retry is a provider call, so it counts towards `usage.n_calls`.
+`MalformedAnswerError` and model-answer `LabelReadoutError` are recoverable: the client appends a correction
+turn and re-issues the answer call up to `n_retry_malformed` times (default 1). The correction asks for exactly
+one of the labels or for only a JSON object matching the schema. Reasons are recorded in
+`debug["retry_reasons"]`. `usage.n_calls` counts every successful provider response, including a response that
+later fails readout and a successful corrective retry; a failed provider attempt appears in
+`debug["llm_attempts"]` but does not increment `n_calls`.
 
-A `LabelReadoutError` that says the provider cannot report logprobs — no logprobs at all, or no alternatives
-for the answer token — is not corrected, because another turn cannot change what the provider returns;
-`method="auto"` answers those questions with `structured` instead.
+A provider-unavailable `LabelReadoutError` — no logprobs at all or no alternatives for the answer token — is not
+corrected, because another turn cannot change what the provider returns. `method="auto"` answers those
+questions with `structured`; pinned `logprobs` or `grammar` reports the error.
 
 When there is no answer to read at all, the message says why, because the parse error alone sends a caller
 looking for a bug that is not there:
@@ -402,10 +415,10 @@ looking for a bug that is not there:
   with `incomplete_details.reason: "max_output_tokens"` (or the `"max_tokens"` spelling OpenAI's own
   streaming example uses) — and all of them reach the caller as *the provider ran out of output tokens
   before the answer was complete*, with the field to raise on **that** surface: `max_output_tokens` for
-  the Responses surface, which refuses a `max_tokens` it does not know, and `max_tokens` on Chat
-  Completions and the Messages API. This holds however the answer was cut off: mid-object, or with no `{`
-  at all. The Messages API's other reason, `model_context_window_exceeded`, is the same failure with the
-  opposite remedy — the request is already too long to answer in — so it arrives as *the provider's
+  Responses, `max_completion_tokens` for Chat Completions (with `max_tokens` named as the local-server
+  alternative), and `max_tokens` for Messages. This holds however the answer was cut off: mid-object, or with
+  no `{` at all. The Messages API's other reason, `model_context_window_exceeded`, is the same failure with
+  the opposite remedy — the request is already too long to answer in — so it arrives as *the provider's
   context window ran out*, naming the state and the examples as what to shorten. A stop reason that is
   not one the surface documents — or not a string at all — is reported the same way rather than read.
 - **The model refused, or the content was filtered.** Each surface puts a refusal in its own place, and
