@@ -219,6 +219,7 @@ _FOREIGN_NAMES = frozenset(
         "RemoteProtocolError",
         "TimeoutException",
         "TransportError",
+        "TypeSafeError",
         "URLError",
         "WriteError",
         "WriteTimeout",

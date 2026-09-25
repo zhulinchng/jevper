@@ -83,4 +83,5 @@ nav:
       - API: api.md
       - Internals: internals.md
       - Glossary: glossary.md
+      - Jev comparison: jev-comparison.md
   - Contributing: contributing.md
