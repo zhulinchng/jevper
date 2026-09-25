@@ -1,5 +1,9 @@
 # jevper
 
+> `jevper` is an independent implementation of the documented System One wire format. It is not affiliated
+> with, endorsed by, or supported by TypeSafe AI — questions about the API itself belong in
+> [their docs](https://docs.typesafe.ai).
+
 The [Jev](https://docs.typesafe.ai) interface — `state` in, typed `questions` (`noul`, `choice`, `score`) out,
 answers carrying probabilities and confidence — on top of any OpenAI-compatible model.
 
@@ -14,10 +18,6 @@ The `responses` surface speaks both OpenAI's Responses API and the [OpenResponse
 specification served at the same `/v1/responses` path — LM Studio (0.3.39+), llama.cpp, vLLM and SGLang all
 implement it, and what each one does with the fields jevper sends is measured in
 [docs/local-servers.md](docs/local-servers.md).
-
-> `jevper` is an independent implementation of the documented System One wire format. It is not affiliated
-> with, endorsed by, or supported by TypeSafe AI — questions about the API itself belong in
-> [their docs](https://docs.typesafe.ai).
 
 ```python
 from openai import OpenAI
