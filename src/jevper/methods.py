@@ -266,21 +266,27 @@ the error says so instead of reporting a generation that stopped early."""
 def _truncation_message(stop: str, surface: str) -> str:
     """The error text for a generation that ran out of room, naming the room and the knob that opens it.
 
-    The output-budget field is the surface's own, because they do not share a name: Chat Completions
-    and the Messages API call it ``max_tokens`` (OpenAI's current name for the first is
-    ``max_completion_tokens``), while the Responses surface calls it ``max_output_tokens`` and
-    refuses a ``max_tokens`` it does not know. Advice naming the wrong field is advice that cannot be
-    followed.
+    The output-budget field is the surface's own, because they do not share a name. Advice naming
+    the wrong field is advice that cannot be followed, and the names have moved: OpenAI's Chat
+    Completions route now takes ``max_completion_tokens`` (and refuses ``max_tokens`` for its
+    reasoning models), while most local servers still take only ``max_tokens`` — so the chat advice
+    names both, and the Responses and Messages names are the only ones there is.
     """
     if stop in _CONTEXT_STOPS:
         return (
             f"the provider's context window ran out before the answer was complete ({stop!r}); "
             f"shorten the state or the examples, or use a model with a larger context"
         )
-    knob = "max_output_tokens" if surface == "responses" else "max_tokens"
+    knob, alternative = {
+        "responses": ("max_output_tokens", ""),
+        "chat_completions": (
+            "max_completion_tokens",
+            " (or 'max_tokens', which is what most local servers take)",
+        ),
+    }.get(surface, ("max_tokens", ""))
     return (
         f"the provider ran out of output tokens before the answer was complete ({stop!r}); "
-        f"raise the limit, for example extra_body={{{knob!r}: 2048}}"
+        f"raise the limit, for example extra_body={{{knob!r}: 2048}}{alternative}"
     )
 
 

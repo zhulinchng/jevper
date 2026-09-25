@@ -52,6 +52,9 @@ none, so the probabilities above arrive as JSON. Point `method="logprobs"` at a 
 them — a local ollama, llama.cpp or vLLM server, or a non-reasoning OpenAI model — to read the model's
 real distribution instead of its self-report.
 
+Every public option in one runnable program — the output budget per surface, async, and a client
+that is not an SDK — is in the [complete example](docs/complete-example.md).
+
 ## Install
 
 ```sh
@@ -360,10 +363,11 @@ uv pip install -e '.[test,mlflow]' && pytest -q tests/test_mlflow.py
 
 ## Docs
 
-Read the [jevper documentation site](https://zhulinchng.github.io/jevper/) for the quick start, method and
-surface selection, public API reference, local-server compatibility, reasoning, few-shot examples, internals,
-and MLflow integration. Contributors can edit the Markdown under [`docs/`](docs/) and run
-`uv run --extra docs mkdocs build --strict`.
+Read the [jevper documentation site](https://zhulinchng.github.io/jevper/) for the quick start, a
+[complete example](https://zhulinchng.github.io/jevper/complete-example/) that sets every public option,
+method and surface selection, public API reference, local-server compatibility, reasoning, few-shot
+examples, troubleshooting, internals, and MLflow integration. Contributors can edit the Markdown under
+[`docs/`](docs/) and run `uv run --extra docs mkdocs build --strict`.
 
 ## License
 

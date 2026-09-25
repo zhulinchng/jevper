@@ -463,7 +463,6 @@ def test_a_long_run_that_hits_the_budget_says_so(stub_server):
     assert "ran out of output tokens" in message
     assert "'length'" in message
 
-
 @pytest.mark.parametrize("server", SERVERS)
 def test_a_recorded_cache_hit_is_read(server):
     """The same prompt twice, and whatever the server said about reuse.

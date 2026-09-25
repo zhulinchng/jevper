@@ -63,12 +63,14 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting started: getting-started.md
+  - Complete example: complete-example.md
   - Guides:
       - Methods: methods.md
       - Reasoning: reasoning.md
       - Few-shot examples: few-shot.md
       - Local servers: local-servers.md
       - MLflow: mlflow.md
+      - Troubleshooting: troubleshooting.md
   - Reference:
       - API: api.md
       - Internals: internals.md

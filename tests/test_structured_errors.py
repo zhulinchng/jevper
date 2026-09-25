@@ -380,18 +380,23 @@ def test_a_responses_incomplete_reason_of_content_filter_is_a_refusal(stub_serve
 
 
 @pytest.mark.parametrize(
-    ("surface", "reason", "knob"),
+    ("surface", "reason", "knob", "beside"),
     [
-        ("chat_completions", "length", "max_tokens"),
-        ("messages", "max_tokens", "max_tokens"),
-        ("responses", "max_output_tokens", "max_output_tokens"),
+        ("chat_completions", "length", "max_completion_tokens", "max_tokens"),
+        ("messages", "max_tokens", "max_tokens", None),
+        ("responses", "max_output_tokens", "max_output_tokens", None),
     ],
 )
-def test_a_truncation_error_names_the_surfaces_own_budget_field(stub_server, surface, reason, knob):
+def test_a_truncation_error_names_the_surfaces_own_budget_field(
+    stub_server, surface, reason, knob, beside
+):
     """The three surfaces do not share a name for the output budget, and the advice has to follow.
 
     The Responses surface calls it ``max_output_tokens`` and refuses a ``max_tokens`` it does not
-    know, so advice that names the Chat spelling is advice the caller cannot act on.
+    know, so advice that names the Chat spelling is advice the caller cannot act on. On Chat the
+    name has itself moved — OpenAI's route now takes ``max_completion_tokens`` and refuses
+    ``max_tokens`` for its reasoning models — while most local servers still take only
+    ``max_tokens``, so that spelling is named beside it.
     """
     if surface == "chat_completions":
         stub = StubServer(chat=lambda _: (200, chat_body(content="", finish_reason=reason), {}))
@@ -411,7 +416,12 @@ def test_a_truncation_error_names_the_surfaces_own_budget_field(stub_server, sur
     with pytest.raises(IncompleteAnswerError) as raised:
         client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
 
-    assert f"extra_body={{{knob!r}: 2048}}" in str(raised.value)
+    message = str(raised.value)
+    assert f"extra_body={{{knob!r}: 2048}}" in message
+    if beside is None:
+        assert f"'{knob}'" in message and message.count("extra_body=") == 1
+    else:
+        assert f"'{beside}'" in message
 
 
 # --- an example's own distribution -----------------------------------------------------------------

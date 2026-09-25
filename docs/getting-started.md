@@ -115,7 +115,11 @@ sequenceDiagram
 
 ## Next steps
 
+- Read the [complete example](complete-example.md) when you want every public option in one program —
+  the output budget per surface, which option reaches which surface, async, and a client that is not
+  an SDK.
 - Read [Methods](methods.md) to choose a concrete method and understand surface selection.
 - Read [Local servers](local-servers.md) for Ollama, llama.cpp, vLLM, SGLang, and LM Studio settings.
+- Read [Troubleshooting](troubleshooting.md) when a call fails or an answer comes back unusable.
 - Read [API reference](api.md) for signatures, limits, errors, and response fields.
 - Add [Reasoning](reasoning.md) or [Few-shot examples](few-shot.md) when the task needs them.
