@@ -162,9 +162,16 @@ def check_answer(answer: Any, question: Mapping[str, Any], *, normalized: bool =
             check(_finite(value), f"probability for level {level} is not finite: {value!r}")
             if normalized:
                 check(0.0 <= value <= 1.0, f"probability for level {level} outside [0, 1]: {value!r}")
-        total = math.fsum(float(value) for value in answer.probabilities.values())
-        check(total > 0.0, "score distribution sums to zero")
-        expected = math.fsum(level * float(value) for level, value in answer.probabilities.items()) / total
+        # The score is read off the distribution rescaled to sum 1, and a zero total falls back to
+        # uniform — which is what the library documents and what a model answering all zeros gets.
+        # So the expectation is checked over the normalized distribution, not the raw one.
+        weights = [float(value) for value in answer.probabilities.values()]
+        total = math.fsum(weights)
+        if total == 0.0:
+            weights = [1.0 / len(weights)] * len(weights)
+        else:
+            weights = [weight / total for weight in weights]
+        expected = math.fsum(level * weight for level, weight in enumerate(weights))
         check(
             abs(answer.score - expected) <= 1e-6,
             f"score {answer.score!r} is not the expectation over the distribution ({expected!r})",

@@ -376,20 +376,42 @@ def prompt_cache_key_72(ctx: Ctx) -> dict[str, Any]:
 
 def structured_outputs_off(ctx: Ctx) -> dict[str, Any]:
     """``structured_outputs=False`` puts the schema in the prompt and a plain JSON object in the
-    request — a `json_object` format on the OpenAI surfaces, and nothing on Responses, which has no
-    such fallback beyond the prompt."""
+    request — a `json_object` format on Chat Completions, and nothing on Responses, which has no
+    such fallback beyond the prompt.
+
+    Every question is its own provider call with its own attempt record, so the check reads them
+    all: no attempt may carry a json_schema, and the schema has to be somewhere in the prompts.
+    """
     service = ctx.service(questions=PLAIN, structured_outputs=False)
     response = service.classify(dict(tickets.SHORT_TICKET), method="structured")
     check_response(response, as_specs(PLAIN), model=ctx.profile.model)
-    request = response.debug["llm_attempts"][-1]["request"]
-    sent = request.get("response_format") or (request.get("text") or {}).get("format")
-    check(
-        not (isinstance(sent, dict) and sent.get("type") == "json_schema"),
-        f"a json_schema was sent although structured output was turned off: {sent!r}",
-    )
-    prompt = prompt_text(response)
-    check("probabilities" in prompt, "the schema is neither in the request nor in the prompt")
-    return {"format": sent, "schema_in_prompt": True}
+    attempts = response.debug.get("llm_attempts") or []
+    formats = []
+    for attempt in attempts:
+        request = attempt.get("request") or {}
+        sent = request.get("response_format") or (request.get("text") or {}).get("format")
+        formats.append(sent)
+        check(
+            not (isinstance(sent, dict) and sent.get("type") == "json_schema"),
+            f"a json_schema was sent although structured output was turned off: {sent!r}",
+        )
+    prompts = "\n".join(_attempt_prompt(attempt) for attempt in attempts)
+    check("probabilities" in prompts, "the schema is neither in the request nor in the prompt")
+    return {"format": formats[0] if formats else None, "schema_in_prompt": True}
+
+
+def _attempt_prompt(attempt: Mapping[str, Any]) -> str:
+    request = attempt.get("request") or {}
+    chunks: list[str] = []
+    for message in list(request.get("messages") or []) + list(request.get("input") or []):
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if isinstance(content, str):
+            chunks.append(content)
+        elif isinstance(content, list):
+            chunks.extend(
+                part.get("text", "") for part in content if isinstance(part, Mapping)
+            )
+    return "\n".join(chunks)
 
 
 def normalize_off(ctx: Ctx) -> dict[str, Any]:
@@ -481,11 +503,42 @@ def stream_zero(ctx: Ctx) -> dict[str, Any]:
 # --------------------------------------------------------------------------------------
 
 
+REASONING_QUESTION = {
+    "intent": Choice(
+        instructions="Pick the intent of the support ticket.",
+        criteria={"billing": "money and invoices", "technical": "errors and crashes", "other": "anything else"},
+    )
+}
+"""One question, so a reasoning scenario costs two provider calls rather than six and the budget
+is spent on thinking rather than on repetition."""
+
+THINKING_BUDGET = 4096
+"""The thinking budget the Messages scenario asks for: a trace that finishes, with the answer after
+it. A budget the trace overruns is testing truncation, which ``tiny-output-budget`` already covers —
+so the servers this runs against are started with a context wide enough to hold it."""
+
+ANALYSIS_BUDGET = 2048
+"""The same for the analysis pass on the two OpenAI surfaces, which is thinking by another name."""
+
+
+def _output_budget(budget: int) -> dict[str, int]:
+    """An output budget that holds ``budget`` thinking tokens and an answer after them."""
+    return {"max_tokens": budget + 1024}
+
+
 def reasoning_two_step(ctx: Ctx) -> dict[str, Any]:
-    """Chat Completions has no native reasoning, so jevper analyses and then answers."""
-    service = ctx.service(questions=PLAIN, reasoning=ReasoningConfig(effort="low", mode="two_step"))
+    """Chat Completions has no native reasoning, so jevper analyses and then answers.
+
+    The analysis pass is a generation like any other, so it gets an output budget of its own —
+    without one, a server's default decides whether the analysis fits or is cut off mid-sentence.
+    """
+    service = ctx.service(
+        questions=REASONING_QUESTION,
+        reasoning=ReasoningConfig(effort="low", mode="two_step"),
+        extra_body=_output_budget(ANALYSIS_BUDGET),
+    )
     response = service.classify(dict(tickets.SHORT_TICKET), method="structured")
-    check_response(response, as_specs(PLAIN), model=ctx.profile.model, min_calls=2)
+    check_response(response, as_specs(REASONING_QUESTION), model=ctx.profile.model, min_calls=2)
     check(
         response.debug.get("reasoning_mode") == "two_step",
         f"reasoning_mode is {response.debug.get('reasoning_mode')!r}",
@@ -498,39 +551,66 @@ def reasoning_two_step(ctx: Ctx) -> dict[str, Any]:
 
 
 def reasoning_native(ctx: Ctx) -> dict[str, Any]:
-    service = ctx.service(questions=PLAIN, reasoning=ReasoningConfig(effort="none", mode="native"))
+    """Native reasoning on the Responses surface, asked for with a real effort.
+
+    A profile that turns thinking off does so with the caller's own field, and that field wins —
+    so the scenario names the effort it wants to be tested with, and the request is checked to
+    carry it. What the server then does with it (a trace, a refusal, nothing) is recorded.
+    """
+    service = ctx.service(
+        questions=REASONING_QUESTION,
+        reasoning=ReasoningConfig(effort="low", mode="native"),
+        extra_body={"reasoning": {"effort": "low"}, **_output_budget(ANALYSIS_BUDGET)},
+    )
     response = service.classify(dict(tickets.SHORT_TICKET), method="structured")
-    check_response(response, as_specs(PLAIN), model=ctx.profile.model)
+    check_response(response, as_specs(REASONING_QUESTION), model=ctx.profile.model)
     check(
         response.debug.get("reasoning_mode") == "native",
         f"reasoning_mode is {response.debug.get('reasoning_mode')!r}",
     )
+    request = response.debug["llm_attempts"][-1]["request"]
+    body = request.get("extra_body") or {}
+    asked = request.get("reasoning") or body.get("reasoning") or {}
+    check(asked.get("effort") == "low", f"the request carries reasoning {asked!r}, not effort 'low'")
     return {
         "reasoning_mode": response.debug.get("reasoning_mode"),
+        "effort": asked.get("effort"),
         "parts": [part.type for part in response.reasoning],
+        "reasoning_chars": len(reasoning_text(response.reasoning)),
     }
 
 
 def reasoning_thinking_budget(ctx: Ctx) -> dict[str, Any]:
     """The Messages surface's own thinking: asked for with a budget, not an effort name.
 
-    The budget has to sit below the output budget, and the profile's budget is the output one — so
-    the call names a larger ceiling here, which is exactly the arithmetic the library refuses
-    locally when a caller's own numbers do not fit.
+    The budget has to sit below the output budget and be large enough for the trace to finish,
+    so the ceiling here is the budget plus room for the answer. A budget the trace overruns would
+    be testing truncation, which ``tiny-output-budget`` already covers.
     """
-    budget = 1024
     service = ctx.service(
-        questions=PLAIN,
-        reasoning=ReasoningConfig(budget_tokens=budget),
-        extra_body={"max_tokens": ctx.profile.messages_max_tokens + 2048},
+        questions=REASONING_QUESTION,
+        reasoning=ReasoningConfig(budget_tokens=THINKING_BUDGET),
+        extra_body=_output_budget(THINKING_BUDGET),
     )
     response = service.classify(dict(tickets.SHORT_TICKET), method="structured")
-    check_response(response, as_specs(PLAIN), model=ctx.profile.model)
-    body = response.debug["llm_attempts"][-1]["request"].get("extra_body") or {}
-    check((body.get("thinking") or {}).get("budget_tokens") == 1024, f"thinking on the wire is {body.get('thinking')!r}")
+    check_response(response, as_specs(REASONING_QUESTION), model=ctx.profile.model)
+    request = response.debug["llm_attempts"][-1]["request"]
+    body = request.get("extra_body") or {}
+    # The Messages SDK has a typed `thinking` parameter, so it travels as one; `max_tokens` is
+    # typed too, and the caller's own value is merged into the body.
+    thinking = request.get("thinking") or body.get("thinking")
+    check(
+        (thinking or {}).get("budget_tokens") == THINKING_BUDGET,
+        f"thinking on the wire is {thinking!r}",
+    )
+    max_tokens = request.get("max_tokens") or body.get("max_tokens")
+    check(
+        isinstance(max_tokens, int) and max_tokens > THINKING_BUDGET,
+        f"the output budget {max_tokens!r} leaves no room for the answer after a {THINKING_BUDGET}-token trace",
+    )
     return {
-        "thinking": body.get("thinking"),
-        "max_tokens": body.get("max_tokens"),
+        "thinking": thinking,
+        "max_tokens": max_tokens,
         "reasoning_chars": len(reasoning_text(response.reasoning)),
     }
 
@@ -750,6 +830,19 @@ def _attempt(scenario: Scenario, ctx: Ctx, api: str, method: str) -> dict[str, A
         name = type(exc).__name__
         if _is_unreachable(exc):
             record.update(status="unreachable", error=f"{name}: {exc}")
+        elif (
+            ctx.api == "messages"
+            and ctx.profile.messages_thinks
+            and _allowed(exc, ("IncompleteAnswerError",))
+        ):
+            # This server's Messages route runs a thinking model the OpenAI-style knob does not
+            # reach, so the trace is paid for out of the output budget: a long prompt can spend all
+            # of it before the answer starts. What the caller is told is a spent budget and the
+            # knob that opens it, which is exactly what happened.
+            record.update(
+                status="documented",
+                error=f"{name}: {ctx.profile.name} spends the output budget on the thinking trace",
+            )
         elif (
             ctx.api == "responses"
             and method in ("structured", "discrete")

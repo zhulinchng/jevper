@@ -40,6 +40,11 @@ class ServerProfile:
     reads the field and LM Studio accepts and ignores it, so a JSON-schema answer there comes back
     in whatever shape the prompt implies — a server limit the service routes around with
     ``api="chat_completions"``, not a library failure."""
+    messages_thinks: bool = False
+    """Whether the server's Messages route runs a thinking model that ignores the OpenAI-style
+    thinking-off field. Where it does, the trace is paid for out of the output budget and a long
+    prompt can spend all of it before the answer starts — reported as a spent budget, which is
+    what happened, with the knob that opens it named."""
     notes: str = ""
 
     def body_for(self, api: str) -> dict[str, Any]:
@@ -59,9 +64,11 @@ PROFILES: dict[str, ServerProfile] = {
         model="qwen3.5:9b",
         extra_body={"reasoning_effort": "none"},
         responses_extra_body={"reasoning": {"effort": "none"}},
-        messages_max_tokens=4096,
+        messages_max_tokens=2048,
+        messages_thinks=True,
         notes="Chat Completions carries logprobs; the Responses route returns an empty logprob list. "
-        "The Messages route runs a thinking model, so its budget has to hold the trace and the answer.",
+        "The Messages route runs a thinking model that ignores reasoning_effort, so its trace is paid "
+        "for out of the output budget.",
     ),
     "llamacpp": ServerProfile(
         name="llamacpp",
@@ -84,9 +91,9 @@ PROFILES: dict[str, ServerProfile] = {
         base_url="http://127.0.0.1:30000/v1",
         model="qwen3.5-9b",
         extra_body=dict(_CHAT_TEMPLATE_OFF),
-        messages_max_tokens=4096,
-        notes="Its Responses route needs top_logprobs sent explicitly; the Messages route needs an "
-        "output budget above the thinking trace.",
+        messages_thinks=True,
+        notes="Its Responses route needs top_logprobs sent explicitly; with a reasoning parser its "
+        "Messages route runs the trace into the output budget, and its context is 4096.",
     ),
     "lmstudio": ServerProfile(
         name="lmstudio",

@@ -6,6 +6,11 @@ than by the library: **which surface carries logprobs**, **how thinking is turne
 fields the server quietly ignores**. This page is the short version, checked against ollama 0.34, llama.cpp
 b11139, vLLM 0.30 and SGLang 0.5.20 serving `Qwen3.5-9B` at 4-bit on one 12 GB card.
 
+Every number here is measured, and it was measured by a consumer project that ships in this
+repository: `examples/incident-triage` — a support-ticket triage service that installs jevper as a
+dependency, whose `sweep` command runs 38 scenarios per server across all three surfaces. The
+tables below are what it measured.
+
 ```python
 from openai import OpenAI
 from jevper import Choice, SystemOneClient
