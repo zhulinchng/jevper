@@ -122,6 +122,11 @@ Unknown fields are accepted and dropped by all five, so a field that does not ap
   (#2413), so the two OpenAI surfaces disagree about it; `/v1/responses` also ignores `instructions` (#1154).
   The Messages route returns Anthropic-shaped `thinking` blocks when asked with an explicit
   `budget_tokens` (1542 characters of it here), and reports `cache_read_input_tokens`.
+- `top_logprobs: 20` — the documented maximum — is taken by all five and answered with twenty
+  alternatives for the answer token, so a label readout does not have to settle for five. `n: 2` is a
+  different story: vLLM and SGLang return two choices, ollama and LM Studio accept the field and answer
+  once, and llama.cpp refuses it outright when it is serving a single slot (`400 n must be between 1 <=
+  value <= 1`), which the recipe above does.
 
 ## What each server actually answers
 
@@ -136,8 +141,9 @@ tolerate, and the fixture tests replay them on every change.
 | logprobs on Chat Completions | yes | yes | yes | yes |
 | logprobs on Responses | **empty list** | **`400`** | yes, with `include` | yes, with `top_logprobs` |
 | `top_logprobs` above 20 | `400` (`must be between 0 and 20`) | accepted | `400` | accepted |
+| `top_logprobs: 20` | 20 alternatives | 20 alternatives | 20 alternatives | 20 alternatives |
 | unknown model id | `404` naming it | ignored, `200` | `404` naming it | Chat ignored, Responses `404` |
-| `n: 2` | accepted, one choice back | `400` | accepted, two choices | accepted, two choices |
+| `n: 2` | accepted, one choice back | `400` (`n` must be 1 — the recipe serves one slot) | accepted, two choices | accepted, two choices |
 | `developer` role | accepted | accepted | accepted | **`400`** |
 | `output_config` on `/v1/messages` | accepted; the trace spends the budget, so nothing returns to enforce | accepted, ignored | **enforced**, invalid `format.type` a `400` | accepted; the trace spends the budget, so nothing returns to enforce |
 | unknown request field | ignored | ignored | ignored | ignored |
