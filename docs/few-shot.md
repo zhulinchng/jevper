@@ -13,10 +13,11 @@ Example(state="Charged twice for one order", answer="billing")
 Example(state="Login fails after reset", answer="technical", probabilities={"billing": 0.05, "technical": 0.9})
 ```
 
-`answer` accepts a label (`"B"`, case-insensitive; two letters such as `"AB"` past 26 options), a `Choice`
-criteria key, a `Score` level index, or a bool for `Noul`. An exact criteria key wins over a label spelled the
-same way, so `answer="a"` with criteria `{"b": ..., "a": ...}` demonstrates the option keyed `a` rather than the
-first label. `probabilities` is rendered only by `method="structured"` — no other answer shape carries a
+`answer` accepts a label (`"B"`, case-insensitive over ASCII — `a` is label `A`, while `ı` and `ſ` are letters
+of their own and are not labels; two letters such as `"AB"` past 26 options), a `Choice` criteria key, a `Score`
+level index, or a bool for `Noul`. An exact criteria key wins over a label spelled the same way, so
+`answer="a"` with criteria `{"b": ..., "a": ...}` demonstrates the option keyed `a` rather than the first
+label, and a non-ASCII key is matched exactly rather than case-folded. `probabilities` is rendered only by `method="structured"` — no other answer shape carries a
 distribution — but it is validated for every method, before any provider call: the keys must be exactly the
 question's, every weight must be non-negative, and a `Noul` weight must be within `[0, 1]`.
 

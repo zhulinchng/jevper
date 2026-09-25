@@ -10,3 +10,4 @@ build/
 mlruns/
 mlflow.db
 *.sqlite
+site/

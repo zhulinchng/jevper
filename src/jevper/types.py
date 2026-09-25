@@ -135,11 +135,15 @@ def ensure_encodable(value: Any, *, where: str, error: type[JevperError] = Jevpe
     same error before a request is even built. Both are local mistakes, so they are reported as
     local ones, with the field named and nothing sent.
 
-    The walk keeps its own stack instead of recursing: a caller can hand over a structure nested
+    The walk keeps its own stack instead of recursing — a caller can hand over a structure nested
     deeper than the interpreter's recursion limit, and a ``RecursionError`` from a local validation
-    pass is the one failure this function exists to prevent.
+    pass is the one failure this function exists to prevent — and it remembers the containers it has
+    entered. A structure that contains itself has no finite encoding either, and following it would
+    never end: it is refused here, with the field named, rather than left to the serializer or to the
+    recursion limit.
     """
     pending: list[Any] = [value]
+    entered: set[int] = set()
     while pending:
         item = pending.pop()
         if isinstance(item, str):
@@ -150,11 +154,18 @@ def ensure_encodable(value: Any, *, where: str, error: type[JevperError] = Jevpe
                     f"{where} contains a character that cannot be encoded as UTF-8 ({exc.reason} at "
                     f"position {exc.start}); replace it before handing it to jevper"
                 ) from None
-        elif isinstance(item, Mapping):
-            pending.extend(item.keys())
-            pending.extend(item.values())
-        elif isinstance(item, (list, tuple)):
-            pending.extend(item)
+        elif isinstance(item, (Mapping, list, tuple)):
+            if id(item) in entered:
+                raise error(
+                    f"{where} contains a structure that refers to itself, which no request can "
+                    "carry; break the cycle before handing it to jevper"
+                ) from None
+            entered.add(id(item))
+            if isinstance(item, Mapping):
+                pending.extend(item.keys())
+                pending.extend(item.values())
+            else:
+                pending.extend(item)
 
 
 Question = Noul | Choice | Score

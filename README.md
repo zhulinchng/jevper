@@ -359,13 +359,10 @@ uv pip install -e '.[test,mlflow]' && pytest -q tests/test_mlflow.py
 
 ## Docs
 
-- [docs/api.md](https://github.com/zhulinchng/jevper/blob/main/docs/api.md) — constructor and `system_one` parameters, answer/usage/debug shapes, errors
-- [docs/methods.md](https://github.com/zhulinchng/jevper/blob/main/docs/methods.md) — the four methods, request bodies, readout rules, surface selection
-- [docs/local-servers.md](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md) — ollama, llama.cpp, vLLM, SGLang and LM Studio: what to pass, turning thinking off, what fits a small GPU, and what each one ignores or refuses
-- [docs/reasoning.md](https://github.com/zhulinchng/jevper/blob/main/docs/reasoning.md) — native vs two-step reasoning, traces, encrypted content
-- [docs/few-shot.md](https://github.com/zhulinchng/jevper/blob/main/docs/few-shot.md) — example levels, precedence, rendering, structured examples
-- [docs/internals.md](https://github.com/zhulinchng/jevper/blob/main/docs/internals.md) — module map, call flow, concurrency, retries, testing
-- [docs/mlflow.md](https://github.com/zhulinchng/jevper/blob/main/docs/mlflow.md) — MLflow 3.16.1: autolog tracing of jevper's calls, hosting jevper as a model, the AI Gateway, `mlflow.genai.evaluate`
+Read the [jevper documentation site](https://zhulinchng.github.io/jevper/) for the quick start, method and
+surface selection, public API reference, local-server compatibility, reasoning, few-shot examples, internals,
+and MLflow integration. Contributors can edit the Markdown under [`docs/`](docs/) and run
+`uv run --extra docs mkdocs build --strict`.
 
 ## License
 

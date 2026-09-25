@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import warnings
+from typing import Any
 
 import pytest
 from fakes import (
@@ -519,3 +520,125 @@ def test_a_header_with_non_ascii_text_is_refused(stub_server):
         chat_client(stub, extra_headers={"X-Label": "café"})
 
     assert stub.requests == []
+
+
+def strict_client(allowed: set[str], answered: Any):
+    """A client that types its keyword arguments the way an older SDK release did.
+
+    ``openai`` grew ``prompt_cache_key`` on Chat Completions and Responses after 1.92, which is the
+    floor this package declares. A field the SDK has no parameter for cannot be sent as one: the call
+    raises ``TypeError`` from inside the SDK, which the caller sees as a provider failure. The body
+    channel — ``extra_body``, merged into the request by every version — is where a field of the API
+    rather than of the SDK has to go.
+    """
+    calls: list[dict[str, Any]] = []
+
+    def create(**kwargs: Any) -> Any:
+        for name in kwargs:
+            if name not in allowed:
+                raise TypeError(f"create() got an unexpected keyword argument {name!r}")
+        calls.append(kwargs)
+        return answered
+
+    class Resource:
+        pass
+
+    resource = Resource()
+    resource.create = create  # type: ignore[attr-defined]
+
+    class Client:
+        pass
+
+    client = Client()
+    client.chat = type("Chat", (), {"completions": resource})()  # type: ignore[attr-defined]
+    client.responses = resource  # type: ignore[attr-defined]
+    return client, calls
+
+
+CHAT_KEYWORDS = {
+    "model", "messages", "response_format", "temperature", "logprobs", "top_logprobs", "grammar",
+    "extra_body", "extra_headers",
+}
+RESPONSES_KEYWORDS = {
+    "model", "input", "store", "text", "include", "top_logprobs", "temperature",
+    "extra_body", "extra_headers",
+}
+
+
+def test_a_cache_key_reaches_a_chat_sdk_that_has_no_parameter_for_it():
+    """The regression this pins: a derived key sent as a typed keyword failed every call on the floor."""
+    from fakes import chat_body
+
+    client, calls = strict_client(CHAT_KEYWORDS, chat_body(content=STRUCTURED))
+
+    SystemOneClient(client, model="stub", api="chat_completions", method="structured").system_one(
+        state="s", questions={"q": question()}, prompt_cache_key="jevper-test-key"
+    )
+
+    assert calls[0]["extra_body"]["prompt_cache_key"] == "jevper-test-key"
+    assert "prompt_cache_key" not in calls[0]
+
+
+def test_a_cache_key_reaches_a_responses_sdk_that_has_no_parameter_for_it():
+    """The same field, the same channel, on the surface where the key is a spec'd API field too."""
+    from fakes import responses_body
+
+    client, calls = strict_client(RESPONSES_KEYWORDS, responses_body(text=STRUCTURED))
+
+    SystemOneClient(client, model="stub", api="responses", method="structured").system_one(
+        state="s", questions={"q": question()}, prompt_cache_key="jevper-test-key"
+    )
+
+    assert calls[0]["extra_body"]["prompt_cache_key"] == "jevper-test-key"
+    assert "prompt_cache_key" not in calls[0]
+
+
+def test_a_derived_cache_key_also_travels_the_body_channel():
+    """No key of the caller's own: the one jevper derives must reach the wire the same way."""
+    from fakes import chat_body
+
+    client, calls = strict_client(CHAT_KEYWORDS, chat_body(content=STRUCTURED))
+
+    SystemOneClient(client, model="stub", api="chat_completions", method="structured").system_one(
+        state="s", questions={"q": question()}
+    )
+
+    assert calls[0]["extra_body"]["prompt_cache_key"].startswith("jevper-")
+
+
+def test_a_self_referential_body_is_refused_rather_than_followed(stub_server):
+    """A structure that contains itself has no encoding; the walk must end, not loop."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+    body: dict = {}
+    body["self"] = body
+
+    with pytest.raises(JevperError, match="refers to itself"):
+        chat_client(stub, extra_body=body).system_one(state="s", questions={"q": question()})
+
+    assert stub.requests == []
+
+
+def test_a_self_referential_state_is_refused_too(stub_server):
+    """The state is rendered before anything else, so its own cycle check answers first — locally."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+    state: list = []
+    state.append(state)
+    client = chat_client(stub)
+
+    with pytest.raises(JevperError, match="[Cc]ircular reference"):
+        client.system_one(state=state, questions={"q": question()})
+
+    assert stub.requests == []
+
+
+def test_a_header_mapping_edited_after_construction_is_not_what_gets_sent(stub_server):
+    """What was validated is what is sent: the client keeps a copy, so a later edit cannot slip past."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+    headers = {"X-Tenant": "ok"}
+    client = chat_client(stub, extra_headers=headers)
+
+    headers["X-Tenant"] = "one\r\nX-Admin: true"
+    client.system_one(state="s", questions={"q": question()})
+
+    sent = {name.lower(): value for name, value in stub.header_pairs[0]}
+    assert sent["x-tenant"] == "ok"

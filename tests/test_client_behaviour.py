@@ -2881,9 +2881,11 @@ def test_a_refusal_one_model_earned_does_not_reach_another(stub_server):
         return 200, chat_body(content=json.dumps({"probabilities": {"billing": 0.7, "technical": 0.2, "sales": 0.1}}))
 
     stub = stub_server(chat=script)
+    # The constructor model is deliberately a third one: a verdict written under the constructor's
+    # model instead of the per-call override would pass a test where the two are the same.
     client = SystemOneClient(
         openai_client(stub),
-        model="old",
+        model="default",
         api="chat_completions",
         method="structured",
         reasoning=ReasoningConfig(mode="native", effort="low"),
@@ -2898,6 +2900,11 @@ def test_a_refusal_one_model_earned_does_not_reach_another(stub_server):
 
     new = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}, model="new")
     assert new.debug.get("server_limits") is None
+    assert stub.bodies("/chat/completions")[-1]["reasoning_effort"] == "low"
+
+    # And the constructor's own model, which was never refused anything, still sends the field.
+    default = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    assert default.debug.get("server_limits") is None
     assert stub.bodies("/chat/completions")[-1]["reasoning_effort"] == "low"
 
 

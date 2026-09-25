@@ -167,7 +167,9 @@ def test_the_trace_records_the_request_fields_jevper_sent(stub_server, autolog):
     assert span.attributes["logprobs"] is True
     assert span.attributes["top_logprobs"] == 20
     # The derived cache key is visible in the trace, which is what makes cache reuse auditable.
-    assert span.attributes["prompt_cache_key"].startswith("jevper-")
+    # It travels in ``extra_body`` (see docs/api.md) rather than as a typed keyword, so MLflow
+    # promotes it to no attribute of its own; the span inputs hold every keyword jevper sent.
+    assert span.inputs["extra_body"]["prompt_cache_key"].startswith("jevper-")
     assert span.inputs["model"] == "stub"
     assert span.inputs["messages"][0]["role"] == "system"
 
@@ -604,6 +606,10 @@ def test_chat_model_predicts_through_the_pyfunc_interface(stub_server, tracking)
     result = loaded.predict({"messages": [{"role": "user", "content": "I was charged twice"}]})
 
     assert result["choices"][0]["message"]["content"] == "billing"
+    # The answer script answers from a fixed rubric, so the answer alone cannot prove the caller's
+    # own text reached the provider; the captured body can.
+    sent = json.dumps(stub.bodies("/chat/completions")[-1], ensure_ascii=False)
+    assert "I was charged twice" in sent
 
 
 def test_chat_model_survives_the_predict_helper(stub_server, tracking, tmp_path):
@@ -866,7 +872,9 @@ def test_a_backend_error_is_relayed_with_its_status(gateway):
         )
         with pytest.raises(ProviderError) as caught:
             client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+        # Both halves of the contract: the message the provider wrote, and the status it came with.
         assert "top_logprobs" in str(caught.value)
+        assert caught.value.status_code == 400
     finally:
         gateway.backend.chat = answer_script
 
@@ -1248,8 +1256,11 @@ def test_a_jevper_backed_langchain_model_logs_and_predicts(stub_server, tracking
         )
 
     loaded = mlflow.pyfunc.load_model(info.model_uri)
-    result = loaded.predict(["I was charged twice"])
+    result = loaded.predict(["Invoice 9931 was charged twice this morning"])
     assert "billing" in json.dumps(result)
+    # As above: the state the caller passed is the only thing the fixed answer cannot stand in for.
+    sent = json.dumps(stub.bodies("/chat/completions")[-1], ensure_ascii=False)
+    assert "Invoice 9931 was charged twice this morning" in sent
 
 
 def test_the_langchain_fixture_survives_being_logged_without_a_config(stub_server, tracking):

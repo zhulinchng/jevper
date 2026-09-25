@@ -11,7 +11,7 @@
 | `labels.py` | Label allocation (`A`–`Z`, then `AA`–`ZZ`) and label → answer-key mapping |
 | `reasoning.py` | Reasoning config and content types, `reasoning_text`, mode resolution |
 | `prompts.py` | Message rendering: state turns, question blocks, few-shot turns, correction messages |
-| `transport.py` | The two surfaces: request builders, response normalizers, surface selection |
+| `transport.py` | The three surfaces (`chat_completions`, `responses`, and `messages`): request builders, response normalizers, surface selection |
 | `methods.py` | The four elicitation methods: request spec, schemas, grammar, readout |
 | `normalize.py` | Confidence and probability arithmetic (the reference adapter's formulas) |
 | `client.py` | Sync/async facades: orchestration, concurrency, retries, finalization, `debug` |

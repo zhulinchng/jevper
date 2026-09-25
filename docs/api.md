@@ -50,7 +50,7 @@ refuses a blocking one, before any request, naming the class to use instead.
 | `n_retry_malformed` | `1` | Corrective retries when an answer cannot be read |
 | `retry` | `None` | Transient-failure retries; `RetryPolicy()` (2 retries, 0.5s base, 8s cap) when unset |
 | `temperature` | `None` | Not sent unless set. `0.0` is recommended for `structured`/`discrete`; `logprobs` needs no setting. Left out of a Messages request that enables `thinking`, which the API refuses alongside a non-default temperature |
-| `prompt_cache_key` | `None` | The provider's cache-routing key. Unset, jevper derives one per question from the parts of the prompt that do not change between calls, so a rubric's requests are routed together; set it to group (or account for) requests your own way |
+| `prompt_cache_key` | `None` | The provider's cache-routing key. Unset, jevper derives one per question from the parts of the prompt that do not change between calls, so a rubric's requests are routed together; set it to group (or account for) requests your own way. It travels in the request *body* on both OpenAI surfaces, never as an SDK keyword, because it is a field of the API rather than of any SDK release: `openai` 1.92 — the floor the test extra declares — has no parameter for it, and a keyword it does not type is a `TypeError` from inside the call |
 | `extra_body` | `None` | Merged into every request body (the grammar field is merged here too). A key it names is the value that reaches the wire — the SDK merges `extra_body` *after* the typed parameters — so jevper leaves that field alone rather than sending a typed value the caller's own key would override. `response_format`/`text`/`output_config` named here therefore also puts the JSON Schema in the prompt, since no schema of jevper's is in the request. On the Messages surface, `max_tokens` comes from here — jevper always sends one there, defaulting to `DEFAULT_MAX_TOKENS` (1024), or 1024 plus `ReasoningConfig(budget_tokens=…)`; a `max_tokens` that cannot hold the thinking budget asked for raises `JevperError` locally, naming both numbers, rather than earning the API's own refusal. Every other key travels on all three surfaces, whether or not a temperature was set |
 | `extra_headers` | `None` | Sent with every request. A name spelled differently from the client's own (`authorization` against the SDK's `Authorization`) is renamed to the client's spelling, so it replaces the default header instead of joining it on the wire. Names and values must be what a header can carry — an HTTP token name and a printable-ASCII value, horizontal tabs allowed — and a name or value that is not is refused here, not by the SDK's encoder from inside the request |
 
@@ -294,9 +294,21 @@ response can neither leak a credential nor fail to serialize:
   is replaced by a marker. A provider object that cannot be dumped at all is recorded as
   `{"undumpable": "<Type could not be dumped for debug>"}` rather than kept as the object itself, which
   `model_dump_json()` would then have to serialize.
-- Provider text quoted in an error is bounded the same way: an `error` carried in a `200`, a status failure's
-  detail and an exception's own message all pass through one formatter, so a gateway answering with a
-  megabyte of HTML cannot put that megabyte into every message, attempt record and log line that quotes it.
+- Provider text quoted in an error is bounded the same way, and the caller's own credential values are
+  removed from it: an `error` carried in a `200`, a status failure's detail and an exception's own message all
+  pass through one formatter — and a gateway that quotes the key it rejected does not get to put it in every
+  message, attempt record and log line that quotes one. A value shorter than eight characters is left alone,
+  because replacing `1` or `test` everywhere would corrupt every message that contains those letters.
+
+An event stream where a whole response belongs is a `ProviderError` on all three surfaces, whether or not it
+carries a failure frame — on Chat Completions that replaces the `ClientCapabilityError` of 0.7.0 and on Messages
+the `MalformedAnswerError`, because a server that streamed when nothing asked it to is a provider's choice
+rather than a capability the client lacks. Catch `JevperError` (or `ProviderError`) for it, not those two.
+
+An interrupt is answered at once. A `KeyboardInterrupt` or `SystemExit` that reaches one question of a batch
+cancels the questions still queued for it and is raised without waiting for the ones already running on a
+worker thread, which cannot be cancelled and may still finish; `close()` joins them. An ordinary per-question
+failure is the opposite: every question runs, and the first failure in insertion order is the one raised.
 
 ## `RetryPolicy`
 

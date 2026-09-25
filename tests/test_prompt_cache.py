@@ -10,6 +10,8 @@ the state-rendering tests in ``test_client_behaviour.py``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 
 import pytest
 from fakes import async_openai_client, chat_body, openai_client, responses_body
@@ -19,6 +21,7 @@ from jevper import (
     Choice,
     Example,
     JevperError,
+    ProviderError,
     ReasoningConfig,
     RetryPolicy,
     SystemOneClient,
@@ -27,6 +30,7 @@ from jevper import (
 CHOICE_LOGS = [("A", -0.12), ("B", -2.47), ("C", -3.48)]
 CRITERIA = {"billing": None, "technical": None, "sales": None}
 OTHER = {"billing": None, "refunds": None, "sales": None}
+STRUCTURED = json.dumps({"probabilities": {"billing": 0.7, "technical": 0.2, "sales": 0.1}})
 
 
 def client_for(stub, **kwargs):
@@ -459,3 +463,31 @@ def test_the_key_differs_per_method_and_is_shared_by_both_reasoning_passes(stub_
     # Two-step is a way of *asking*, not another prefix: it keys like the method it answers with, so
     # the analysis pass and a plain call with the same rubric still land in one bucket.
     assert keys[2] == keys[1]
+
+
+def test_a_refusal_on_one_surface_does_not_silence_the_key_on_another(stub_server):
+    """One client, one model, two surfaces: a Chat refusal must not strip the key from Responses.
+
+    The learned limits are keyed by (model, surface), so this is the case a per-model-only key would
+    fail: the same model, the same client, the other route.
+    """
+    def script(body):
+        if "messages" in body:
+            return 400, {"error": {"message": "prompt_cache_key is not supported"}}
+        return 200, chat_body(content=STRUCTURED)
+
+    stub = stub_server(chat=script, responses=lambda _: (200, responses_body(text=STRUCTURED)))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="auto", method="structured",
+        prompt_cache_key="jevper-test-key", retry=RetryPolicy(n_retries=0), n_retry_malformed=0,
+    )
+
+    # The Chat refusal is the caller's own business here: whether the ladder drops the field and
+    # answers, or reports it, the point is the other surface.
+    with contextlib.suppress(ProviderError):
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}, api="chat_completions")
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)}, api="responses")
+
+    assert stub.bodies("/chat/completions"), "the Chat call was made and refused the key"
+    assert "prompt_cache_key" not in stub.bodies("/chat/completions")[-1]
+    assert stub.bodies("/responses")[-1]["prompt_cache_key"] == "jevper-test-key"

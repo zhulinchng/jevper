@@ -736,9 +736,10 @@ def _dump_model(obj: Any) -> Any:
     the dump either way, and the dump exists for ``debug``, so the warning is noise the caller never
     asked for; ``warnings=False`` keeps it out of their logs without touching global warning state.
 
-    A duck client that answers with a plain mapping is sanitized like a typed model, and an object
-    that cannot be dumped at all leaves a name behind rather than itself: the provider's own object
-    in ``debug`` is exactly the thing ``model_dump_json`` then has to serialize.
+    A duck client that answers with a plain mapping is sanitized like a typed model. An object that
+    cannot be dumped, or that is neither plain data nor a model at all, leaves a name behind rather
+    than itself: the provider's own object in ``debug`` is exactly the thing ``model_dump_json`` then
+    has to serialize, and a duck client is free to return anything.
     """
     dump = getattr(obj, "model_dump", None)
     if callable(dump):
@@ -751,7 +752,34 @@ def _dump_model(obj: Any) -> Any:
                 return {"undumpable": f"<{type(obj).__name__} could not be dumped for debug>"}
     if isinstance(obj, (Mapping, list, tuple)):
         return _sanitize_debug(obj)
-    return obj
+    if _is_plain_data(obj):
+        return obj
+    return {"undumpable": f"<{type(obj).__name__} is not data jevper can keep for debug>"}
+
+
+def _is_plain_data(value: Any) -> bool:
+    """Whether a value is something ``model_dump_json`` can already write."""
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _debug_entries(items: Any) -> dict[Any, Any]:
+    """A mapping's entries with printable, non-colliding keys.
+
+    Escaping and truncation can map two distinct provider keys onto the same text — ``"x\\ud800"``
+    and the literal ``"x\\\\ud800"`` both become ``x\\ud800``, and a key cut at the bound can land on
+    another key's marker. Silently keeping one of them would lose a field the provider sent, so a
+    repeat is numbered: the record stays printable and every field the provider sent is still there.
+    """
+    entries: dict[Any, Any] = {}
+    for key, item in items:
+        name = _debug_key(key)
+        if name in entries:
+            suffix = 2
+            while f"{name}#{suffix}" in entries:
+                suffix += 1
+            name = f"{name}#{suffix}"
+        entries[name] = item
+    return entries
 
 
 def _debug_key(key: Any) -> Any:
@@ -764,24 +792,35 @@ def _debug_key(key: Any) -> Any:
 
 
 def _sanitize_debug(value: Any, depth: int = 0) -> Any:
-    """The dumped provider object with every string printable and bounded, for a response that must
-    serialize.
+    """The dumped provider object as printable, bounded, JSON-writable data.
 
     A body can carry an escaped lone surrogate, which the SDK decodes into a Python string no UTF-8
     encoder accepts; left in ``debug`` it would make ``SystemOneResponse.model_dump_json()`` raise
     long after the call succeeded. The escapes the wire carried are shown instead, so the debug
-    record still says what the provider sent. Keys are text too, and a duck client's raw mapping
-    goes through here as well, so no path into ``debug`` skips the guarantee.
+    record still says what the provider sent. Keys are text too, a duck client's raw mapping goes
+    through here as well, and a value that is neither data nor a model — an ``object()`` in a
+    metadata field, a set, a client object — becomes a marker, so no path into ``debug`` can leave
+    the response unserializable.
     """
     if isinstance(value, str):
         return bounded_text(value, MAX_DEBUG_STRING)
+    if _is_plain_data(value):
+        return value
     if depth >= MAX_DEBUG_DEPTH:
         return f"<{type(value).__name__} nested deeper than {MAX_DEBUG_DEPTH} levels>"
     if isinstance(value, Mapping):
-        return {_debug_key(key): _sanitize_debug(item, depth + 1) for key, item in value.items()}
+        return _debug_entries((key, _sanitize_debug(item, depth + 1)) for key, item in value.items())
     if isinstance(value, (list, tuple)):
         return [_sanitize_debug(item, depth + 1) for item in value]
-    return value
+    # A model or an object of the caller's own, nested inside a duck client's mapping: ask it for
+    # its data, and keep a name if it cannot answer.
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        try:
+            return _sanitize_debug(dump(), depth + 1)
+        except Exception:  # noqa: BLE001 - the record is evidence, never the call's outcome
+            return f"<{type(value).__name__} could not be dumped for debug>"
+    return f"<{type(value).__name__} is not data jevper can keep for debug>"
 
 
 # A header whose name says it carries a credential is not recorded with its value: the attempt
@@ -980,8 +1019,11 @@ class _BaseClient:
         self.n_retry_malformed = n_retry_malformed
         self.retry = policy
         self.temperature = temperature
-        self.extra_body = extra_body
-        self.extra_headers = extra_headers
+        # A copy, so a caller that keeps and later edits the mapping cannot slip a header past the
+        # validation above: what was checked is exactly what is sent, and later edits are the
+        # caller's own new client. Same for the body, whose text is checked on every call anyway.
+        self.extra_body = dict(extra_body) if extra_body is not None else None
+        self.extra_headers = dict(extra_headers) if extra_headers is not None else None
         self.prompt_cache_key = prompt_cache_key
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._executor_lock = threading.Lock()
@@ -1010,15 +1052,41 @@ class _BaseClient:
 
         The record names the transport that made the call — not whatever the shared context holds by the
         time the failure is handled — so a delayed failure still shows the surface and the request that
-        produced it.
+        produced it. The provider's own words go through the same scrub as the header values: a gateway
+        that quotes the key it rejected puts a credential in every error message and every log line
+        that quotes one.
         """
         log.add_attempt(
             question_id,
             surface=transport.surface,
             request=transport.kwargs(spec, context.model),
-            error=_describe(exc),
+            error=self._scrub(_describe(exc)),
         )
         return _is_transient(exc)
+
+    def _secret_values(self) -> tuple[str, ...]:
+        """The caller's own credential values, from the headers whose names carry one.
+
+        Only the caller's: the SDK client's own key is not reachable from here, and a value too short
+        to be a credential is not scrubbed — replacing ``"1"`` or ``"test"`` everywhere would corrupt
+        every message that happens to contain those letters.
+        """
+        if not self.extra_headers:
+            return ()
+        return tuple(
+            value
+            for name, value in self.extra_headers.items()
+            if isinstance(name, str)
+            and isinstance(value, str)
+            and len(value) >= 8
+            and any(part in name.casefold() for part in _CREDENTIAL_HEADER_PARTS)
+        )
+
+    def _scrub(self, text: str) -> str:
+        """The caller's own credential values removed from text the provider wrote."""
+        for secret in self._secret_values():
+            text = text.replace(secret, "<redacted>")
+        return text
 
     # -- method="auto" -----------------------------------------------------------------
 
@@ -1280,7 +1348,7 @@ class _BaseClient:
         being remembered. A server error that survived every retry is only a bad minute, so it is not.
         """
         if (context.auto or context.api_auto) and spec.logprobs:
-            failure = _describe(exc)
+            failure = self._scrub(_describe(exc))
             if _logprobs_rejected(exc, spec, transport.surface):
                 capability = _logprobs_unsupported(exc, spec, transport.surface)
                 note = (
@@ -1306,9 +1374,20 @@ class _BaseClient:
             # The transport already built the right error — an embedded provider failure — so keep
             # its message and status and hand it the attempt history instead of wrapping it again.
             exc.attempts = log.attempts
+            scrubbed = self._scrub(str(exc))
+            if scrubbed != str(exc) and type(exc) is ProviderError:
+                # The body the provider sent can quote the credential it rejected, and this is the
+                # message every caller and every log line will carry. Only the plain class is rebuilt,
+                # so a subclass keeps its identity rather than being flattened by the scrub.
+                return ProviderError(
+                    scrubbed,
+                    attempts=log.attempts,
+                    status_code=exc.status_code,
+                    embedded=exc.embedded,
+                )
             return exc
         return ProviderError(
-            _describe(exc),
+            self._scrub(_describe(exc)),
             attempts=log.attempts,
             status_code=_status_code(exc),
         )

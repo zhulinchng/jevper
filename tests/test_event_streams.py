@@ -356,3 +356,54 @@ def test_a_completed_event_with_no_failure_is_still_a_mismatch(stub_server):
     )
     with pytest.raises(ProviderError, match="event stream"):
         client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+
+def test_a_multiline_data_frame_is_one_event(stub_server):
+    """SSE joins the data lines of an event with newlines; a JSON body split across lines is one frame."""
+    frame = (
+        "event: error\n"
+        "data: {\n"
+        'data:   "type": "error",\n'
+        'data:   "status": 503,\n'
+        'data:   "error": {"code": "overloaded", "message": "upstream busy"}\n'
+        "data: }\n"
+        "\n"
+    )
+    server = stub_server(responses=lambda _: (200, frame, STREAM_HEADERS))
+
+    client = SystemOneClient(
+        openai_client(server), model="stub", api="responses", method="structured",
+        retry=RetryPolicy(n_retries=1, base_delay=0.0, max_delay=0.0),
+    )
+    with pytest.raises(ProviderError) as caught:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert caught.value.status_code == 503
+    assert "upstream busy" in str(caught.value)
+    assert len(server.bodies("/responses")) == 2, "a transient frame in two lines is still retried"
+
+
+def test_a_strict_client_reads_the_same_frames(stub_server):
+    """A client with strict response validation refuses the stream before jevper sees it, as a body."""
+    from openai import OpenAI
+
+    frame = event_frame(
+        "error", {"type": "error", "status": 429, "error": {"code": "rate_limit", "message": "slow down"}}
+    )
+    server = stub_server(responses=lambda _: (200, frame, STREAM_HEADERS))
+    client = OpenAI(
+        base_url=server.base_url,
+        api_key="test",
+        max_retries=0,
+        timeout=10,
+        _strict_response_validation=True,
+    )
+    configured = SystemOneClient(
+        client, model="stub", api="responses", method="structured", retry=RetryPolicy(n_retries=0)
+    )
+
+    with pytest.raises(ProviderError) as caught:
+        configured.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert caught.value.status_code == 429
+    assert "slow down" in str(caught.value)

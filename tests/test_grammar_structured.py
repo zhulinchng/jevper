@@ -936,9 +936,15 @@ def test_deeply_nested_json_is_a_malformed_answer_not_a_recursion_error(stub_ser
 
 
 def test_a_nested_object_beside_the_answer_is_still_malformed_by_its_keys(stub_server):
-    """A deep value inside an otherwise valid shape fails on the key set, not on the parser."""
+    """A nested value inside an otherwise valid shape fails on the key set, not on the parser.
+
+    Sixty levels, not two thousand: deep enough that the record of the answer has to be summarized
+    rather than walked whole, and shallow enough that the *test's own* ``json.dumps`` succeeds on
+    every runtime the package supports — 3.10's encoder refuses far sooner than 3.12's, and a test
+    that only passes on the newest one is testing the interpreter, not jevper.
+    """
     deep: object = 1
-    for _ in range(2000):
+    for _ in range(60):
         deep = {"deeper": deep}
     answer = json.dumps({"probabilities": {"billing": 0.7, "technical": 0.2, "sales": 0.1}, "extra": deep})
     stub = stub_server(chat=lambda _: (200, chat_body(content=answer)))

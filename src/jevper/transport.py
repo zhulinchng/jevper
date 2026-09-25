@@ -270,7 +270,14 @@ def build_chat_kwargs(
     ):
         kwargs["reasoning_effort"] = spec.reasoning.effort
     if spec.prompt_cache_key is not None and limits.cache_key and "prompt_cache_key" not in body:
-        kwargs["prompt_cache_key"] = spec.prompt_cache_key
+        # Through the body channel rather than as a typed keyword: `prompt_cache_key` is an API
+        # field, not an SDK one, and `openai` only grew the typed parameter on Chat Completions and
+        # Responses after 1.92 — the floor this package declares. Sent as a keyword, every call on
+        # every surface raised `TypeError: create() got an unexpected keyword argument
+        # 'prompt_cache_key'` from inside the SDK on a supported version, and the caller's remedy
+        # (upgrade the SDK) was nowhere in the error. The body is identical either way, since the
+        # SDK merges `extra_body` into it.
+        body["prompt_cache_key"] = spec.prompt_cache_key
     if spec.temperature is not None and "temperature" not in body:
         kwargs["temperature"] = spec.temperature
     if spec.grammar is not None and "grammar" not in body:
@@ -361,7 +368,7 @@ def build_responses_kwargs(
         # would not reach the wire, so the schema travels only where jevper still owns the input.
         kwargs["input"] = _responses_input(_schema_in_prompt(spec.messages, spec))
     if spec.prompt_cache_key is not None and limits.cache_key and "prompt_cache_key" not in body:
-        kwargs["prompt_cache_key"] = spec.prompt_cache_key
+        body["prompt_cache_key"] = spec.prompt_cache_key
     if spec.temperature is not None and "temperature" not in body:
         kwargs["temperature"] = spec.temperature
     if body:
@@ -648,7 +655,7 @@ def _event_stream_error(text: str) -> ProviderError | None:
         if not lines:
             continue
         event = ""
-        payloads: list[str] = []
+        data: list[str] = []
         for line in lines:
             name, separator, value = line.partition(":")
             if not separator:
@@ -657,20 +664,29 @@ def _event_stream_error(text: str) -> ProviderError | None:
             if name.strip() == "event":
                 event = value.strip()
             elif name.strip() == "data":
-                payloads.append(value)
-        for payload in payloads:
-            if payload.strip() in ("[DONE]", ""):
-                continue
-            try:
-                body = json.loads(payload)
-            except ValueError:
-                continue
-            if not isinstance(body, Mapping):
-                continue
-            failure = _frame_failure(body, event=event)
-            if failure is not None:
-                return failure
+                data.append(value)
+        if not data:
+            continue
+        # SSE joins the data lines of one event with newlines before the payload is decoded, so a
+        # JSON body written across several lines is one frame rather than several fragments —
+        # decoding each line on its own would drop the event and lose the status inside it.
+        failure = _frame_failure_text("\n".join(data), event=event)
+        if failure is not None:
+            return failure
     return None
+
+
+def _frame_failure_text(payload: str, *, event: str) -> ProviderError | None:
+    """The failure one event's joined data lines carry, in either dialect."""
+    if payload.strip() in ("[DONE]", ""):
+        return None
+    try:
+        body = json.loads(payload)
+    except ValueError:
+        return None
+    if not isinstance(body, Mapping):
+        return None
+    return _frame_failure(body, event=event)
 
 
 def _frame_failure(body: Mapping[str, Any], *, event: str) -> ProviderError | None:
@@ -1201,6 +1217,11 @@ def _provider_error_from(exc: BaseException) -> BaseException:
     an error arrives as ``APIResponseValidationError`` and the embedded-error reader never runs.
     The body is on the exception; reading the same error from it keeps the provider's message and
     its status, which is what makes an overloaded upstream retryable rather than terminal.
+
+    A body that is text is the same case one step further along: an event stream is not a response
+    object, so a strict client refuses it with the raw stream as its body, and the frame reader
+    would never run. The stream is read here, so a strict client reports the same failure — and
+    retries the same transient one — as the default client does.
     """
     status = getattr(exc, "status_code", None)
     if status is None:
@@ -1211,6 +1232,12 @@ def _provider_error_from(exc: BaseException) -> BaseException:
         # failed to parse is a failure the embedded-error reader has not seen yet.
         return exc
     body = getattr(exc, "body", None)
+    if isinstance(body, (str, bytes)):
+        failure = _event_stream_error(
+            body.decode("utf-8", "backslashreplace") if isinstance(body, bytes) else body
+        )
+        if failure is not None:
+            return failure
     if isinstance(body, Mapping):
         failure = _embedded_error(body)
         if failure is not None:

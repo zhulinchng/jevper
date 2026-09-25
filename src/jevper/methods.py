@@ -28,7 +28,7 @@ from .errors import (
 from .labels import MAX_CHOICE_OPTIONS, MAX_LABEL_OPTIONS, ascii_upper, label_to_key
 from .reasoning import ReasoningConfig
 from .transport import CallResult, CallSpec, TokenLogprob
-from .types import Method, Question
+from .types import Method, Question, bounded_text
 
 GRAMMAR_SURFACE_HINT = (
     "grammar requires a Chat Completions surface that accepts a `grammar` field (llama-cpp-python and "
@@ -602,13 +602,17 @@ def _require_root_keys(payload: Mapping[str, Any], expected: str, *, method: str
 
     The message names the keys and not the values: a provider that pads the answer with a megabyte
     of its own text would otherwise put that megabyte into every error message, every attempt record
-    and every log line that quotes the failure.
+    and every log line that quotes the failure. The same holds for the key *names*, which are the
+    provider's text too — one three-megabyte key name would take the place of the megabyte of values.
+    Each name is escaped to printable UTF-8 and cut, and the check itself is on the untouched keys.
     """
-    keys = sorted(str(key) for key in payload)
-    if keys != [expected]:
-        raise MalformedAnswerError(
-            f"the {method} answer must be an object with exactly {expected!r}, got keys {keys}"
-        )
+    keys = [str(key) for key in payload]
+    if sorted(keys) == [expected]:
+        return
+    shown = sorted(bounded_text(key, 200) for key in keys)
+    raise MalformedAnswerError(
+        f"the {method} answer must be an object with exactly {expected!r}, got keys {shown}"
+    )
 
 
 def readout_structured(result: CallResult, question: Question) -> Readout:
@@ -655,27 +659,34 @@ def _level_index(value: Any, levels: Sequence[int]) -> int | None:
     ``"2.0"`` and ``"2.000"`` are level 2, while ``"2.0000000000000000000001"`` is a number with a
     fractional part that a binary float rounds away. Accepting it would answer a question the model
     did not answer with a level it did not give.
+
+    Membership is decided on the decimal, before any conversion to ``int``. ``"1e999999999"`` is a
+    perfectly finite decimal, and converting it would try to build an integer with a billion digits
+    out of nineteen characters of answer — the provider's text deciding how much memory the caller's
+    process uses. The levels of a question are a handful of small integers, so comparing the decimal
+    with them answers the question without ever materialising one.
     """
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        index = value
-    elif isinstance(value, float):
+        return value if value in levels else None
+    if isinstance(value, float):
+        # An integral float is exact up to 2**53, far above any question's level count, and a float
+        # that is not integral is refused rather than rounded into one.
         if not value.is_integer():
             return None
-        index = int(value)
-    elif isinstance(value, str):
-        text = value.strip()
+        return int(value) if int(value) in levels else None
+    if isinstance(value, str):
         try:
-            number = Decimal(text)
+            number = Decimal(value.strip())
         except InvalidOperation:
             return None
         if not number.is_finite() or number != number.to_integral_value():
             return None
-        index = int(number)
-    else:
-        return None
-    return index if index in levels else None
+        if not any(number == Decimal(level) for level in levels):
+            return None
+        return int(number)
+    return None
 
 
 def _boolean(value: Any) -> bool | None:

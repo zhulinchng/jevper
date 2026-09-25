@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jevper"
-version = "0.7.1"
+version = "0.7.2"
 description = "The Jev (System One) interface over any OpenAI-compatible model: noul, choice and score questions in one call"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,11 +30,14 @@ dependencies = ["pydantic>=2.7"]
 # openai>=1.92 is the first release whose responses.create accepts top_logprobs (1.91 and earlier
 # reject the keyword); the suite exercises that surface directly. anthropic is the client for the
 # Messages surface — jevper imports nothing from it, and drives it through the real SDK against the
-# stub server, exactly as it does for openai.
+# stub server, exactly as it does for openai. Nothing jevper sends is newer than this floor: a field the
+# API defines but an SDK has no parameter for (prompt_cache_key) travels in the request body instead, and
+# tests/test_wire_boundaries.py pins that with a client that types its keywords like the floor release.
 test = ["pytest>=8", "openai>=1.92", "anthropic>=0.49"]
 # The MLflow integration suite (tests/test_mlflow.py) skips without this. The gateway extra is what puts
 # `mlflow gateway` on the CLI at all, and the langchain extra is what the LangChain-flavour test needs.
 mlflow = ["mlflow[gateway,langchain]>=3.16"]
+docs = ["mkdocs>=1.6", "mkdocs-material>=9.6", "mkdocs-mermaid2-plugin>=1.2"]
 
 [project.urls]
 Homepage = "https://github.com/zhulinchng/jevper"
