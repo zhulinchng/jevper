@@ -1,0 +1,21 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "jevper",
+  "description": "The Jev (System One) interface over any OpenAI-compatible model: ask noul, choice and score questions in a single call, with logprobs, grammar, structured-output and discrete readouts, plus retry, reasoning, and few-shot support.",
+  "folders": ["docs"],
+  "excludeFiles": ["internals.md", "contributing.md", "CHANGELOG.md", "LICENSE.md", "CODE_OF_CONDUCT.md"],
+  "rules": [
+    "Import from the package root — `from jevper import SystemOneClient, Choice, Noul, Score`. Everything listed in `__all__` is public; the submodules (client, types, transport, prompts) are implementation detail.",
+    "`SystemOneClient(client, *, model, ...)` — only `client` is positional, every other option is keyword-only. An unknown keyword raises TypeError from the constructor.",
+    "Make one call with `system_one(*, state, questions, ...) -> SystemOneResponse`. `questions` is a mapping of id to `Noul`/`Choice`/`Score`; results come back on the `nouls`/`choices`/`scores` properties.",
+    "Do not mix facades: `SystemOneClient` refuses an asynchronous client and `AsyncSystemOneClient` refuses a blocking one, before any request, naming the class to use instead.",
+    "Leave `method` and `api` at the `\"auto\"` default — auto resolves per model and surface, preferring `responses`, then `chat_completions`, then `messages`, falling back when a server answers 404 for a route.",
+    "jevper has no `max_tokens` parameter; the three surfaces name the field differently, so set it through `extra_body` (e.g. `extra_body={\"max_tokens\": 2048}`) — the Messages surface requires it.",
+    "`extra_body` refuses two keys before any request: `model` (pass `model=` instead) and a truthy `stream` (jevper reads a single non-streaming response).",
+    "Set `temperature=0.0` for the `structured` and `discrete` methods; `logprobs` needs no temperature. Leave it `None` to not send the field at all.",
+    "Every error derives from `JevperError` — catch that base class. Subclasses include `InvalidQuestionError`, `UnsupportedMethodError`, `ClientCapabilityError`, `MalformedAnswerError`, `ProviderError`, `IncompleteAnswerError`, `ModelRefusalError`.",
+    "`top_logprobs` must be in [0, 20] and at least 2 when `method` is pinned to `logprobs`/`grammar` — the sampled token alone is not a distribution.",
+    "The client object stays owned by the caller; `close()` only shuts down jevper's thread pool. jevper imports neither the openai nor the anthropic SDK — it duck-types any object exposing `responses.create`, `chat.completions.create`, or `messages.create`.",
+    "Requires Python 3.10+ with `pydantic>=2.7`, the sole runtime dependency. jevper is an independent implementation of the documented System One wire format, not affiliated with TypeSafe."
+  ]
+}
