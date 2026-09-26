@@ -143,6 +143,31 @@ non-whitespace token of the *answer*, and a model that thinks first and then ans
 `structured` and `discrete` are unaffected: they parse the JSON object out of the answer text, wherever the
 reasoning went. Use one of those for an always-thinking model, or a model that can be asked not to think.
 
+## A thinking budget the answer has to fit inside
+
+A reasoning model spends the output budget before it answers, and the Responses surface reports the
+consequence precisely: `status: "incomplete"` with `incomplete_details.reason: "max_output_tokens"` and
+**no output items at all** — not a short answer, nothing. jevper reports that as an
+`IncompleteAnswerError` naming the reason, which is the useful diagnosis, because the fix is the
+caller's: raise the budget with `extra_body={"max_output_tokens": n}`.
+
+Measured on opencode Zen, 2026-09-26, `muse-spark-1.3-contributor` on `api="responses"`:
+
+| `effort` | 256 tokens | 1024 | 4096 |
+| --- | --- | --- | --- |
+| unset | `incomplete`, no output | completes | completes |
+| `minimal`, `low` | completes | completes | completes |
+| `medium`, `high`, `xhigh` | `incomplete`, no output | completes | completes |
+| `max` | `400` | `400` | `400` |
+
+Two things to read off that. jevper's default budget of 1024 is enough for every effort this model
+accepts, so nothing has to be raised for it to work — but a *smaller* budget silently costs you the
+whole answer, and more thinking needs more room, not less. And `max` is in jevper's literal because
+some providers accept it; this one refuses it with a 400 that names no field
+(`param: None`, "The request contains invalid parameters"), so there is nothing for the field-downgrade
+path to key on and the provider's own 400 is what reaches you. Guessing a substitute effort would be
+inventing a mapping the provider did not state, so jevper reports the verdict instead.
+
 ## Reading the trace
 
 ```python
