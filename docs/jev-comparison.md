@@ -12,7 +12,7 @@ Where something could not be measured, it says so rather than guessing — see
 | Service | `POST https://opencode.ai/zen/v1/systemone`, the Jev endpoint opencode Zen serves |
 | Model | `jev-1.13-free`; the paid `jev-1.13` answered HTTP 402 on this account |
 | Reference client | `typesafe-sdk` 0.7.1 from PyPI, installed and read for the contract it encodes |
-| jevper | 0.7.5 on this branch, `.venv` (Python 3.14, openai 3.19.0) — the measurements below were taken on 0.7.4, before the System One surface existed |
+| jevper | 0.7.7 on this branch, `.venv` (Python 3.14, openai 3.19.0). The confidence and score arithmetic below was measured on 0.7.4, before the System One surface existed; every wire-format measurement was taken on 2026-09-26 against 0.7.7 |
 | Published docs | TypeSafe's API reference, confidence page, and the `jev-1.13` jaggedness page (reviewed 2026-09-17) |
 
 ## jevper can call this endpoint
@@ -66,6 +66,12 @@ arithmetic with them.
 error, before a request is sent. The service ignores what it does not know, so accepting them would
 mean reporting a method the caller did not get. A noul carrying neither instructions nor criteria is
 refused for the same reason the service answers 400 for one.
+
+**So is anything the wire format cannot carry, however reasonable it looks.** Every structured field
+on this wire takes a string, an object or an array, so a number or a boolean in a `state`, an
+`instructions`, a noul's criterion, a choice option's description or a score level is a 422 the
+service would answer — refused here instead, with every field named at once. An empty question id is
+the same: a 400 the service would have answered after the round trip.
 
 **The surface is never chosen for you.** `api="auto"` keeps its documented order and does not post a
 Jev body to a client that happens to have a `post` method — both official SDKs do.
@@ -163,7 +169,7 @@ jevper validates client-side and the service validates again on arrival, so the 
 is where the two sets of rules differ. `typesafe-sdk` 0.7.1 is the third column because it is the
 reference client, and it turns out to enforce almost nothing:
 
-| Input | Real service | typesafe-sdk 0.7.1 | jevper 0.7.5 |
+| Input | Real service | typesafe-sdk 0.7.1 | jevper 0.7.7 |
 | --- | --- | --- | --- |
 | 255 options | accepted | accepted | accepted |
 | 256 options | 400 `Too many choices. Must have at most 255 choices.` | accepted, fails at the server | rejected at construction, naming 255 as the Jev limit |
@@ -174,9 +180,26 @@ reference client, and it turns out to enforce almost nothing:
 | A choice option with `null` criteria | accepted | accepted | accepted |
 | `instructions` as an object or an array | accepted | accepted | accepted |
 | `state` as an object or an array | accepted | accepted | accepted |
+| `state` as an empty array | accepted | — | accepted; the prompt renderer refuses it as an empty conversation, and this surface no longer asks it |
+| A bare number or boolean anywhere a structured field goes — `state`, `instructions`, a noul side, a choice option's description, a score level | 422 `Input should be a valid string` naming the path | accepted, fails at the server | refused before sending, every field named in one error |
+| A `null` score level | 422 | — | refused before sending |
+| A `null` on a noul side beside a set one | accepted | accepted | accepted |
+| An empty question id | 400 `Question key cannot be empty.` | — | refused before sending |
 | An empty `questions` map | 422 with a pydantic `detail` list | `TypeSafeError` before sending | rejected before sending |
 | A noul with neither instructions nor criteria | 400 `Noul question must have criteria or instructions` | accepted | refused on `systemone`, accepted on a prompt surface, where the question can be rendered from an example |
 | An unknown field on a question (`temperature`) | ignored, 200 | rejected, `extra="forbid"` | rejected, `extra="forbid"` |
+
+One rule covers the middle of that table, and it is the schema's rather than a limit the service
+invents: **every structured field takes a string, an object or an array.** Measured field by field on
+2026-09-26 — a number and a boolean are 422 in all five places, and an array answers 200 where a
+string would, as does an object. `null` is the one value treated differently per field, and each of
+those is measured too: refused as missing on `state`, 422 on a score level, and 200 on a noul side or
+a choice option, where the API reference documents it as "use null when an option needs no extra
+detail".
+
+jevper's question models are wider than this on purpose, because a prompt surface can render a number
+as text and no prompt surface has such a limit, so the check lives on this surface rather than in the
+models: `Noul(instructions=0)` is not a malformed question until it goes on this wire.
 
 The one row where jevper is stricter than the service it mirrors is the single-level score. The
 service answers it, and the answer is degenerate — all mass on level 0, score 0, confidence 1 — so

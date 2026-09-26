@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -1092,3 +1093,196 @@ def test_a_credential_quoted_back_by_the_provider_is_scrubbed_while_listing_mode
     assert secret not in str(raised.value)
     assert "<redacted>" in str(raised.value)
     assert raised.value.status_code == 401
+
+
+# --- what this wire format refuses, measured against the live service on 2026-09-26 -----------------
+#
+# Its structured fields take a string, an object or an array. A bare number, a boolean or null is a
+# 422 there, and a null state is refused as missing; an empty question id is a 400. jevper's own
+# question types are wider than that on purpose, so a call carrying one of these spent a request to
+# be told what was already knowable, and each case below asserts nothing was sent.
+
+
+@pytest.mark.parametrize(
+    "state, named",
+    [
+        (None, "state=None"),
+        (0, "state=0"),
+        (1.5, "state=1.5"),
+        (True, "state=True"),
+    ],
+    ids=["null", "int", "float", "bool"],
+)
+def test_a_state_the_wire_format_cannot_carry_is_refused_before_the_request(stub_server, state, named):
+    """``state=None`` is refused as missing and a number as a type; both arrive as a 422."""
+    stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.7}}))
+
+    with pytest.raises(InvalidQuestionError, match=re.escape(named)):
+        client_for(stub).system_one(state=state, questions={"n": NOUL})
+
+    assert stub.requests == []
+
+
+@pytest.mark.parametrize("instructions", [0, 1.5, True], ids=["int", "float", "bool"])
+def test_instructions_the_wire_format_cannot_carry_are_refused_before_the_request(
+    stub_server, instructions
+):
+    """A prompt surface renders a number as text, so the question model allows one; this wire does not.
+
+    Measured: ``instructions`` answers 422 "Input should be a valid string" for a number and a
+    boolean, and 200 for a string, a dict and a list.
+    """
+    stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.7}}))
+    question = Noul(instructions=instructions, criteria=NoulCriteria(true="it agrees"))
+
+    with pytest.raises(InvalidQuestionError, match="instructions="):
+        client_for(stub).system_one(state=STATE, questions={"n": question})
+
+    assert stub.requests == []
+
+
+@pytest.mark.parametrize(
+    "criteria, named",
+    [((1, 2), "score level 0 = 1"), (("a", None), "score level 1 = None"), ((True, "b"), "score level 0 = True")],
+    ids=["int", "null", "bool"],
+)
+def test_score_levels_the_wire_format_cannot_carry_are_refused_before_the_request(
+    stub_server, criteria, named
+):
+    """The rubric's level texts are strings on this wire, though the question model allows more.
+
+    Measured: a level that is a number, a boolean or null answers 422 naming the level's index, and
+    one that is an object answers 200.
+    """
+    stub = stub_server(systemone=answering({"s": {"type": "score", "score": 0.0, "confidence": 0.5,
+                                                 "legend": {}, "probabilities": {}}}))
+    question = Score(instructions="How bad?", criteria=criteria)
+
+    with pytest.raises(InvalidQuestionError, match=re.escape(named)):
+        client_for(stub).system_one(state=STATE, questions={"s": question})
+
+    assert stub.requests == []
+
+
+def test_an_empty_question_id_is_refused_before_the_request(stub_server):
+    """The service answers 400 "Question key cannot be empty." for an empty id."""
+    stub = stub_server(systemone=answering({"": {"type": "noul", "noul": 0.7}}))
+
+    with pytest.raises(InvalidQuestionError, match="empty question id"):
+        client_for(stub).system_one(state=STATE, questions={"": NOUL})
+
+    assert stub.requests == []
+
+
+def test_every_offending_field_is_named_in_one_error(stub_server):
+    """One complaint per attempt would make a caller fix a call one field at a time."""
+    stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.7}}))
+    questions = {
+        "": Noul(instructions=0, criteria=NoulCriteria(true="it agrees")),
+        "s": Score(instructions="How bad?", criteria=("fine", 2)),
+    }
+
+    with pytest.raises(InvalidQuestionError) as raised:
+        client_for(stub).system_one(state=0, questions=questions)
+
+    message = str(raised.value)
+    assert "state=0" in message
+    assert "empty question id" in message
+    assert "instructions=0" in message
+    assert "score level 1 = 2" in message
+    assert stub.requests == []
+
+
+@pytest.mark.parametrize("value", [0, 2.5, True], ids=["int", "float", "bool"])
+def test_a_noul_criterion_side_the_wire_format_cannot_carry_is_refused(stub_server, value):
+    """Both sides take a string, an object or an array; a null beside a set side is 200."""
+    stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.7}}))
+    question = Noul(instructions="Do they agree?", criteria=NoulCriteria(true=value, false="they do not"))
+
+    with pytest.raises(InvalidQuestionError, match="criteria true="):
+        client_for(stub).system_one(state=STATE, questions={"n": question})
+
+    assert stub.requests == []
+
+
+@pytest.mark.parametrize("description", [0, 2.5, True], ids=["int", "float", "bool"])
+def test_a_choice_description_the_wire_format_cannot_carry_is_refused(stub_server, description):
+    """An option's description takes a string, an object or an array — or null, which is 200."""
+    stub = stub_server(
+        systemone=answering({"c": {"type": "choice", "choice": "billing", "confidence": 0.6,
+                                   "probabilities": {"billing": 0.6, "other": 0.4}}})
+    )
+    question = Choice(instructions="Which team?", criteria={"billing": description, "other": "rest"})
+
+    with pytest.raises(InvalidQuestionError, match="description of option 'billing'"):
+        client_for(stub).system_one(state=STATE, questions={"c": question})
+
+    assert stub.requests == []
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        Noul(instructions=["a", "list"], criteria=NoulCriteria(true=["also", "a list"])),
+        Choice(instructions={"ask": "which?"}, criteria={"billing": ["rubric", "as a list"]}),
+        Score(instructions="How bad?", criteria=({"why": "fine"}, ["it", "is", "broken"])),
+    ],
+    ids=["noul", "choice", "score"],
+)
+def test_a_structured_field_the_wire_format_takes_is_accepted(stub_server, question):
+    """The counterpart: an array and an object answer 200 wherever a string would.
+
+    A score level that is an object also comes back in the legend as that object, which is why the
+    legend field is wider than the API reference's ``map<string, string>`` alone would suggest.
+    """
+    answer = (
+        {"q": {"type": "choice", "choice": "billing", "confidence": 1.0,
+               "probabilities": {"billing": 1.0}}}
+        if question.type == "choice"
+        else {"q": {"type": "score", "score": 0.0, "confidence": 0.5, "legend": {0: {"why": "fine"}},
+                    "probabilities": {0: 1.0}}}
+        if question.type == "score"
+        else {"q": {"type": "noul", "noul": 0.7}}
+    )
+    stub = stub_server(systemone=answering(answer))
+
+    response = client_for(stub).system_one(state=STATE, questions={"q": question})
+
+    assert list(response.answers) == ["q"]
+
+
+@pytest.mark.parametrize("state", [[], {}, "", [1, 2], {"messages": []}, {"a": 1}])
+def test_every_state_the_wire_format_takes_is_accepted(stub_server, state):
+    """The counterpart: a string, an object or an array all answer 200 on this wire.
+
+    An empty list is one of them, and the prompt renderer refuses it as an empty conversation — which
+    is why this surface stopped asking the renderer to judge the state.
+    """
+    stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.7}}))
+
+    response = client_for(stub).system_one(state=state, questions={"n": NOUL})
+
+    assert response.answers["n"].noul == 0.7
+    assert stub.requests[-1]["state"] == state
+
+
+def test_a_lone_surrogate_in_the_state_is_still_refused_on_this_surface(stub_server):
+    """The prompt renderer is not consulted here, so the check it did is done explicitly.
+
+    Nothing can carry a surrogate, on any surface; the check rode along on the renderer before.
+    """
+    stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.7}}))
+
+    with pytest.raises(JevperError, match="surrogate"):
+        client_for(stub).system_one(state={"bad": "a\udcffb"}, questions={"n": NOUL})
+
+    assert stub.requests == []
+
+
+def test_a_prompt_surface_still_renders_the_state_it_always_did(stub_server):
+    """Moving the System One branch above the renderer must not change what a prompt surface accepts."""
+    stub = stub_server(chat=lambda _: (200, {"choices": [{"message": {"content": "x"}}]}))
+    client = SystemOneClient(openai_client(stub), model=MODEL, api="chat_completions")
+
+    with pytest.raises(JevperError, match="non-empty list"):
+        client.system_one(state=[], questions={"n": Noul(instructions="ok?")})

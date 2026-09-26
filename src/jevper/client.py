@@ -84,6 +84,7 @@ from .types import (
     MethodSelection,
     ModelMetadata,
     NoulAnswer,
+    NoulCriteria,
     Question,
     ScoreAnswer,
     SystemOnePayload,
@@ -1072,6 +1073,64 @@ def _batch_outcomes(
     return outcomes, totals
 
 
+def _wire_offenders(state: Any, parsed: Mapping[str, Question]) -> list[str]:
+    """What the System One wire format refuses, found before a request rather than after a 422.
+
+    One rule, measured field by field against the live service on 2026-09-26 and matching the
+    published API reference: every structured field — ``state``, a question's ``instructions``, a
+    noul's two criteria sides, a choice option's description, a score's level — takes a string, an
+    object or an array. A bare number or boolean is 422 "Input should be a valid string" naming the
+    exact path, in all five places. An array answers 200 where a string would, as does an object.
+
+    Null is the one value the rule treats differently per field, and each of these is measured too: a
+    null ``state`` is refused as missing, a null score level is 422, and a null on a noul side or a
+    choice option is 200 — the Jev API documents the last as "use null when an option needs no extra
+    detail". An empty question id answers 400 "Question key cannot be empty.".
+
+    jevper's own question types are deliberately wider than this, because a prompt surface can render
+    a number as text and no prompt surface has such a limit, so the check belongs here rather than in
+    the models: nothing about ``Noul(instructions=0)`` is wrong until it goes on this wire.
+    """
+    offenders: list[str] = []
+    if state is None or _is_bare_scalar(state):
+        offenders.append(f"state={state!r}")
+    for question_id, question in parsed.items():
+        if not question_id:
+            offenders.append("an empty question id")
+        if _is_bare_scalar(question.instructions):
+            offenders.append(f"question {question_id!r}: instructions={question.instructions!r}")
+        if question.type == "noul":
+            # A noul may carry no criteria at all, leaning on its instructions, which the noul rule
+            # has already settled; there is nothing on a wire to check in that case.
+            criteria = question.criteria
+            if isinstance(criteria, NoulCriteria):
+                for side in ("true", "false"):
+                    value = getattr(criteria, side)
+                    if _is_bare_scalar(value):
+                        offenders.append(f"question {question_id!r}: criteria {side}={value!r}")
+        elif question.type == "choice":
+            for option, description in question.criteria.items():
+                if _is_bare_scalar(description):
+                    offenders.append(
+                        f"question {question_id!r}: the description of option {option!r} "
+                        f"is {description!r}"
+                    )
+        else:
+            for index, level in enumerate(question.criteria):
+                if level is None or _is_bare_scalar(level):
+                    offenders.append(f"question {question_id!r}: score level {index} = {level!r}")
+    return offenders
+
+
+def _is_bare_scalar(value: Any) -> bool:
+    """Whether a value is a number or a boolean, which this wire format has nowhere to put.
+
+    ``bool`` before ``int`` for the reader rather than for the behaviour: ``isinstance`` already
+    covers it, and naming both says what is being excluded.
+    """
+    return isinstance(value, (bool, int, float))
+
+
 class _BaseClient:
     def __init__(
         self,
@@ -1599,9 +1658,12 @@ class _BaseClient:
             raise JevperError(f"reasoning must be a ReasoningConfig, got {type(reasoning).__name__}")
         if prompt_cache_key is not None:
             _require_prompt_cache_key(prompt_cache_key)
-        # Fail fast, before any provider call, and reuse the rendered turns for every question.
-        state_messages = tuple(render_state_messages(state))
+        # Fail fast, before any provider call. The state is validated per surface: rendering it as
+        # prompt turns is what a prompt surface needs, and judging it by that renderer would refuse
+        # a state the System One wire format takes — an empty list is a wire-format state, and the
+        # renderer refuses it as an empty conversation.
         parsed = {question_id: parse_question(question_id, raw) for question_id, raw in questions.items()}
+        state_messages: tuple[dict[str, str], ...] = ()
         # Every few-shot example is checked here too. A question whose example is invalid would
         # otherwise only fail inside its own worker — after the questions ahead of it had already spent
         # provider calls on a call that was locally invalid from the start.
@@ -1637,6 +1699,8 @@ class _BaseClient:
                 temperature,
                 prompt_cache_key,
             ), parsed
+        # The rendered turns are reused for every question, so the state is rendered once.
+        state_messages = tuple(render_state_messages(state))
 
         if api_auto and self._surface_missing(surface):
             # This server answered 404 for the route before: do not pay for the discovery again, and
@@ -1731,6 +1795,22 @@ class _BaseClient:
                     f"question {question_id!r}: a noul must carry instructions or criteria; the Jev "
                     "API answers 400 for one with neither"
                 )
+        # What the wire format asks for that a prompt surface has no opinion about, refused here
+        # rather than sent: a structured field takes a string, an object or an array, so a bare
+        # number, a boolean or null is a 422 there, and a question id has to be a non-empty string.
+        # All of them in one error, so a caller fixes the call in one go rather than one complaint
+        # per attempt.
+        offenders = _wire_offenders(state, parsed)
+        if offenders:
+            raise InvalidQuestionError(
+                "the Jev API refuses "
+                + "; ".join(offenders)
+                + " — on this wire a structured field takes a string, an object or an array, and a "
+                "question id is a non-empty string"
+            )
+        # The prompt renderer is not consulted on this surface, so the one thing it did check is
+        # checked here: a lone surrogate in the state is a value no request could carry.
+        ensure_encodable(state, where="state")
         refused: list[str] = []
         if requested != "auto":
             refused.append(f"method={requested!r} (the service picks its own method here)")
