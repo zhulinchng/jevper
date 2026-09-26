@@ -184,6 +184,188 @@ above.
 model list describes as **0.766** accuracy. For the Jev side of that comparison, see
 [`jev-comparison.md`](jev-comparison.md).
 
+## CLM, the contrastive decision model
+
+[CLM](https://github.com/Contrastive-LM/CLM) is the second open server on this wire format, and it takes a
+different route to the same place: instead of a model trained to generate, `CLM-v0.1-8B` is a frozen
+Qwen3-8B encoder with two small projection heads — a state head and an action head — trained with a
+bidirectional InfoNCE loss so that a state is pulled toward the action taken from it. A typed question is
+a state plus a closed set of candidate actions, and the softmax over their scores *is* the answer
+distribution. There is no generation anywhere in it, which is where its latency advantage comes from.
+
+It serves the System One wire format deliberately. `POST /v1/systemone` and `GET /v1/models` are the
+TypeSafe shapes, and its own client is documented as accepting questions "in the wire format" so that "a
+request written for TypeSafe replays here unchanged" — so unlike ollaya, nothing had to be added to reach
+it. `api="systemone"` and a base URL is the whole of it:
+
+```bash
+pip install contrastive-lm
+
+# the encoder: Qwen3-8B, pooling runner, last-token embeddings
+vllm serve Qwen/Qwen3-8B --served-model-name qwen3-8b --runner pooling \
+  --max-model-len 2048 --port 8090 &
+
+# the API and playground on :8700; fetches the 75 MB head into ~/.cache/clm/ on first run
+clm-serve
+```
+
+```python
+from openai import OpenAI
+from jevper import Choice, Noul, Score, SystemOneClient
+
+with SystemOneClient(
+    OpenAI(base_url="http://127.0.0.1:8700/v1", api_key="clm"),
+    model="clm-latest",
+    api="systemone",
+    noul_requires_question=False,
+) as client:
+    response = client.system_one(
+        state="Customer: my invoice was charged twice and nobody answers the phone!",
+        questions={
+            "urgency": Noul(instructions="Is this urgent?"),
+            "department": Choice(instructions="Which team should handle this?",
+                                 criteria={"billing": "Charges, invoices, refunds",
+                                           "technical": "Bugs and outages"}),
+            "frustration": Score(instructions="How frustrated is the customer?",
+                                 criteria=["Calm", "Frustrated", "Very angry"]),
+        },
+    )
+
+response.answers["department"].choice            # 'billing'
+response.answers["department"].probabilities     # keyed by the caller's own criteria keys
+response.answers["frustration"].probabilities    # {0: …, 1: …, 2: …} — the rubric's own levels
+```
+
+`CLM_BASE_URL` and `CLM_API_KEY` are what its own client reads; the server checks the key only when
+`CLM_API_KEY` was set when it started, so any non-empty `api_key` works. `clm-serve` also serves a
+playground at `/`, and `--no-ui` drops it.
+
+`GET /v1/models` answers TypeSafe's `{"models": [...]}` shape, so `list_models()` works here — the same
+parity gain ollaya offers, and unlike an OpenAI-style gateway on the same path. The two names it reports
+are `clm-latest` (the reference head, or whatever `--ckpt` names) and `clm-raw`, an ablation that takes
+the cosine in the encoder's own space with no projection head. Both routes sit under `/v1`, so one client
+object reaches both — there is no ollaya-style split to work around.
+
+### The levels arrive as text, and a noul arrives as almost nothing
+
+Both are worth knowing because they are this server's assembly code rather than the format's.
+`clm.schema.answer_from_probs` keys a score's `probabilities` and its `legend` with `str(level)`, because
+a JSON object key is text, and builds a noul as `{"type", "noul"}` and stops — no confidence, no
+distribution. jevper reads the levels back as the rubric's own indices, so `answer.probabilities[0]` and
+`answer.legend[0]` work here exactly as they do on every other System One server rather than raising a
+`KeyError` on this one alone. The noul needs no such handling: `NoulAnswer` has no confidence field to
+fill.
+
+CLM also **accepts** a noul carrying neither instructions nor criteria, reading the question id in their
+place, where the hosted Jev service answers 400. That is what `noul_requires_question=False` is for, and
+the default leaves the refusal in place, so a caller on the hosted service never has to ask for it back.
+The same flag serves ollaya, for the same reason: whether a bare noul is answerable is a property of the
+server being asked, not of the format.
+
+### `temperature` sharpens here, it does not sample
+
+CLM's `temperature` is not a sampling parameter. It divides the logits *before* the softmax, so a value
+below 1 sharpens the distribution and one above 1 flattens it, within `(0, 100]`. The same field on a
+prompt surface picks a token; here it sets how decisive the model is allowed to be, and it is worth
+reaching deliberately. jevper has no typed option for it on this wire, so it goes in `extra_body`:
+
+```python
+SystemOneClient(provider, model="clm-latest", api="systemone",
+                 extra_body={"temperature": 0.2})   # a far more decisive distribution
+```
+
+Outside that range the server answers 422 `temperature must be in (0, 100]`.
+
+### `rank()` is a `Choice` question
+
+CLM's headline primitive ranks free-form candidate strings — best-of-N answers, tool names, next moves —
+through `CLMClient.rank(context, question, answers)`. It is not a separate capability: the implementation
+is a choice question over the candidates, and that is how it is written with jevper. A rubric already
+covers it, so there is nothing to call and nothing to add.
+
+```python
+candidates = ["Escalate to billing", "Ask for a callback", "Issue a refund"]
+response = client.system_one(
+    state=ticket_body,
+    questions={"next": Choice(instructions="What should the agent do next?",
+                              criteria={str(i): c for i, c in enumerate(candidates)})},
+)
+best = candidates[int(response.answers["next"].choice)]
+```
+
+The keys are yours to choose, which is what makes the index round-trip above work. Use the candidate text
+as the key when it is short and you want the answer to be readable on its own.
+
+### `usage.billing_units` is not `usage.n_calls`
+
+CLM reports `usage.billing_units` — the number of *questions* — beside `input_tokens`, which counts
+encoder tokens spent on cache misses. jevper's `usage.n_calls` counts the *requests it made*, so one
+request that answered three questions reports `n_calls == 1` and not 3. Nothing is lost: the server's own
+count is in `response.debug`, and the two are different facts about the same call.
+
+### The state is truncated silently, and nothing reports it
+
+This is the one caveat that matters on a decision surface, and it is the server's rather than the
+format's. `clm-serve` truncates every text it embeds to `--max-tokens` (2048 by default), which has to
+match the encoder's `--max-model-len` — a state past it is cut, and `POST /v1/systemone` **does not report
+that it did**. Ollaya's native endpoint at least answers with `state_truncated`; here a truncated state
+reads as a complete one, and the decision is then about a prefix the caller never wrote.
+
+So size the state for it: raise both limits together (`--max-model-len 8192` on `vllm serve` and
+`clm-serve --max-tokens 8192`, which needs more GPU memory) or keep the state inside the default. The
+heads are trained on prose, and the server renders a structured state to `key: value` lines itself, so
+that part is not a risk — the token count is.
+
+### The heads are locked to their encoder
+
+`CLM-v0.1-8B` is a 20M-parameter pair of heads over a frozen Qwen3-8B, and a head only means anything
+with the encoder and the pooling it was trained against: **Qwen3-8B, last-token pooling**. A different
+backbone, a different pooling, or a quantized encoder produces embeddings the head was never fitted to,
+and the answers are then well-formed and wrong. That is what makes this server awkward to fit on a small
+card: Qwen3-8B in bf16 is roughly 16 GB of weights before anything else, so a 12 GB GPU cannot hold it
+at all, and the obvious workaround — quantizing the encoder — is the one thing that invalidates the
+numbers. Two further consequences worth stating plainly: CLM **only scores** the candidates it is given,
+so its probabilities are relative to that set, and the SOTA agentic numbers on its model page
+(DeepSWE 81.6%, Terminal-Bench 2.1 87.6%) come from fine-tuned heads rather than from this checkpoint
+zero-shot.
+
+### Using a `CLMClient` you already have
+
+The form above is the one to use. A program that already holds a `clm.CLMClient` — because it also calls
+`rank()` directly, or reads `CLM_BASE_URL` itself — can still reach jevper through it, because jevper's
+System One surface is reached through two low-level methods, `post(path, body=…, cast_to=…)` and
+`get(path, cast_to=…)`, and a `CLMClient` has neither. It does have the two operations those stand for.
+
+```python
+--8<-- "examples/clm_transport.py"
+```
+
+Two caveats come from `CLMClient`'s own surface rather than from jevper, and both are in the file's
+docstring. It needs the **private** `_post`, which is the only way to get a raw response body out of a
+`CLMClient` — its public `system_one()` answers dataclasses, and jevper reads the body as sent because the
+answers are the provider's numbers — so the recipe is tied to the `contrastive-lm` version you test it
+against. And `extra_headers` are not plumbed through, which costs nothing here: a `CLMClient` already
+sends `Authorization` from `CLM_API_KEY`, the only header this server reads. There is no async twin,
+because `CLMClient` is synchronous; an async program wants the `AsyncOpenAI` form above.
+
+### What was measured, and on what
+
+**The wire was measured; the predictions were not, and that is a limit of the hardware rather than a
+choice.** On **2026-09-26**, against the real `clm-serve` 0.1.0 — its real FastAPI app, its real routes,
+its real status codes and its real answer schema — running its own mock encoder
+(`tools/playground_mock.py`, hashed character n-grams standing in for Qwen3-8B). Every route, every
+status and every field on this section was read off that run with jevper 0.7.11. The *numbers* that came
+back are lexical-overlap noise and are not CLM's predictions, so no accuracy figure on this page is
+jevper's measurement and none is claimed.
+
+The real encoder was not available: the box this page's other runs use has one RTX 3080 (12 GB), and
+Qwen3-8B in bf16 does not fit on it. What that leaves unverified is the model's behaviour — which answer
+it picks, how sharp a distribution is, whether a near-tie is stable — and nothing structural. Everything
+this section asserts about jevper's side (the level keys, the noul, `temperature`, the two routes, the
+usage fields, the error body) is a property of the wire and was checked against a server implementing it
+for real. `tests/test_clm_integration.py` pins all of it without a GPU, and one test in it runs against a
+live `clm-serve` when `CLM_BASE_URL` is set.
+
 ## What to pass per server
 
 | Server | `base_url` | `model` | Thinking off | Notes |

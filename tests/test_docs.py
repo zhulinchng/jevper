@@ -208,6 +208,7 @@ _FOREIGN_NAMES = frozenset(
     {
         "APIConnectionError",
         "APITimeoutError",
+        "CLMClient",
         "ConnectError",
         "ConnectTimeout",
         "LocalProtocolError",

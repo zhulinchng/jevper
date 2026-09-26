@@ -56,6 +56,7 @@ print(answer.choice, answer.probabilities, answer.confidence)
 | Choose `logprobs`, `grammar`, `structured`, or `discrete` | [Methods](methods.md) |
 | Configure a local OpenAI-compatible server | [Local servers](local-servers.md) |
 | Run decisions locally against [Ollaya](local-servers.md#ollaya-the-decision-server), including its native endpoint | [Local servers](local-servers.md#ollaya-the-decision-server) |
+| Run decisions locally against [CLM](local-servers.md#clm-the-contrastive-decision-model), whose API is the same wire format | [Local servers](local-servers.md#clm-the-contrastive-decision-model) |
 | Inspect the complete public API and error contract | [API reference](api.md) |
 | Add native or two-step reasoning | [Reasoning](reasoning.md) |
 | Provide demonstrations to the model | [Few-shot examples](few-shot.md) |

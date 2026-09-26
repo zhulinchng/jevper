@@ -27,6 +27,13 @@ a `NativeSystemOneResponse` carrying which checkpoint a router chose, whether th
 and the run's own timings. Both are measured in
 [docs/local-servers.md](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md#ollaya-the-decision-server).
 
+The same surface also reaches [CLM](https://github.com/Contrastive-LM/CLM), which serves the Jev wire
+format at `/v1/systemone` and `/v1/models` and needs no option jevper does not already have — its own
+documentation says a request written for the Jev format replays there unchanged. Its `temperature`
+sharpens a distribution rather than sampling, and its state is truncated at 2048 tokens without saying
+so, which is the one caveat worth reading before pointing a decision at it. Measured in
+[docs/local-servers.md](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md#clm-the-contrastive-decision-model).
+
 The `responses` surface speaks both OpenAI's Responses API and the [OpenResponses](https://www.openresponses.org)
 specification, and both live at the same `/v1/responses` path — the OpenResponses site lists LM Studio among
 the ecosystem's implementers, [vLLM says its route "aligns with" it](https://github.com/vllm-project/vllm/issues/32850)
