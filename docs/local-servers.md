@@ -128,43 +128,116 @@ up to two trailing tokens that cannot be part of the answer are dropped before t
 ## Re-verified on 2026-09-26
 
 A second run over the same box, after the System One surface landed, to check that nothing about the
-prompt surfaces had moved. Ollama 0.34.3 with `qwen3.5:9b` and llama.cpp with
-`Qwen_Qwen3.5-9B-Q4_K_M.gguf`, driven through jevper's public API with a three-question call (a noul, a
-choice, a score), the method matrix, four `state` shapes, a 30-option choice with non-ASCII labels,
-examples, async parity, and the refusals:
+prompt surfaces had moved. Every server below was driven through jevper's public API with a
+three-question call (a noul, a choice, a score), the method matrix, four `state` shapes, a 30-option
+choice with non-ASCII labels, examples, async parity, and the refusals — 25 or 26 of the same 26
+checks against each, against jevper 0.7.6.
 
-| Check | Ollama 0.34.3 | llama.cpp |
-| --- | --- | --- |
-| `api="auto"` | probes the Responses route, answers on Chat Completions: `method=logprobs`, 6 calls for 3 questions | — (probe aborted, see below) |
-| `api="chat_completions"` | `method=logprobs`, **3 calls for 3 questions**, 387 input tokens, all three answers correct | `method=logprobs`, 3 calls, all three correct |
-| `api="responses"` | answers with `method=structured` — consistent with the empty logprob list in the table below | — |
+| Check | Ollama 0.34.3 | llama.cpp | vLLM 0.30.1rc1 | SGLang 0.5.20 | LM Studio 0.0.25 |
+| --- | --- | --- | --- | --- | --- |
+| `api="auto"` | probes Responses, answers on Chat Completions: `method=logprobs`, 6 calls for 3 questions | probe aborted, see below | `api=responses`, `method=logprobs`, **3 calls**, 1.2 s | `api=responses`, `method=logprobs`, **3 calls**, 1.1 s | `api=responses`, `method=logprobs`, **3 calls**, 0.5 s |
+| `api="chat_completions"` | `method=logprobs`, 3 calls, 387 input tokens | `method=logprobs`, 3 calls | `method=logprobs`, 3 calls, 393 input tokens, 0.7 s | `method=logprobs`, 3 calls, 393 input tokens, 1.1 s | `method=logprobs`, 3 calls, 366 input tokens, 0.2 s |
+| `api="responses"` | answers with `method=structured` — its logprob list comes back empty | not usable, see below | `api="auto"` selects it and reads logprobs off it; the explicit check did not run (the route's readiness request timed out) | `method=logprobs`, 3 calls | `method=logprobs`, 3 calls |
+| `method="grammar"` | reads a distribution | **fails on the 4B, see below** | reads a distribution | reads a distribution | reads a distribution |
+| 30-option choice, non-ASCII labels | works | works | sum 1.0000, `team-00` | sum 1.0000, `team-00` | sum 1.0000, `team-00` |
+| `list_models()` | not this library's shape: `MalformedAnswerError`, an OpenAI-style `data` list | **parses**: 1 model, the GGUF path | `MalformedAnswerError`, an OpenAI-style `data` list | `MalformedAnswerError`, an OpenAI-style `data` list | `MalformedAnswerError`, an OpenAI-style `data` list |
 
-The `api="auto"` cost is the documented one: ollama serves `/v1/responses` but its logprob list comes
-back empty there, so the ladder probes it, finds no distribution to read, and moves to Chat
+Three things this run settled that the 2026-09-25 pass could not.
+
+**`grammar` works wherever the server's `top_logprobs` name the alternatives.** It read a real
+distribution on ollama, vLLM, SGLang and LM Studio today. llama.cpp is the one server where it failed,
+and only on the 4B: `_LogprobsUnavailable: the provider returned 20 top_logprobs for the answer token
+'A' (method='grammar'), none of which was an alternative`. The grammar itself was honoured — the answer
+was a valid label — but a confident small model does not put the losing label in its top 20, so there is
+no distribution left to read. The same server's 9B read one on 2026-09-25, so this is a property of the
+model behind the server, not of the server. Use `logprobs` or `structured` where the readout cannot find
+the alternatives.
+
+**llama.cpp's `/v1/responses` is not usable for this wire format.** Asked for a structured answer, it
+returns a label where the schema wants a probability, and jevper refuses it: `MalformedAnswerError:
+'noul' must be a finite number, got 'A'`. Reproduced on two different models (a 9B Q4_K_M and a 4B
+Q4_K_M), so it is the shim's answer rather than one model's mistake. Its Chat Completions route
+serves the same three questions correctly.
+
+**A thinking trace that reaches the answer is a launch fact, not a reading fact.** Started without a
+thinking switch, vLLM's first answer began with the literal token `Thinking`, and jevper refused it as
+`LabelReadoutError: first non-whitespace token 'Thinking' is not one of the labels ['A', 'B']`. With
+`extra_body={"chat_template_kwargs": {"enable_thinking": false}}` — the recipe above — the same server
+answers all three questions in 1.2 s. The refusal is the point: a trace that leaked into the answer is
+visible rather than scored.
+
+The `api="auto"` cost on Ollama is the documented one: it serves `/v1/responses` but its logprob list
+comes back empty there, so the ladder probes it, finds no distribution to read, and moves to Chat
 Completions. Six requests for three questions is three answers plus three probes, and the probes are
-in `debug["llm_attempts"]`; `usage.n_calls` counts the results, not the wire.
+in `debug["llm_attempts"]`; `usage.n_calls` counts the results, not the wire. vLLM, SGLang and LM Studio
+answer on the Responses route on the first try, so `auto` costs them nothing.
 
-One harness fact worth writing down, because it is a readiness trap rather than a jevper behaviour:
-**llama.cpp answers `GET /v1/models` with 200 while it is still loading weights**, and the completion
-that follows is `503 {"error": {"message": "Loading model", "type": "unavailable_error", "code": 503}}`.
-jevper reads that as a retryable `ProviderError` and the call succeeds on a later attempt — but a
-sweep that waits on `/v1/models` to decide the server is up will start a run against a server that is
-not serving yet. Wait on a real completion instead.
+### Launching these three on a 12 GB card
 
-Not covered by this run: vLLM and SGLang (the sweep was still on the GPU queue when the notes were
-written) and LM Studio (the only 27B model on the test machine was refused by LM Studio's own resource
-guardrail — "insufficient system resources" on a 32 GB laptop — so that row still rests on the
-2026-09-25 measurement above).
+Measured on the RTX 3080 test box, where `nvidia-smi` reports 12.0 GiB but **only 10.84 GiB is ever
+free** — WSL2 holds the rest — so vLLM's default `--gpu-memory-utilization 0.92` is refused before it
+loads anything:
+
+```
+ValueError: Free memory on device cuda:0 (10.84/12.0 GiB) on startup is less than desired GPU
+memory utilization (0.92, 11.04 GiB).
+```
+
+Three settings get there, and dropping any one of them puts the failure back:
+
+```bash
+# vLLM 0.30.1rc1 — 7.55 GiB of weights, 14,043-token KV cache, serving in 37 s
+vllm serve ~/models/Qwen3.5-9B-AWQ-4bit --port 8000 \
+  --max-model-len 4096 --gpu-memory-utilization 0.87 --enforce-eager \
+  --max-num-batched-tokens 1024 --max-num-seqs 2 --reasoning-parser qwen3 \
+  --limit-mm-per-prompt '{"image":0,"video":0}'
+
+# SGLang 0.5.20 — ready in 4 s once the kernel cache exists
+python -m sglang.launch_server --model-path ~/models/Qwen3.5-9B-AWQ-4bit --port 30000 \
+  --mem-fraction-static 0.85 --context-length 4096 --max-running-requests 1 \
+  --max-mamba-cache-size 8 --reasoning-parser qwen3 --disable-cuda-graph \
+  --attention-backend triton --sampling-backend pytorch
+```
+
+- **`--limit-mm-per-prompt '{"image":0,"video":0}'`** (or `--language-model-only`): the AWQ checkpoint is
+  a `Qwen3_5ForConditionalGeneration`, so the vision tower's profiling budget is spent before the KV
+  cache is allocated. At `--gpu-memory-utilization 0.85` without it, the engine dies with
+  `ValueError: No available memory for the cache blocks.`
+- **SGLang's two backend flags**: with the default flashinfer backends the server JIT-builds a CUDA
+  kernel through ninja, and that build fails on this box with
+  `nvcc warning: incompatible redefinition for option 'compiler-bindir'` followed by
+  `RuntimeError: Ninja build failed`. `--attention-backend triton --sampling-backend pytorch` keeps it
+  off that path entirely.
+- **SGLang's CLI spelling**: this build's console script is `sglang serve`, and
+  `sglang launch_server` is refused by argparse (`invalid choice`) before anything starts.
+  `python -m sglang.launch_server` is the form that works.
+
+One more readiness trap, in the same family as llama.cpp's: **vLLM's engine can die silently in
+WSL2**, seconds after it reports a KV cache size — `RuntimeError: Engine core initialization failed.
+Failed core proc(s): {}`, with no traceback and nothing in `dmesg`. The same command served correctly
+on the next attempt, so a driver that gives up on the first failure will report a server that works.
+Retry the launch, and wait on a real completion rather than `/v1/models`.
+
+### What the probe could not decide
+
+Four or five of the probe's checks reported `ok: false` against servers that were otherwise clean, the
+same way every time, so none of them is a server result: a dead-port check that rewrites `base_url` only
+for non-loopback hosts (against `127.0.0.1` it aimed at the live server), an "empty questions" case that
+never emptied the question map, a one-option `Choice` that this library accepts by design — the Jev API
+documents a 255-option maximum and no minimum, and `tests/test_client_behaviour.py` says so — and two
+async checks that expect the refusal at a different point than the one it surfaces. They are artefacts of
+the throwaway probe, not of the servers and not of jevper.
 
 ## What each server ignores, and what it rejects
 
 Unknown fields are accepted and dropped by all five, so a field that does not apply is not an error:
 
-- `grammar` (jevper's `method="grammar"`) is a llama.cpp convention, and llama.cpp is the one server that
-  takes it: measured there, the GBNF label grammar is honoured and the readout returns a real distribution
-  (confidence above 0.9999 on a clean state). ollama, vLLM, SGLang and LM Studio ignore the field, so the
-  model answers unconstrained and the label readout reports a non-label first token instead of a grammar
-  failure. Use `logprobs` or `structured` there.
+- `grammar` (jevper's `method="grammar"`) is a llama.cpp convention, and llama.cpp honours the GBNF label
+  grammar. What differs is whether jevper can read a distribution afterwards, which depends on the
+  model's `top_logprobs` naming the other option: measured on a 9B and on a 4B that was refused with
+  `_LogprobsUnavailable` (see the 2026-09-26 section). ollama, vLLM, SGLang and LM Studio accept the
+  field and read a distribution off it. Prefer `logprobs` or `structured` where the readout reports a
+  non-label first token instead.
 - `strict: true` inside `json_schema` is ignored by ollama and honoured by vLLM and SGLang.
 - `reasoning_effort` reaches the chat template on llama.cpp, ollama and SGLang; vLLM validates it against its
   own enum and answers `400` for a value outside it (`xhigh` and `max` are the usual casualties).
