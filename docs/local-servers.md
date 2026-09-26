@@ -131,7 +131,9 @@ A second run over the same box, after the System One surface landed, to check th
 prompt surfaces had moved. Every server below was driven through jevper's public API with a
 three-question call (a noul, a choice, a score), the method matrix, four `state` shapes, a 30-option
 choice with non-ASCII labels, examples, async parity, and the refusals — 25 or 26 of the same 26
-checks against each, against jevper 0.7.6.
+checks against each, against jevper 0.7.6. vLLM, SGLang and LM Studio were each run twice — the
+second time after a reboot of the box, to check the launch recipes as well as the results — and the
+timings agree to within noise.
 
 | Check | Ollama 0.34.3 | llama.cpp | vLLM 0.30.1rc1 | SGLang 0.5.20 | LM Studio 0.0.25 |
 | --- | --- | --- | --- | --- | --- |
@@ -174,19 +176,23 @@ answer on the Responses route on the first try, so `auto` costs them nothing.
 
 ### Launching these three on a 12 GB card
 
-Measured on the RTX 3080 test box, where `nvidia-smi` reports 12.0 GiB but **only 10.84 GiB is ever
-free** — WSL2 holds the rest — so vLLM's default `--gpu-memory-utilization 0.92` is refused before it
-loads anything:
+Measured on the RTX 3080 test box under WSL2, where vLLM's own free-memory query reports **10.84 of
+12.0 GiB** and refuses its default `--gpu-memory-utilization 0.92` before it loads anything:
 
 ```
 ValueError: Free memory on device cuda:0 (10.84/12.0 GiB) on startup is less than desired GPU
 memory utilization (0.92, 11.04 GiB).
 ```
 
+That gap is not stale allocations. `nvidia-smi` reported 12,091 MiB free on a freshly restarted box
+with nothing else running, and vLLM still saw 10.84 GiB — the two disagree by about a gigabyte, and
+vLLM gates on its own view. Rebooting does not raise the ceiling, so budget from the number in the
+error rather than from `nvidia-smi`.
+
 Three settings get there, and dropping any one of them puts the failure back:
 
 ```bash
-# vLLM 0.30.1rc1 — 7.55 GiB of weights, 14,043-token KV cache, serving in 37 s
+# vLLM 0.30.1rc1 — 7.55 GiB of weights, 14,043-token KV cache; 28 s to first token after a reboot
 vllm serve ~/models/Qwen3.5-9B-AWQ-4bit --port 8000 \
   --max-model-len 4096 --gpu-memory-utilization 0.87 --enforce-eager \
   --max-num-batched-tokens 1024 --max-num-seqs 2 --reasoning-parser qwen3 \
@@ -214,9 +220,17 @@ python -m sglang.launch_server --model-path ~/models/Qwen3.5-9B-AWQ-4bit --port 
 
 One more readiness trap, in the same family as llama.cpp's: **vLLM's engine can die silently in
 WSL2**, seconds after it reports a KV cache size — `RuntimeError: Engine core initialization failed.
-Failed core proc(s): {}`, with no traceback and nothing in `dmesg`. The same command served correctly
-on the next attempt, so a driver that gives up on the first failure will report a server that works.
-Retry the launch, and wait on a real completion rather than `/v1/models`.
+Failed core proc(s): {}`, with no traceback and nothing in `dmesg`. It happened twice on the day of
+this run, and the identical command served correctly on the next attempt, so a driver that gives up on
+the first failure will report a server that works. Retry the launch, keep the server log and the
+client-side log in different files so a crash leaves evidence, and wait on a real completion rather
+than `/v1/models`.
+
+One more trap specific to vLLM, and it is a trap for a readiness *ping* rather than for jevper: a bare
+`POST /v1/responses {"model": …, "input": "hi"}` never answers — it times out at 25 s, twice on this
+box. The route itself is fine, because `api="auto"` selects it and reads logprobs off it
+(`api=responses method=logprobs`, 3 calls, 1.1 s). So a bare-ping timeout on that route means nothing
+about whether jevper can use it, and waiting on one will hang a sweep that would otherwise pass.
 
 ### What the probe could not decide
 
