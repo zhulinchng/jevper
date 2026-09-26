@@ -338,3 +338,20 @@ def test_example_answer_prefers_an_exact_key_over_a_label(stub_server):
     sent = stub.bodies("/chat/completions")[0]
     demonstrated = [m["content"] for m in sent["messages"] if m["role"] == "assistant"]
     assert demonstrated == ["B"]  # the label of the option keyed "a", not the first label "A"
+
+
+def test_an_unusable_example_state_costs_no_request_behind_another_question(stub_server):
+    """``_prepare`` resolves every question's examples before any request, and an example's state is
+    half of an example. Left to the worker, the second question's bad state failed only after the first
+    question's call had been paid for — on a call that was locally invalid from the start."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+    questions = {
+        "first": Choice(criteria=CRITERIA),
+        "second": Choice(criteria=CRITERIA, examples=[Example(state={1, 2}, answer="billing")]),
+    }
+
+    with pytest.raises(JevperError, match="example 0"):
+        client.system_one(state="s", questions=questions)
+
+    assert stub.requests == []

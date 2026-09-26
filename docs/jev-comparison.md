@@ -12,7 +12,7 @@ Where something could not be measured, it says so rather than guessing — see
 | Service | `POST https://opencode.ai/zen/v1/systemone`, the Jev endpoint opencode Zen serves |
 | Model | `jev-1.13-free`; the paid `jev-1.13` answered HTTP 402 on this account |
 | Reference client | `typesafe-sdk` 0.7.1 from PyPI, installed and read for the contract it encodes |
-| jevper | 0.7.10 on this branch, `.venv` (Python 3.14, openai 3.19.0). The confidence and score arithmetic below was measured on 0.7.4, before the System One surface existed; every Jev wire-format measurement was taken on 2026-09-26 against 0.7.8, which this page does not re-measure. The Ollaya run in [local servers](local-servers.md#ollaya-the-decision-server) is 0.7.10 |
+| jevper | 0.7.11 on this branch, `.venv` (Python 3.14, openai 3.19.0). The confidence and score arithmetic below was measured on 0.7.4, before the System One surface existed; every Jev wire-format measurement was taken on 2026-09-26 against 0.7.8, which this page does not re-measure. The Ollaya run in [local servers](local-servers.md#ollaya-the-decision-server) is 0.7.11 |
 | Published docs | TypeSafe's API reference, confidence page, and the `jev-1.13` jaggedness page (reviewed 2026-09-17) |
 
 ## jevper can call this endpoint

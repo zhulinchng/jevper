@@ -176,7 +176,7 @@ RTX 3080 (12 GB). `laya:en` and `laya:typed-decisions` are 854 MB each; the `lay
 pulls `laya:multilingual` (684 MB) as its second target. The daemon chose **F16 on `cuda:0`**, which
 `ollaya ps` reports and which is worth knowing: ollaya's own model card notes the F16 graph can differ
 from F32 when the top two options are within 0.01 of each other, so a near-tied answer is not stable
-across precisions. All of it is jevper 0.7.10 driven through the public API, plus raw HTTP for the tables
+across precisions. All of it is jevper 0.7.11 driven through the public API, plus raw HTTP for the tables
 above.
 
 `laya:en` is a 421M-parameter ModernBERT-large, ONNX, onnxruntime, with `choice` and `score` capabilities;

@@ -10,7 +10,7 @@ extra_css:
 
 # The footer version is asserted against jevper.__version__ by tests/test_release_hygiene.py; see
 # the "Claims and releases" section of docs/contributing.md.
-copyright: "Copyright © 2026 Zhu Lin · jevper 0.7.10"
+copyright: "Copyright © 2026 Zhu Lin · jevper 0.7.11"
 
 theme:
   name: material

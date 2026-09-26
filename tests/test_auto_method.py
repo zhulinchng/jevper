@@ -216,10 +216,11 @@ def test_auto_falls_back_inside_two_step_reasoning(stub_server):
 
     assert response.debug["reasoning_mode"] == "two_step"
     assert response.debug["methods"] == {"q": "structured"}
-    # Analysis, rejected answer, analysis again, structured answer. The rejected attempt is not in
-    # n_calls (it produced no usage), so the request count is what shows the cost.
-    assert len(stub.bodies("/chat/completions")) == 4
-    assert response.usage.n_calls == 3
+    # Analysis, rejected answer, structured answer. The rejected attempt is not in n_calls (it
+    # produced no usage), and the analysis is bought once: the fallback re-asks how to read the
+    # answer, not what the question is about.
+    assert len(stub.bodies("/chat/completions")) == 3
+    assert response.usage.n_calls == 2
 
 
 def test_auto_falls_back_on_the_responses_surface(stub_server):
@@ -942,3 +943,22 @@ def test_an_explicit_logprobs_call_moves_surface_on_an_unsupported_include(stub_
     assert response.answers["q"].choice == "billing"
     assert response.debug["api"] == "chat_completions"
     assert "retrying the label readout on api='chat_completions'" in response.debug["retry_reasons"][0]
+
+
+def test_a_stale_downgrade_cannot_move_a_remembered_limit_back_up(stub_server):
+    """Two questions on one call run concurrently, each holding the snapshot its transport was built
+    with, so a downgrade computed from the older one can land after a sibling has already walked
+    further down. Writing it wholesale would put that rung back, and the next call would re-send the
+    very field the server had refused twice."""
+    from jevper.transport import Limits
+
+    client = SystemOneClient(openai_client(stub_server()), model="stub")
+    base = Limits()
+    key = ("stub", "chat_completions")
+
+    client._remember_limits("stub", "chat_completions", base, Limits(structured="object"))
+    client._remember_limits("stub", "chat_completions", base, Limits(structured="none"))
+    # The stale question now reports the rung it discovered, from before either of those.
+    client._remember_limits("stub", "chat_completions", base, Limits(structured="object"))
+
+    assert client._limits[key].structured == "none"

@@ -407,3 +407,35 @@ def test_a_strict_client_reads_the_same_frames(stub_server):
 
     assert caught.value.status_code == 429
     assert "slow down" in str(caught.value)
+
+
+def crlf(text: str) -> str:
+    """The same stream with the other line ending SSE allows."""
+    return text.replace("\n", "\r\n")
+
+
+def test_a_crlf_framed_stream_still_yields_the_providers_status(stub_server):
+    """SSE permits CRLF, and a body framed with it contains no ``"\\n\\n"`` at all.
+
+    Splitting on the LF pair alone reads the whole stream as one frame, joins its data lines into
+    invalid JSON, and reports a provider's ``503`` as the protocol mismatch — a verdict that is not
+    retryable, so a transient failure upstream is written off for the life of the call.
+    """
+    stream = crlf(
+        event_frame(
+            "response.created", {"type": "response.created", "response": {"status": "in_progress"}}
+        )
+        + error_frame(503, "upstream busy")
+    )
+    server = stub_server(responses=lambda _: (200, stream, STREAM_HEADERS))
+
+    client = SystemOneClient(
+        openai_client(server), model="stub", api="responses", method="structured",
+        retry=RetryPolicy(n_retries=1, base_delay=0.0, max_delay=0.0),
+    )
+    with pytest.raises(ProviderError) as caught:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert caught.value.status_code == 503
+    assert "upstream busy" in str(caught.value)
+    assert len(server.bodies("/responses")) == 2, "the status is read, so the frame is retried"

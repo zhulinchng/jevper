@@ -33,6 +33,8 @@ from jevper import (
     AsyncSystemOneClient,
     Choice,
     ClientCapabilityError,
+    InvalidQuestionError,
+    JevperError,
     MalformedAnswerError,
     NativeSystemOneResponse,
     Noul,
@@ -354,15 +356,16 @@ def test_a_routing_report_that_cannot_be_read_is_a_jevper_error(stub_server):
         client.system_one(state=STATE, questions=QUESTIONS)
 
 
-def test_a_routing_field_that_is_not_an_object_reads_as_no_routing(stub_server):
-    """A value of the wrong type is the endpoint not reporting a router at all, and there is nothing
-    there to fail to read."""
-    stub = stub_server(decide=answering(native_body(routing="english")))
+@pytest.mark.parametrize("routing", ["english", ["english"], 3], ids=["string", "list", "number"])
+def test_a_routing_field_that_is_not_an_object_is_unreadable(stub_server, routing):
+    """``null`` is how the endpoint says a model named directly answered, so it is the one value that
+    reads as no router. Anything else that is not an object is a report that could not be read, and
+    reading it as "no router" would assert something the service never said."""
+    stub = stub_server(decide=answering(native_body(routing=routing)))
 
-    with native_client(stub) as client:
-        response = client.system_one(state=STATE, questions=QUESTIONS)
-
-    assert response.routing is None
+    client = native_client(stub)
+    with pytest.raises(MalformedAnswerError, match="must be an object or null"):
+        client.system_one(state=STATE, questions=QUESTIONS)
 
 
 @pytest.mark.parametrize(
@@ -432,10 +435,19 @@ def test_usage_is_counted_once_for_the_shared_request(stub_server):
 # Skipped unless OLLAYA_BASE_URL is set, e.g.
 #   OLLAYA_BASE_URL=http://127.0.0.1:11435/v1 OLLAYA_MODEL=laya:en pytest tests/test_ollaya_native.py
 OLLAYA_BASE_URL = os.environ.get("OLLAYA_BASE_URL")
+OLLAYA_ROOT_URL = os.environ.get("OLLAYA_ROOT_URL") or (
+    OLLAYA_BASE_URL[: -len("/v1")] if OLLAYA_BASE_URL and OLLAYA_BASE_URL.endswith("/v1") else None
+)
+"""Where ``/api/decide`` lives, which is the server root rather than the ``/v1`` prefix the TypeSafe
+routes answer under. Derived from ``OLLAYA_BASE_URL`` unless given, because the two routes sit at
+different depths and one base URL reaches only one of them."""
 
 
 @pytest.mark.skipif(not OLLAYA_BASE_URL, reason="OLLAYA_BASE_URL is not set")
-def test_ollaya_answers_one_request_and_reports_its_own_route() -> None:
+def test_ollaya_answers_three_questions_in_one_request_and_lists_its_models() -> None:
+    """The TypeSafe route, and the parity gain with it: this server answers ``GET /v1/models`` in the
+    shape ``list_models()`` reads, which a gateway answering that path OpenAI-style is reported as
+    getting wrong."""
     from openai import OpenAI
 
     model = os.environ.get("OLLAYA_MODEL", "laya:en")
@@ -444,11 +456,147 @@ def test_ollaya_answers_one_request_and_reports_its_own_route() -> None:
         model=model,
         api="systemone",
     ) as client:
-        response = client.system_one(
-            state="I was charged twice for my subscription this month.",
-            questions={"refund": Noul(instructions="Does the customer ask for a refund?")},
-        )
+        response = client.system_one(state=STATE, questions=QUESTIONS)
+        models = [entry.name for entry in client.list_models()]
 
-    assert set(response.answers) == {"refund"}
-    assert 0.0 <= response.answers["refund"].noul <= 1.0
+    assert set(response.answers) == {"refund", "team", "severity"}
     assert response.usage.n_calls == 1
+    assert model in models
+
+
+@pytest.mark.skipif(not OLLAYA_ROOT_URL, reason="OLLAYA_ROOT_URL is not set")
+def test_ollaya_answers_on_its_native_route_and_reports_the_request() -> None:
+    """``/api/decide`` at the server root: the route the native report exists for, and the only base
+    URL that reaches it."""
+    from openai import OpenAI
+
+    model = os.environ.get("OLLAYA_MODEL", "laya:en")
+    with SystemOneClient(
+        OpenAI(base_url=OLLAYA_ROOT_URL, api_key="ollaya", max_retries=0),
+        model=model,
+        api="systemone",
+        native=True,
+    ) as client:
+        response = client.system_one(state=STATE, questions=QUESTIONS, extras=["laya"])
+
+    assert isinstance(response, NativeSystemOneResponse)
+    assert set(response.answers) == {"refund", "team", "severity"}
+    assert response.usage.n_calls == 1
+    assert isinstance(response.created_at, str) and response.created_at
+    assert isinstance(response.done_reason, str) and response.done_reason
+    assert isinstance(response.state_truncated, bool)
+    assert all(
+        isinstance(getattr(response, name), int | None)
+        for name in ("total_duration", "load_duration", "eval_duration")
+    )
+    assert all(answer.laya is not None for answer in response.answers.values())
+
+
+# --- what the report says when the endpoint says nothing, or the wrong thing ---------------------
+
+
+def test_a_null_reason_reads_as_no_prose(stub_server):
+    """``reason`` is the one routing field with a default, and ``null`` is how this endpoint spells an
+    absent value everywhere else — the same spelling ``act_probability`` uses. Reading it as unreadable
+    would throw away a call whose answers all parsed."""
+    stub = stub_server(
+        decide=answering(
+            native_body(
+                routing={"router": "laya:latest", "model": "laya:en", "route": "english",
+                         "reason": None}
+            )
+        )
+    )
+
+    response = native_client(stub).system_one(state=STATE, questions=QUESTIONS)
+
+    assert response.routing.reason == ""
+    assert response.routing.route == "english"
+
+
+@pytest.mark.parametrize(
+    "laya",
+    [{"confidence": 0.5, "act_probability": 7.5}, {"confidence": 0.5, "act_probability": float("nan")}],
+    ids=["out-of-range", "nan"],
+)
+def test_an_act_probability_outside_zero_to_one_is_refused(stub_server, laya):
+    """It is declared a probability and sits beside a ``confidence`` that is bounded, so an unbounded
+    one would let a number that cannot be a probability through as one."""
+    answers = {"refund": {**NOUL, "laya": laya}}
+    stub = stub_server(decide=answering(native_body(answers)))
+
+    client = native_client(stub)
+    with pytest.raises(MalformedAnswerError, match="act_probability"):
+        client.system_one(state=STATE, questions=QUESTIONS, extras=["laya"])
+
+
+def test_a_null_native_scalar_reads_as_the_default_and_a_string_flag_is_not_true(stub_server):
+    """``str(None)`` is the four-character string ``"None"`` and ``bool("false")`` is ``True``, so
+    neither can be how these are read: ``created_at`` is documented as a timestamp to compare against
+    the service's own log, and ``state_truncated`` is a flag a caller branches on."""
+    stub = stub_server(
+        decide=answering(
+            native_body(created_at=None, done_reason=None, state_truncated="false")
+        )
+    )
+
+    response = native_client(stub).system_one(state=STATE, questions=QUESTIONS)
+
+    assert response.created_at == ""
+    assert response.done_reason == "decide"
+    assert response.state_truncated is False
+
+
+# --- the two flags the documented ollaya call uses together --------------------------------------
+
+
+def test_a_bare_noul_is_answered_on_the_native_route_when_the_rule_is_lifted(stub_server):
+    """The combination ``docs/local-servers.md`` tells a reader to copy: ollaya reads the question id
+    in place of a missing instruction, and the native endpoint is the route that carries the report."""
+    stub = stub_server(decide=answering(native_body({"bare": {"type": "noul", "noul": 0.428}})))
+
+    with native_client(stub, noul_requires_question=False) as client:
+        response = client.system_one(state=STATE, questions={"bare": Noul()})
+
+    assert response.answers["bare"].noul == 0.428
+    assert stub.paths == ["/api/decide"]
+
+
+def test_the_default_still_refuses_a_bare_noul_on_the_native_route(stub_server):
+    """Also the pair: ``native=True`` does not lift the rule, only the caller's own flag does."""
+    stub = stub_server(decide=answering(native_body()))
+
+    client = native_client(stub)
+    with pytest.raises(InvalidQuestionError, match="'bare'"):
+        client.system_one(state=STATE, questions={"bare": Noul()})
+
+    assert stub.requests == []
+
+
+def test_native_with_an_auto_surface_is_refused_rather_than_ignored(stub_server):
+    """``api="auto"`` never selects the systemone surface, so ``native`` could not take effect on any
+    call this client makes. Left unsaid it posts to a prompt route instead, which a server serving
+    only the decision routes answers with a 404 for a path the caller never named."""
+    stub = stub_server()
+
+    client = SystemOneClient(openai_root_client(stub), model=MODEL, native=True)
+    with pytest.raises(ClientCapabilityError, match="api='auto' never selects"):
+        client.system_one(state=STATE, questions=QUESTIONS)
+
+    assert stub.requests == []
+
+
+@pytest.mark.parametrize(
+    "extras", ["laya", None, 5], ids=["a-bare-string", "None", "a-number"]
+)
+def test_a_malformed_extras_argument_is_refused_before_any_request(stub_server, extras):
+    """A ``str`` is a ``Sequence[str]`` by Python's rules, so ``extras="laya"`` type-checks and then
+    means the opposite of what it looks like — four names, one per character — and a non-iterable
+    escaped as a raw ``TypeError`` from the public method. Both are named here instead."""
+    stub = stub_server(decide=answering(native_body()))
+
+    client = native_client(stub)
+    with pytest.raises(JevperError, match="extras must be a sequence of names"):
+        client.system_one(state=STATE, questions=QUESTIONS, extras=extras)
+
+    assert stub.requests == []

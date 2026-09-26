@@ -14,6 +14,7 @@ from jevper import (
     LabelReadoutError,
     MalformedAnswerError,
     Noul,
+    ProviderError,
     ReasoningConfig,
     Score,
     SystemOneClient,
@@ -955,3 +956,18 @@ def test_a_nested_object_beside_the_answer_is_still_malformed_by_its_keys(stub_s
 
     with pytest.raises(MalformedAnswerError, match="exactly 'probabilities'"):
         client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+
+def test_grammar_is_not_rotated_onto_a_surface_that_cannot_carry_it(stub_server):
+    """A grammar is a Chat Completions convention with no counterpart on either other surface, so when
+    that route is gone there is nowhere to go. Rotating anyway spends a request whose constraint the
+    other surface drops from the body in silence, and only then reports the same verdict the caller
+    gets without it — so the 404 is the answer, and the prompt surface is never asked."""
+    stub = stub_server(responses=lambda _: (200, responses_body(text="A")))
+    client = SystemOneClient(openai_client(stub), model="stub", method="grammar")
+
+    with pytest.raises(ProviderError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert error.value.status_code == 404
+    assert stub.paths == ["/v1/chat/completions"]

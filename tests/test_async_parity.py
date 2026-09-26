@@ -17,6 +17,7 @@ from fakes import (
     anthropic_client,
     async_anthropic_client,
     async_openai_client,
+    async_openai_root_client,
     chat_body,
     messages_body,
     openai_client,
@@ -26,9 +27,14 @@ from fakes import (
 from jevper import (
     AsyncSystemOneClient,
     Choice,
+    Example,
     IncompleteAnswerError,
+    InvalidQuestionError,
     LabelReadoutError,
+    ModelMetadata,
+    Noul,
     ProviderError,
+    ReasoningConfig,
     RetryPolicy,
     SystemOneClient,
 )
@@ -405,3 +411,317 @@ def test_the_async_client_answers_a_batch_in_order(stub_server):
     assert response.answers["how_bad"].score == pytest.approx(1.6)
     assert response.answers["is_it_real"].noul == pytest.approx(0.9)
     assert response.usage.n_calls == 3
+
+
+# --- per-call overrides --------------------------------------------------------------------------
+#
+# ``docs/api.md`` promises "per-call values win over constructor defaults" without naming a facade.
+# The async driver resolves those values in its own ``system_one``, so each is shown on the wire from
+# the async call — the constructor's value on one call and the per-call value on the next, in one
+# test, so a value that was taken from the constructor is not mistaken for one that was forwarded.
+# Both calls share one event loop because the SDK's transport is bound to the loop it is first used
+# on, so a second ``asyncio.run`` against the same client would fail for a reason the test is not
+# about.
+
+CHOICE_LOGS = [("A", -0.12), ("B", -2.47), ("C", -3.48)]
+
+
+def chat_client(stub, *, model="stub", **kwargs) -> AsyncSystemOneClient:
+    return AsyncSystemOneClient(
+        async_openai_client(stub), model=model, api="chat_completions", method="structured", **kwargs
+    )
+
+
+def ask_pair(client: AsyncSystemOneClient, **overrides):
+    """The constructor's call and the per-call one, awaited in one loop."""
+
+    async def call():
+        questions = {"q": Choice(criteria=CRITERIA)}
+        first = await client.system_one(state="s", questions=questions)
+        second = await client.system_one(state="s", questions=questions, **overrides)
+        return first, second
+
+    return run(call())
+
+
+def test_a_per_call_model_reaches_the_async_wire_and_beats_the_constructor(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+    client = chat_client(stub, model="constructor-model")
+
+    ask_pair(client, model="per-call-model")
+
+    assert [body["model"] for body in stub.bodies("/chat/completions")] == [
+        "constructor-model",
+        "per-call-model",
+    ]
+
+
+def test_a_per_call_method_reaches_the_async_wire_and_beats_the_constructor(stub_server):
+    def script(body):
+        if body.get("logprobs"):
+            return 200, chat_body(content="A", logprobs=CHOICE_LOGS)
+        return 200, chat_body(content=STRUCTURED)
+
+    stub = stub_server(chat=script)
+    client = chat_client(stub)  # the constructor says "structured"
+
+    first, second = ask_pair(client, method="logprobs")
+
+    assert first.answers["q"].choice == "billing"
+    assert second.answers["q"].choice == "billing"
+    bodies = stub.bodies("/chat/completions")
+    assert bodies[0]["response_format"]["type"] == "json_schema"
+    assert bodies[0].get("logprobs") is None
+    assert bodies[1]["logprobs"] is True
+
+
+def test_a_per_call_api_reaches_the_async_wire_and_beats_the_constructor(stub_server):
+    stub = stub_server(
+        chat=lambda _: (200, chat_body(content=STRUCTURED)),
+        responses=lambda _: (200, responses_body(text=STRUCTURED)),
+    )
+    client = chat_client(stub)  # the constructor says "chat_completions"
+
+    ask_pair(client, api="responses")
+
+    assert stub.paths == ["/v1/chat/completions", "/v1/responses"]
+
+
+def test_a_per_call_reasoning_reaches_the_async_wire_and_beats_the_constructor(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+    client = chat_client(stub, reasoning=ReasoningConfig(mode="native", effort="high"))
+
+    ask_pair(client, reasoning=ReasoningConfig(mode="native", effort="low"))
+
+    assert [body.get("reasoning_effort") for body in stub.bodies("/chat/completions")] == [
+        "high",
+        "low",
+    ]
+
+
+def test_a_per_call_temperature_reaches_the_async_wire_and_beats_the_constructor(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+    client = chat_client(stub, temperature=0.0)
+
+    ask_pair(client, temperature=0.5)
+
+    assert [body.get("temperature") for body in stub.bodies("/chat/completions")] == [0.0, 0.5]
+
+
+def test_a_per_call_cache_key_reaches_the_async_wire_and_beats_the_constructor(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+    client = chat_client(stub, prompt_cache_key="constructor-key")
+
+    ask_pair(client, prompt_cache_key="per-call-key")
+
+    assert [body.get("prompt_cache_key") for body in stub.bodies("/chat/completions")] == [
+        "constructor-key",
+        "per-call-key",
+    ]
+
+
+def test_per_call_examples_reach_the_async_wire_and_beat_the_constructor(stub_server):
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+    client = chat_client(stub, examples=(Example(state="constructor example", answer="billing"),))
+
+    ask_pair(client, examples=(Example(state="per-call example", answer="billing"),))
+
+    prompts = [json.dumps(body["messages"]) for body in stub.bodies("/chat/completions")]
+    assert "constructor example" in prompts[0] and "per-call example" not in prompts[0]
+    assert "per-call example" in prompts[1] and "constructor example" not in prompts[1]
+
+
+# --- the model list, on both sides of the documented base-URL split ------------------------------
+
+MODELS = {
+    "models": [
+        {"name": "jev-1.13-free", "description": "General-purpose.", "release_date": "2026-09-15"}
+    ]
+}
+
+
+def test_the_async_model_list_is_read_from_the_v1_client(stub_server):
+    """``GET /v1/models``, the one route that lives under the version prefix."""
+    stub = stub_server(models=(200, MODELS))
+    client = AsyncSystemOneClient(async_openai_client(stub), model="jev-1.13-free")
+
+    models = run(client.alist_models())
+
+    assert [model.name for model in models] == ["jev-1.13-free"]
+    assert isinstance(models[0], ModelMetadata)
+    assert models[0].description == "General-purpose."
+    assert stub.paths == ["/v1/models"]
+
+
+def test_the_async_model_list_on_a_root_base_url_reports_the_missing_route(stub_server):
+    """A root base URL reaches ``/api/decide`` but not the model list, which is ``/v1``'s.
+
+    The root client asks ``/models``, not ``/v1/models``, so a server that serves the list under the
+    version prefix answers a 404 there — and that has to arrive as the ``ProviderError`` every other
+    provider failure arrives as, not as the SDK's own exception escaping a documented list method.
+    """
+    stub = stub_server(models=(404, {"error": {"message": "no route at /models"}}))
+    client = AsyncSystemOneClient(async_openai_root_client(stub), model="jev-1.13-free")
+
+    with pytest.raises(ProviderError) as raised:
+        run(client.alist_models())
+
+    assert raised.value.status_code == 404
+    assert "404" in str(raised.value)
+    assert stub.paths == ["/models"]
+
+
+# --- the async lifecycle -------------------------------------------------------------------------
+
+
+def test_the_async_context_manager_yields_the_client_and_keeps_the_callers_client_open(stub_server):
+    """``async with`` hands back the configured client; ``aclose`` touches nothing the caller owns.
+
+    The async facade holds no pool of its own, so ``aclose`` is safe to call any number of times and
+    the caller's provider client — which jevper never closes — is the one that must still be open.
+    """
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+    provider = async_openai_client(stub)
+    configured = AsyncSystemOneClient(
+        provider, model="stub", api="chat_completions", method="structured"
+    )
+
+    async def call():
+        async with configured as entered:
+            assert entered is configured
+            await configured.aclose()
+            await configured.aclose()
+        # Still usable after ``aclose``: nothing was torn down that a call needs.
+        return await configured.system_one(
+            state="s",
+            questions={"a": Choice(criteria=CRITERIA), "b": Choice(criteria=CRITERIA)},
+        )
+
+    response = run(call())
+    assert set(response.answers) == {"a", "b"}
+    assert provider.is_closed() is False
+
+
+def test_the_async_exit_closes_on_the_exception_path(stub_server):
+    """A call that raises inside ``async with`` still runs ``__aexit__``'s release, not a bare return."""
+    released: list[int] = []
+
+    class Spy(AsyncSystemOneClient):
+        async def aclose(self) -> None:
+            released.append(1)
+            await super().aclose()
+
+    configured = Spy(
+        async_openai_client(stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))),
+        model="stub",
+        api="chat_completions",
+        method="structured",
+    )
+
+    async def call():
+        async with configured:
+            raise RuntimeError("the caller's own failure")
+
+    with pytest.raises(RuntimeError, match="the caller's own failure"):
+        run(call())
+    assert released == [1]
+
+
+# --- the bare noul, on the async facade ----------------------------------------------------------
+
+NOUL_ANSWER = {"model": "stub", "answers": {"n": {"type": "noul", "noul": 0.1249}}, "usage": {}}
+
+
+def test_the_async_client_refuses_a_bare_noul_before_any_request(stub_server):
+    stub = stub_server(systemone=lambda _: (200, NOUL_ANSWER))
+    client = AsyncSystemOneClient(async_openai_client(stub), model="stub", api="systemone")
+
+    with pytest.raises(InvalidQuestionError, match="must carry instructions or criteria"):
+        run(client.system_one(state="s", questions={"n": Noul()}))
+
+    assert stub.requests == []
+
+
+def test_the_async_client_sends_a_bare_noul_when_the_caller_allows_it(stub_server):
+    """``noul_requires_question=False`` on the async constructor reaches the same relaxed rule."""
+    stub = stub_server(systemone=lambda _: (200, NOUL_ANSWER))
+    client = AsyncSystemOneClient(
+        async_openai_client(stub), model="stub", api="systemone", noul_requires_question=False
+    )
+
+    response = run(client.system_one(state="s", questions={"n": Noul()}))
+
+    assert stub.requests[0]["questions"]["n"] == {"type": "noul"}
+    assert response.answers["n"].noul == 0.1249
+
+
+# --- ollaya's native options, on the async facade ------------------------------------------------
+
+NATIVE_MODEL = "laya:en"
+NATIVE_ANSWERS = {
+    "team": {
+        "type": "choice",
+        "choice": "billing",
+        "confidence": 0.9744,
+        "probabilities": {"billing": 0.9872, "support": 0.0128},
+        "laya": {"confidence": 0.901, "act_probability": 1.0},
+    }
+}
+
+
+def native_body() -> dict:
+    return {
+        "model": NATIVE_MODEL,
+        "answers": NATIVE_ANSWERS,
+        "usage": {"input_tokens": 118, "output_tokens": 0},
+    }
+
+
+def native_client(stub) -> AsyncSystemOneClient:
+    """The native route needs the server root: ``/api/decide`` is not under ``/v1``."""
+    return AsyncSystemOneClient(
+        async_openai_root_client(stub), model=NATIVE_MODEL, api="systemone", native=True
+    )
+
+
+def test_async_extras_reach_the_native_body_and_its_laya_object_is_read(stub_server):
+    stub = stub_server(decide=lambda _: (200, native_body()))
+
+    async def call():
+        async with native_client(stub) as client:
+            return await client.system_one(
+                state="s",
+                questions={
+                    "team": Choice(
+                        instructions="Which team?",
+                        criteria={"billing": "Payments", "support": "Other"},
+                    )
+                },
+                extras=["laya"],
+            )
+
+    response = run(call())
+
+    assert stub.paths == ["/api/decide"]
+    assert stub.requests[0]["extras"] == ["laya"]
+    answer = response.answers["team"]
+    assert answer.laya is not None
+    assert answer.laya.confidence == 0.901
+    assert answer.laya.act_probability == 1.0
+    assert answer.confidence == 0.9744
+
+
+def test_async_keep_alive_reaches_the_native_body(stub_server):
+    stub = stub_server(decide=lambda _: (200, native_body()))
+
+    async def call():
+        async with native_client(stub) as client:
+            return await client.system_one(
+                state="s",
+                questions={"team": Choice(criteria={"billing": None, "support": None})},
+                keep_alive="10m",
+            )
+
+    run(call())
+
+    assert stub.requests[0]["keep_alive"] == "10m"

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -204,14 +205,24 @@ def _api_schema(schema: Any) -> Any:
     return schema
 
 
-def _caller_body(extra_body: Mapping[str, Any] | None, limits: Limits) -> dict[str, Any]:
-    """The caller's own request fields, minus the capability fields this server has refused.
+def _caller_body(
+    extra_body: Mapping[str, Any] | None,
+    limits: Limits,
+    *,
+    native: bool | None = None,
+) -> dict[str, Any]:
+    """The caller's own request fields, minus the fields this call cannot carry.
 
     The SDK merges ``extra_body`` into the request *after* the typed parameters, so a key the caller
     names there is the value that reaches the wire — including a key jevper would otherwise set. The
     builders therefore leave those fields alone and read the caller's value as the effective one, which
     is also why a capability field the server has refused is removed here: without that, the "re-ask
     without it" the ladder promises would send the same bytes a second time.
+
+    ``native`` is the System One route this request is going to, for the two fields that exist on one
+    of them only: ``extras`` and ``keep_alive``. ``None`` is a surface with no such route — the three
+    prompt surfaces, where neither is one of jevper's fields and a caller's own use of the name is
+    their business.
     """
     body = dict(extra_body or {})
     if "model" in body:
@@ -222,13 +233,31 @@ def _caller_body(extra_body: Mapping[str, Any] | None, limits: Limits) -> dict[s
             "extra_body cannot carry 'model': pass model= to the constructor or to system_one(), "
             "where it is validated and used for the cache key and the public response"
         )
-    if body.get("stream"):
-        # The SDK would merge a stream request over the typed ``stream`` jevper never sets, and the
-        # server's event stream would reach a parser built for one whole response. Refused here,
-        # where it costs nothing, rather than as an unreadable answer after the call.
-        raise JevperError(
-            "extra_body cannot ask for a stream: jevper reads the answer from one non-streaming "
-            "response, so remove 'stream' (or set it to false)"
+    if "stream" in body:
+        if body["stream"]:
+            # The SDK would merge a stream request over the typed ``stream`` jevper never sets, and the
+            # server's event stream would reach a parser built for one whole response. Refused here,
+            # where it costs nothing, rather than as an unreadable answer after the call.
+            raise JevperError(
+                "extra_body cannot ask for a stream: jevper reads the answer from one non-streaming "
+                "response, so remove 'stream' (or set it to false)"
+            )
+        # The remedy that refusal offers — "remove 'stream' (or set it to false)" — has to leave a
+        # body with no such key either way, so the field is dropped rather than forwarded as a falsy
+        # value: the name itself is what a route reserves (ollaya answers a request that sets it),
+        # and an absent field is what "not streaming" is spelled as everywhere else here.
+        body.pop("stream")
+    if native is False and ("extras" in body or "keep_alive" in body):
+        # Ollaya's two native request fields, refused on the TypeSafe route. The refusal that says so
+        # lives in the client, which sees the typed parameters only, so a caller who reached the same
+        # fields through ``extra_body`` would post them to a route that answers 200 and ignores them:
+        # every answer would come back with no ``laya`` object and nothing said about why. Checked
+        # here, where the request is, and refused by name before anything is sent — the same verdict,
+        # in the same words, as the typed parameter gets.
+        asked = [name for name in ("extras", "keep_alive") if name in body]
+        raise ClientCapabilityError(
+            f"api='systemone' cannot carry {', '.join(asked)}; those belong to ollaya's native "
+            "endpoint, so build the client with native=True to reach them"
         )
     if limits.structured != "schema":
         # The server refused the schema field once, so the caller's format field goes too — whatever it
@@ -471,6 +500,24 @@ def _usable_choice(choice: Any) -> bool:
     return isinstance(_get(choice, "text"), str)
 
 
+def _item_list(value: Any, *, carrier: str) -> list[Any]:
+    """A field these APIs type as a list of items, as that list; anything else as nothing to read.
+
+    ``choices``, the Responses ``output`` and the Messages ``content`` are lists of objects in every
+    spelling of these APIs, and the readers below walk them. A body that puts a mapping, a string or
+    a number there would otherwise raise ``KeyError``/``TypeError`` from the middle of that walk — a
+    stdlib error out of a layer whose contract is that a caller-detectable problem arrives as a
+    ``JevperError`` — or, walked as a mapping's keys, read as an empty answer that no provider sent.
+    Both are the verdict an empty list already gets: this body carries no answer to read, and the
+    caller is told which field was missing it rather than what an integer did to a subscript.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    raise ClientCapabilityError(f"provider returned no {carrier}")
+
+
 def _chat_reasoning_tokens(usage: Any, details: Any) -> Any:
     """The reasoning-token count, from the nested detail object or the top level of ``usage``.
 
@@ -677,8 +724,13 @@ def _event_stream_error(text: str) -> ProviderError | None:
     and the same ``error``. Both hold the one thing a caller needs — what failed, and with which
     status, which is what decides whether retrying is worth anything — so both are read, and only a
     stream that carries no failure of its own is reported as the protocol mismatch it is.
+
+    Frames are separated by a blank line, and SSE allows either line ending: a body framed with CRLF
+    contains no ``"\\n\\n"`` at all, so splitting on that alone reads the whole stream as one frame,
+    joins its data lines into invalid JSON and reports a provider's 503 as the protocol mismatch —
+    which is not retryable. Either ending separates the events.
     """
-    for frame in text.split("\n\n"):
+    for frame in re.split(r"\r?\n\r?\n", text):
         lines = [line for line in frame.splitlines() if line.strip()]
         if not lines:
             continue
@@ -779,7 +831,7 @@ def _chat_result(response: Any, request: dict[str, Any]) -> CallResult:
     failure = _embedded_error(response)
     if failure is not None:
         raise failure
-    choices = _get(response, "choices") or []
+    choices = _item_list(_get(response, "choices"), carrier="choices")
     choice = choices[0] if choices else None
     if not _usable_choice(choice):
         if _get(choice, "delta") is not None:
@@ -855,7 +907,11 @@ def _answer_messages(response: Any) -> list[Any]:
     those count; with no labels every message counts, as before. A response whose every message is
     commentary has no answer to read, which the empty-answer path then reports.
     """
-    messages = [item for item in _get(response, "output") or [] if _get(item, "type") == "message"]
+    messages = [
+        item
+        for item in _item_list(_get(response, "output"), carrier="output items")
+        if _get(item, "type") == "message"
+    ]
     final = [item for item in messages if _get(item, "phase") == "final_answer"]
     if final:
         return final
@@ -895,7 +951,7 @@ def _responses_refusal(response: Any) -> str | None:
     ``output_text`` turns a refusal into an empty answer — true, and useless, the same way the other
     two would be without their own reader.
     """
-    for item in _get(response, "output") or []:
+    for item in _item_list(_get(response, "output"), carrier="output items"):
         if _get(item, "type") != "message":
             continue
         for part in _get(item, "content") or []:
@@ -913,7 +969,7 @@ def _responses_token_logprobs(response: Any) -> tuple[TokenLogprob, ...]:
 
 
 def _responses_reasoning(response: Any) -> tuple[ReasoningContentPart, ...]:
-    return _reasoning_parts(_get(response, "output"))
+    return _reasoning_parts(_item_list(_get(response, "output"), carrier="output items"))
 
 
 def _responses_result(response: Any, request: dict[str, Any]) -> CallResult:
@@ -1108,7 +1164,7 @@ def build_messages_kwargs(
 def _messages_text(response: Any) -> str:
     return "".join(
         str(_get(block, "text") or "")
-        for block in _get(response, "content") or ()
+        for block in _item_list(_get(response, "content"), carrier="content blocks")
         if _get(block, "type") == "text"
     )
 
@@ -1122,7 +1178,7 @@ def _messages_reasoning(response: Any) -> tuple[ReasoningContentPart, ...]:
     omitted, and a part with no text would make ``reasoning_text`` return an empty line.
     """
     parts: list[ReasoningContentPart] = []
-    for block in _get(response, "content") or ():
+    for block in _item_list(_get(response, "content"), carrier="content blocks"):
         if _get(block, "type") != "thinking":
             continue
         text = _get(block, "thinking")
@@ -1190,13 +1246,14 @@ def build_systemone_kwargs(
     works unchanged.
 
     The caller's ``extra_body`` is merged the way the other three surfaces merge it — its value is
-    the value on the wire — except for the two fields ``_caller_body`` refuses everywhere: a
-    ``model`` there would put a different model on the wire than the one this call reports, and a
-    ``stream`` would arrive as an event stream jevper has no way to read.
+    the value on the wire — except for the fields ``_caller_body`` refuses: a ``model`` there would
+    put a different model on the wire than the one this call reports, a ``stream`` would arrive as an
+    event stream jevper has no way to read, and ``extras``/``keep_alive`` belong to the native route,
+    so on the TypeSafe one they are refused by name rather than sent to a service that ignores them.
     """
     if spec.systemone is None:  # pragma: no cover - the System One runner always sets it
         raise ClientCapabilityError("a System One request needs a payload")
-    caller = _caller_body(extra_body, limits)
+    caller = _caller_body(extra_body, limits, native=spec.native)
     body: dict[str, Any] = {
         "state": spec.systemone.state,
         "model": model,
@@ -1206,9 +1263,13 @@ def build_systemone_kwargs(
         },
         **caller,
     }
-    if spec.extras:
+    # Both of these are the caller's to decide, and ``extra_body`` is where they said it: the SDK
+    # merges that body over the typed parameters, so a value set here as well would make the request
+    # recorded in ``debug`` disagree with the one the provider received. The guard is the one the
+    # other three builders use for every field they own.
+    if spec.extras and "extras" not in body:
         body["extras"] = list(spec.extras)
-    if spec.keep_alive is not None:
+    if spec.keep_alive is not None and "keep_alive" not in body:
         # Absent and null mean the same thing there, so a caller who set nothing sends no field and
         # the service's own default stands.
         body["keep_alive"] = spec.keep_alive

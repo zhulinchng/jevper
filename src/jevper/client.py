@@ -114,6 +114,12 @@ def _is_transient_status(status: int | None) -> bool:
     return status is not None and (status in TRANSIENT_STATUS_CODES or status >= 500)
 
 
+STRUCTURED_RUNGS = ("schema", "object", "none")
+"""The structured-output ladder, hardest first. A refusal moves a server one rung down it and nothing
+moves one back up, so the remembered limit keeps the furthest rung any question reached — see
+:meth:`_BaseClient._remember_limits`."""
+
+
 def _is_server_error(status: int | None) -> bool:
     """Whether the provider answered with a 5xx of its own: never the request's fault."""
     return status is not None and status >= 500
@@ -946,6 +952,14 @@ class _CallContext:
     extras: tuple[str, ...] = ()
     keep_alive: str | int | None = None
     """Ollaya's own request options for that endpoint; see ``CallSpec.extras``."""
+    analysis: dict[tuple[str, str], tuple[tuple[Any, ...], str, list[dict[str, str]]]] = field(
+        default_factory=dict
+    )
+    """Each question's analysis-pass output, keyed by question and surface: its reasoning, its text and
+    the prompt it came from. The analysis is the half of a two-step call that does not depend on how
+    the answer is read, so when a method falls back and the question is asked again its trace is reused
+    rather than bought twice — the identical request would return the identical reasoning. One worker
+    owns each key, so no lock is needed."""
 
 
 @dataclass
@@ -1185,15 +1199,21 @@ def _is_bare_scalar(value: Any) -> bool:
 
 
 def _routing(raw: Any) -> Routing | None:
-    """The router's own report, or ``None`` when the body carried none to read.
+    """The router's own report, or ``None`` when the endpoint reported that there was none.
 
-    Wrapped like every other provider payload in this library. An object that does not hold the
-    fields it is documented to hold is a response that could not be read, and that is reported as
-    this library's error rather than as a pydantic one escaping from inside assembly — where a
-    caller writing the documented ``except JevperError`` would not catch it.
+    ``null`` is how the endpoint says a model named directly answered — the live daemon sends exactly
+    that for ``laya:en`` — so ``None`` is a value the service sent, not a gap to fill. Anything else
+    that is not an object is a report that could not be read, and it is reported the way a malformed
+    one is: ``parse_answer`` refuses this same shape of payload with the same reasoning, and answering
+    "no router" about a string would assert something the service never said.
     """
-    if not isinstance(raw, Mapping):
+    if raw is None:
         return None
+    if not isinstance(raw, Mapping):
+        raise MalformedAnswerError(
+            "the routing report must be an object or null, as the native endpoint documents it; got "
+            f"{type(raw).__name__}"
+        )
     try:
         return Routing(**raw)
     except ValidationError as exc:
@@ -1205,21 +1225,22 @@ def _routing(raw: Any) -> Routing | None:
 def _native_fields(body: Any) -> dict[str, Any]:
     """The fields ollaya's native endpoint adds to a TypeSafe response, as its response type wants them.
 
-    Read the way the answers are: a field the endpoint left out keeps the type's own default rather
-    than being filled with a value the service never sent. ``state_truncated`` and ``done_reason``
-    are the exception — they describe the one request that was made, so a body without them is a
-    body that made no decision, and the defaults are the honest reading of that. A duration is a
-    measurement, so a reported ``0`` — a warm model, a call that generated nothing — is kept as one
-    and only an absent field is ``None``.
+    Read the way the answers are: a field the endpoint left out — or reported as ``null`` — keeps the
+    type's own default rather than being filled with a value the service never sent. That is why each
+    field is read by type rather than through ``str`` or ``bool``: ``str(None)`` is the four-character
+    string ``"None"``, and ``bool("false")`` is ``True``, so both would report something the endpoint
+    did not say. A duration is a measurement, so a reported ``0`` — a warm model, a call that
+    generated nothing — is kept as one and only an absent or non-integer field is ``None``.
     """
     if not isinstance(body, Mapping):
         return {}
-    routing = body.get("routing")
+    reason = body.get("done_reason")
+    created = body.get("created_at")
     fields: dict[str, Any] = {
-        "routing": _routing(routing),
-        "state_truncated": bool(body.get("state_truncated", False)),
-        "done_reason": str(body.get("done_reason", "decide")),
-        "created_at": str(body.get("created_at", "")),
+        "routing": _routing(body.get("routing")),
+        "state_truncated": body.get("state_truncated") is True,
+        "done_reason": reason if isinstance(reason, str) else "decide",
+        "created_at": created if isinstance(created, str) else "",
     }
     for name in ("total_duration", "load_duration", "eval_duration"):
         value = body.get(name)
@@ -1421,6 +1442,12 @@ class _BaseClient:
                 continue
             if candidate == "messages" and method in ("logprobs", "grammar"):
                 continue
+            if method == "grammar" and candidate != "chat_completions":
+                # A grammar is a Chat Completions convention with no counterpart on either other
+                # surface — the same reason ``_logprob_surface_alternative`` refuses to move for one.
+                # Rotating anyway spends a request whose constraint the other surface silently drops,
+                # and only then reports the ``UnsupportedMethodError`` the caller gets without it.
+                continue
             return candidate
         return None
 
@@ -1469,16 +1496,25 @@ class _BaseClient:
         concurrently, so writing that result wholesale would let a later write put back a field
         another question has meanwhile learned to leave out — and the next call would pay the same
         refusal again. Only the fields this downgrade actually changed are applied, onto whatever is
-        remembered now.
+        remembered now, and a field is never moved back up: the only ladder with more than two rungs
+        is ``structured``'s, and a rung a concurrent question already passed is kept.
         """
         key = (model, surface)
         with self._auto_lock:
             current = self._limits.get(key, base)
-            changed = {
-                entry.name: getattr(limits, entry.name)
-                for entry in dataclass_fields(Limits)
-                if getattr(limits, entry.name) != getattr(base, entry.name)
-            }
+            changed: dict[str, Any] = {}
+            for entry in dataclass_fields(Limits):
+                new = getattr(limits, entry.name)
+                if new == getattr(base, entry.name):
+                    # This downgrade did not touch the field, so whatever is remembered stands.
+                    continue
+                if entry.name == "structured" and (
+                    STRUCTURED_RUNGS.index(getattr(current, entry.name)) >= STRUCTURED_RUNGS.index(new)
+                ):
+                    # A concurrent question already walked this field past the rung this one is
+                    # heading for, and the ladder only goes one way.
+                    continue
+                changed[entry.name] = new
             if changed:
                 self._limits[key] = replace(current, **changed)
 
@@ -1785,6 +1821,17 @@ class _BaseClient:
         if effective_api not in APIS:
             raise JevperError(f"api must be one of {APIS!r}, got {effective_api!r}")
         api_auto = effective_api == "auto"
+        if api_auto and self.native:
+            # ``auto`` never selects the systemone surface — ``post`` is a method many clients have
+            # for their own reasons (see ``transport.select_surface``) — so ``native`` cannot take
+            # effect on this call whatever it resolves to. Left unsaid it posts to a prompt route
+            # instead, which against a server that serves only the decision routes answers 404 for a
+            # path the caller never named.
+            raise ClientCapabilityError(
+                "native=True posts to ollaya's /api/decide, which is the api='systemone' wire "
+                "format, and api='auto' never selects that surface; pass api='systemone' to reach "
+                "the native endpoint"
+            )
         effective_model = self.model if model is None else model
         _require_model(effective_model)
         effective_reasoning = reasoning if reasoning is not None else self.reasoning
@@ -1949,6 +1996,16 @@ class _BaseClient:
         )
         if effective_cache_key is not None:
             refused.append("prompt_cache_key= (there is no prompt here to cache)")
+        # The shape of ``extras`` first, because it is a property of the argument rather than of the
+        # route. A bare string is a ``Sequence[str]`` by Python's rules and means the opposite of what
+        # it looks like — ``tuple("laya")`` is four names, one per character — and a non-iterable
+        # escapes from the public method as a raw ``TypeError``. ``_resolve_examples`` already guards
+        # this same mistake for ``examples``.
+        if isinstance(extras, (str, bytes)) or not isinstance(extras, Iterable):
+            raise JevperError(
+                f"extras must be a sequence of names such as ['laya'], got {extras!r} "
+                f"({type(extras).__name__})"
+            )
         # Ollaya's native options, refused on the TypeSafe route with the fix that reaches them.
         # Checked apart from the list below because its advice is the opposite of theirs: these are
         # not fields to drop, they are fields of the other endpoint.
@@ -2028,8 +2085,22 @@ class _BaseClient:
                     # Checked whatever the method renders: a bad distribution must not wait for the
                     # one method that happens to show it.
                     validate_example_probabilities(question, example.probabilities, index)
+                # The example's state is rendered here for the same reason the caller's own state is
+                # rendered in ``_prepare``: it is the half of an example that reaches the prompt
+                # untouched, so a state that cannot be encoded, or that is self-referential or not a
+                # turn list, is a locally-invalid request. Left to the worker it fails after the
+                # questions ahead of this one have already spent provider calls on a call that was
+                # invalid from the start.
+                try:
+                    render_state_messages(example.state)
+                except JevperError as exc:
+                    # Rendered from the example rather than from the state the caller passed, so the
+                    # message has to say which example it came from — the renderer cannot know.
+                    raise InvalidQuestionError(f"example {index}: {exc}") from exc
             except InvalidQuestionError as exc:
                 raise InvalidQuestionError(f"question {question_id!r}: {exc}") from exc
+            except JevperError as exc:
+                raise JevperError(f"question {question_id!r}: {exc}") from exc
         return resolved
 
     def _question_steps(
@@ -2116,21 +2187,32 @@ class _BaseClient:
         trace: str | None = None
         if context.mode == "two_step":
             analysis = assemble(parts, system=ANALYSIS_SYSTEM_PROMPT)
-            result = yield CallSpec(
-                messages=analysis, reasoning=context.analysis_reasoning, prompt_cache_key=cache_key
-            )
-            unavailable = methods.answer_failure(result)
-            if unavailable is not None:
-                # The analysis is a request like any other: a trace cut off by the output budget, or
-                # filtered, is not a trace. Quoting a partial one into the answer prompt teaches the
-                # model to answer from a half-thought, and the second call would be spent proving it.
-                unavailable.attempts = log.attempts
-                raise unavailable
-            native_reasoning = result.reasoning
+            remembered = context.analysis.get((question_id, context.transport.surface))
+            if remembered is not None and remembered[2] != analysis:
+                # The prompt this trace came from is not the one this attempt would send, so the trace
+                # says nothing about the question as it is being asked now.
+                remembered = None
+            if remembered is None:
+                result = yield CallSpec(
+                    messages=analysis,
+                    reasoning=context.analysis_reasoning,
+                    prompt_cache_key=cache_key,
+                )
+                unavailable = methods.answer_failure(result)
+                if unavailable is not None:
+                    # The analysis is a request like any other: a trace cut off by the output budget,
+                    # or filtered, is not a trace. Quoting a partial one into the answer prompt teaches
+                    # the model to answer from a half-thought, and the second call would be spent
+                    # proving it.
+                    unavailable.attempts = log.attempts
+                    raise unavailable
+                remembered = (result.reasoning, result.text, analysis)
+                context.analysis[(question_id, context.transport.surface)] = remembered
+            native_reasoning, text, _ = remembered
             # A model that reasons without writing output leaves `text` empty; its reasoning items are
             # then the analysis. An empty assistant turn is never sent: several OpenAI-compatible
             # servers reject empty content, and it would teach the answer pass nothing.
-            trace = result.text.strip() or None
+            trace = text.strip() or None
             trace_text = trace or reasoning_text(native_reasoning).strip() or None
             cue = answer_cue(method)
             messages = messages + (
@@ -2542,24 +2624,27 @@ class SystemOneClient(_BaseClient):
             except BaseException as exc:  # noqa: BLE001 - re-raised below, in question order
                 failure = exc
         else:
+            # The pool is captured and every task submitted under one lock, because ``close()`` takes
+            # the same lock to shut it down: releasing it in between lets a close land in the gap and
+            # turn the next submit into a raw ``RuntimeError`` out of a method whose failures are
+            # documented as ``JevperError``. Submitting only queues work, so the lock is held briefly.
+            futures = {}
             with self._executor_lock:
                 if self._executor is None:
                     self._executor = concurrent.futures.ThreadPoolExecutor(
                         max_workers=self.max_concurrency
                     )
                 executor = self._executor
-            # Each worker runs the caller's context rather than a fresh one, so a trace or span the
-            # caller has open — MLflow's, OpenTelemetry's, or their own — still holds on this thread.
-            # A fresh context per task is what makes that safe: one Context cannot be entered twice
-            # at once, and the questions run concurrently. Without the hand-off, an enclosing span
-            # sees one question land inside it and the rest land as roots of their own, which is
-            # worse than either being consistent.
-            futures = {
-                question_id: executor.submit(
-                    contextvars.copy_context().run, self._run, question_id, question, context
-                )
-                for question_id, question in parsed.items()
-            }
+                # Each worker runs the caller's context rather than a fresh one, so a trace or span
+                # the caller has open — MLflow's, OpenTelemetry's, or their own — still holds on this
+                # thread. A fresh context per task is what makes that safe: one Context cannot be
+                # entered twice at once, and the questions run concurrently. Without the hand-off, an
+                # enclosing span sees one question land inside it and the rest land as roots of their
+                # own, which is worse than either being consistent.
+                for question_id, question in parsed.items():
+                    futures[question_id] = executor.submit(
+                        contextvars.copy_context().run, self._run, question_id, question, context
+                    )
             for question_id, future in futures.items():
                 try:
                     outcomes[question_id] = future.result()

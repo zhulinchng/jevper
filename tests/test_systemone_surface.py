@@ -282,7 +282,7 @@ def test_a_score_answered_with_levels_outside_the_rubric_is_refused(stub_server)
                                    "probabilities": {"0": 0.0, "1": 0.0, "4": 1.0}}})
     )
 
-    with pytest.raises(MalformedAnswerError, match="levels \\['4'\\]"):
+    with pytest.raises(MalformedAnswerError, match=r"got \['0', '1', '4'\]"):
         client_for(stub).system_one(state=STATE, questions={"s": SCORE})
 
 
@@ -1272,8 +1272,9 @@ def test_a_structured_field_the_wire_format_takes_is_accepted(stub_server, quest
         {"q": {"type": "choice", "choice": "billing", "confidence": 1.0,
                "probabilities": {"billing": 1.0}}}
         if question.type == "choice"
-        else {"q": {"type": "score", "score": 0.0, "confidence": 0.5, "legend": {0: {"why": "fine"}},
-                    "probabilities": {0: 1.0}}}
+        else {"q": {"type": "score", "score": 0.0, "confidence": 0.5,
+                    "legend": {0: {"why": "fine"}, 1: ["it", "is", "broken"]},
+                    "probabilities": {0: 1.0, 1: 0.0}}}
         if question.type == "score"
         else {"q": {"type": "noul", "noul": 0.7}}
     )
@@ -1319,3 +1320,68 @@ def test_a_prompt_surface_still_renders_the_state_it_always_did(stub_server):
 
     with pytest.raises(JevperError, match="non-empty list"):
         client.system_one(state=[], questions={"n": Noul(instructions="ok?")})
+
+
+# --- the score distribution ----------------------------------------------------------------------
+
+
+def test_a_score_distribution_is_keyed_by_level_index(stub_server):
+    """``legend`` and ``probabilities`` have to agree on their key type, because the caller reaches
+    both the same way: ``answer.probabilities[0]``, and ``Σ i·pᵢ`` over the levels. The wire spells a
+    JSON object's keys as text, so this surface reads them back as the indices they are."""
+    stub = stub_server(
+        systemone=answering({"s": {"type": "score", "score": 1.0, "confidence": 0.6,
+                                   "legend": {"0": "fine", "1": "broken"},
+                                   "probabilities": {"0": 0.4, "1": 0.6}}})
+    )
+
+    answer = client_for(stub).system_one(state=STATE, questions={"s": SCORE}).answers["s"]
+
+    assert set(answer.probabilities) == {0, 1}
+    assert set(answer.legend) == {0, 1}
+    assert answer.probabilities[1] == 0.6
+
+
+@pytest.mark.parametrize(
+    "probabilities",
+    [{"0": 1.0}, {}, {"0": 0.5, "1": 0.5, "2": 0.0}],
+    ids=["a-level-missing", "empty", "a-level-extra"],
+)
+def test_a_score_distribution_has_to_cover_the_rubric(stub_server, probabilities):
+    """A decision about a question is about that question, in both directions: a level outside the
+    rubric answers something else, and a rubric level with no probability is an answer the caller
+    cannot read — ``probabilities[level]`` would raise. The prompt surfaces hold a model to the same
+    exact set, so a service and a model answer under one rule."""
+    stub = stub_server(
+        systemone=answering({"s": {"type": "score", "score": 1.0, "confidence": 0.6,
+                                   "legend": {"0": "fine", "1": "broken"},
+                                   "probabilities": probabilities}})
+    )
+
+    with pytest.raises(MalformedAnswerError, match="must carry exactly this rubric's levels"):
+        client_for(stub).system_one(state=STATE, questions={"s": SCORE})
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"n": {"type": "noul", "noul": float("nan")}},
+        {"n": {"type": "noul", "noul": float("inf")}},
+        {"s": {"type": "score", "score": float("inf"), "confidence": 0.5,
+               "legend": {"0": "fine", "1": "broken"}, "probabilities": {"0": 1.0, "1": 0.0}}},
+        {"s": {"type": "score", "score": 1.0, "confidence": 0.5,
+               "legend": {"0": "fine", "1": "broken"},
+               "probabilities": {"0": float("nan"), "1": 0.5}}},
+    ],
+    ids=["noul-nan", "noul-infinity", "score-infinity", "probability-nan"],
+)
+def test_a_non_finite_number_is_not_an_answer(stub_server, answer):
+    """The wire is JSON, where ``NaN`` and ``Infinity`` are literals a reader accepts and no arithmetic
+    survives — a score of infinity is not a level and a probability that is not a number is not a
+    probability. Every other provider number in this library refuses them; these three do too."""
+    stub = stub_server(systemone=answering(answer))
+    question_id = "n" if "n" in answer else "s"
+    question = Noul(instructions="ok?") if question_id == "n" else SCORE
+
+    with pytest.raises(MalformedAnswerError, match="finite number"):
+        client_for(stub).system_one(state=STATE, questions={question_id: question})

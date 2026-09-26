@@ -325,6 +325,94 @@ def test_a_malformed_answer_is_retried_and_the_reason_names_the_failure(stub_ser
     assert "'choice' must be one of the labels" in correction["content"]
 
 
+# --- the provider's padding does not travel back to the provider ---------------------------------
+
+# A malformed answer's message is quoted verbatim into the corrective user turn and re-sent, so an
+# unbounded rendering of the provider's own text is a second request the caller pays for that carries
+# the padding back at the provider. Every provider-supplied value in these messages goes through
+# ``bounded_text`` for that reason, exactly as ``_require_root_keys`` already did for key names.
+
+
+def test_a_padded_choice_is_bounded_out_of_the_message_and_the_retry(stub_server):
+    padding = "x" * 2_000_000
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps({"choice": padding}))))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="discrete",
+        api="chat_completions",
+        n_retry_malformed=1,
+    )
+
+    with pytest.raises(MalformedAnswerError) as error:
+        client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
+
+    message = str(error.value)
+    assert "'choice' must be one of the labels" in message
+    assert "… (+" in message
+    assert len(message) < 1000
+    sent = stub.bodies("/chat/completions")
+    assert len(sent) == 2
+    assert padding not in json.dumps(sent[1])
+    assert len(json.dumps(sent[1])) < 4000
+
+
+def test_a_padded_key_name_is_bounded_out_of_the_structured_message_and_the_retry(stub_server):
+    padding = "k" * 1_000_000
+    payload = {"probabilities": {padding: 0.5, "technical": 0.5}}
+    stub = stub_server(chat=lambda _: (200, chat_body(content=json.dumps(payload))))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="structured",
+        api="chat_completions",
+        n_retry_malformed=1,
+    )
+
+    with pytest.raises(MalformedAnswerError) as error:
+        client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
+
+    message = str(error.value)
+    assert "must have exactly the option keys" in message
+    assert "… (+" in message
+    assert len(message) < 1000
+    sent = stub.bodies("/chat/completions")
+    assert len(sent) == 2
+    assert padding not in json.dumps(sent[1])
+    assert len(json.dumps(sent[1])) < 4000
+
+
+def test_a_padded_finish_reason_is_bounded_out_of_the_message(stub_server):
+    """A provider's ``finish_reason`` is its own text too, and it is quoted in the failure message.
+
+    The stop reason names the failure, so a padded one is bounded before it is rendered. An unknown
+    stop reason is the provider's own failure, not a malformed answer, so it is reported without a
+    corrective retry — there is no second request for the padding to travel in.
+    """
+    padding = "p" * 1_000_000
+    body = chat_body(content=json.dumps({"choice": "zzz"}), finish_reason=padding)
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(
+        openai_client(stub),
+        model="stub",
+        method="discrete",
+        api="chat_completions",
+        n_retry_malformed=1,
+    )
+
+    with pytest.raises(IncompleteAnswerError) as error:
+        client.system_one(state=STATE, questions={"q": Choice(criteria=CRITERIA)})
+
+    message = str(error.value)
+    assert "the provider stopped before the answer was complete" in message
+    assert "… (+" in message
+    assert len(message) < 1000
+    sent = stub.bodies("/chat/completions")
+    assert len(sent) == 1
+    assert padding not in json.dumps(sent[0])
+    assert len(json.dumps(sent[0])) < 4000
+
+
 # --- a generation the provider withheld ----------------------------------------------------------
 
 

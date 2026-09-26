@@ -345,7 +345,7 @@ class LayaExtras(BaseModel):
     """
 
     confidence: float = Field(ge=0.0, le=1.0)
-    act_probability: float | None = None
+    act_probability: float | None = Field(default=None, ge=0.0, le=1.0)
     """Whether acting on this answer is appropriate, or ``None`` for a model with no act head — the
     service reports the absence as null rather than omitting the number, and jevper says ``None``."""
 
@@ -362,10 +362,21 @@ class Routing(BaseModel):
     route: str
     reason: str = ""
 
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _no_prose_is_no_reason(cls, value: Any) -> Any:
+        """``null`` reads as the absent key does.
+
+        Every other optional native field is spelled ``null`` rather than omitted — that is what
+        ``act_probability`` is declared ``float | None`` for — so a service saying "no prose here"
+        that way is saying what an omitted key says, not sending something unreadable.
+        """
+        return "" if value is None else value
+
 
 class NoulAnswer(BaseModel):
     type: Literal["noul"] = "noul"
-    noul: float
+    noul: float = Field(allow_inf_nan=False)
     """A regression output, so any real number is a score; only a non-number is not an answer."""
     laya: LayaExtras | None = None
     """Ollaya's own confidence, when its native endpoint was asked for it. ``None`` everywhere else."""
@@ -379,9 +390,11 @@ class _Probability(BaseModel):
     jevper would have produced. The probabilities beside it are the provider's own numbers, and with
     ``normalize_probabilities=False`` they are deliberately passed through as they arrived: bounding
     them would turn a distribution the caller asked to see for themselves into a validation error.
+    Finite is not a bound, though — ``NaN`` and ``Infinity`` are not numbers to reason about, and
+    ``json.loads`` reads both literals without complaint, so they are refused here.
     """
 
-    probabilities: dict[Any, float]
+    probabilities: dict[Any, Probability]
     confidence: float = Field(ge=0.0, le=1.0)
     laya: LayaExtras | None = None
     """Ollaya's own confidence, when its native endpoint was asked for it. ``None`` everywhere else."""
@@ -393,7 +406,7 @@ class ChoiceAnswer(_Probability):
 
 class ScoreAnswer(_Probability):
     type: Literal["score"] = "score"
-    score: float
+    score: float = Field(allow_inf_nan=False)
     """The rubric's own number — a level index, or whatever scale the criteria ask for."""
     legend: dict[int, JSONContent]
 
@@ -514,12 +527,22 @@ def parse_answer(question_id: str, question: Question, payload: Any) -> Answer:
                 f"question {question_id!r}: the service's score distribution must be an object of "
                 f"level probabilities, got {type(raw).__name__}"
             )
-        unknown = sorted(str(key) for key in raw if str(key) not in levels)
-        if unknown:
+        # Both directions, because a decision has to be about the question that was asked. A level the
+        # rubric does not have is an answer to something else; a rubric level the service left out is
+        # a decision the caller cannot read, since ``answer.probabilities[level]`` is how the
+        # documented arithmetic reaches it. The prompt surfaces make the same exact-set check
+        # (``methods.readout_structured``), so a service and a model answer under one rule.
+        answered = {str(key) for key in raw}
+        if answered != levels:
             raise MalformedAnswerError(
-                f"question {question_id!r}: the service answered with levels {unknown}, which are "
-                f"not this rubric's {sorted(levels)}"
+                f"question {question_id!r}: the service's score distribution must carry exactly "
+                f"this rubric's levels {sorted(levels)}, got {sorted(answered)}"
             )
+        # The levels are this rubric's own indices, and JSON object keys are always text. ``legend``
+        # beside it is typed ``dict[int, JSONContent]`` and the prompt surfaces build these keys with
+        # ``int(level)``, so leaving them as text here would make one answer type mean two things and
+        # turn the documented ``answer.probabilities[0]`` into a KeyError on this surface alone.
+        payload = {**payload, "probabilities": {int(key): value for key, value in raw.items()}}
     if question.type == "choice":
         # The same check the score branch makes, for the same reason: a choice naming an option the
         # caller never offered is a decision about a question that was not asked, and the caller

@@ -274,7 +274,7 @@ def _truncation_message(stop: str, surface: str) -> str:
     """
     if stop in _CONTEXT_STOPS:
         return (
-            f"the provider's context window ran out before the answer was complete ({stop!r}); "
+            f"the provider's context window ran out before the answer was complete ({bounded_text(stop)!r}); "
             f"shorten the state or the examples, or use a model with a larger context"
         )
     knob, alternative = {
@@ -285,7 +285,7 @@ def _truncation_message(stop: str, surface: str) -> str:
         ),
     }.get(surface, ("max_tokens", ""))
     return (
-        f"the provider ran out of output tokens before the answer was complete ({stop!r}); "
+        f"the provider ran out of output tokens before the answer was complete ({bounded_text(stop)!r}); "
         f"raise the limit, for example extra_body={{{knob!r}: 2048}}{alternative}"
     )
 
@@ -304,7 +304,7 @@ def _stop_note(result: CallResult) -> str:
     """
     if result.stop in _TRUNCATED_STOPS:
         return f" — {_truncation_message(result.stop, result.surface)}"
-    note = f" — the provider reported {result.stop!r}" if result.stop is not None else ""
+    note = f" — the provider reported {bounded_text(result.stop)!r}" if result.stop is not None else ""
     if result.refusal:
         note += f" — the model refused to answer: {result.refusal[:200]!r}"
     elif result.stop in _REFUSAL_STOPS:
@@ -344,13 +344,13 @@ def answer_failure(result: CallResult) -> ProviderError | None:
         elif result.stop == "content_filter":
             message += ": the provider filtered the content for safety"
         if result.stop:
-            message += f" — the provider reported {result.stop!r}"
+            message += f" — the provider reported {bounded_text(result.stop)!r}"
         return ModelRefusalError(message)
     if result.stop in _TRUNCATED_STOPS:
         return IncompleteAnswerError(_truncation_message(result.stop, result.surface))
     if result.stop is not None and result.stop not in _COMPLETE_STOPS.get(result.surface, frozenset()):
         return IncompleteAnswerError(
-            f"the provider stopped before the answer was complete ({result.stop!r})"
+            f"the provider stopped before the answer was complete ({bounded_text(result.stop)!r})"
         )
     return None
 
@@ -386,7 +386,7 @@ def _agree_with_answer_text(sampled: str, text: str, labels: Sequence[str]) -> N
     if token is None or token.group(1) == named.group(1):
         return
     raise LabelReadoutError(
-        f"the sampled token {sampled!r} contradicts the answer text, which starts with the label "
+        f"the sampled token {bounded_text(sampled)!r} contradicts the answer text, which starts with the label "
         f"{named.group(1)!r}; the provider's logprobs and its text are not from the same generation"
     )
 
@@ -408,7 +408,7 @@ def first_answer_token(result: CallResult, labels: Sequence[str], *, method: Met
             _agree_with_answer_text(token.token, result.text, labels)
             return token
         raise LabelReadoutError(
-            f"first non-whitespace token {token.token!r} is not one of the labels {list(labels)!r}"
+            f"first non-whitespace token {bounded_text(token.token)!r} is not one of the labels {list(labels)!r}"
             f"{_stop_note(result)}"
         )
     raise LabelReadoutError(
@@ -426,7 +426,8 @@ def _logprob_readout(
     token = first_answer_token(result, labels, method=method)
     if token.logprob is None:
         raise LabelReadoutError(
-            f"the provider returned no logprob for the answer token {token.token!r} (method={method!r})"
+            f"the provider returned no logprob for the answer token {bounded_text(token.token)!r} "
+            f"(method={method!r})"
         )
     if len(labels) == 1:
         # A one-option question has no distribution to read: the sampled token is the answer and the
@@ -448,7 +449,7 @@ def _logprob_readout(
         unusable = "" if token.reported_alternatives < 2 else ", none of which carried a logprob"
         raise _LogprobsUnavailable(
             f"the provider returned {token.reported_alternatives} top_logprobs{unusable} for the answer "
-            f"token {token.token!r} (method={method!r}), which is not a distribution over the options; "
+            f"token {bounded_text(token.token)!r} (method={method!r}), which is not a distribution over the options; "
             f"use method='structured' for the model's own probabilities, or method='discrete' for one "
             f"label",
             evidence="readout",
@@ -465,11 +466,11 @@ def _logprob_readout(
         # non-option token cannot smuggle an impossible value through.
         if math.isnan(top_logprob) or top_logprob == float("inf"):
             raise LabelReadoutError(
-                f"logprob for the alternative token {top_token!r} must be finite, got {top_logprob!r}"
+                f"logprob for the alternative token {bounded_text(top_token)!r} must be finite, got {top_logprob!r}"
             )
         if top_logprob > 0.0:
             raise LabelReadoutError(
-                f"logprob for the alternative token {top_token!r} is positive ({top_logprob!r}), "
+                f"logprob for the alternative token {bounded_text(top_token)!r} is positive ({top_logprob!r}), "
                 "which no log probability can be — the provider sent something other than logprobs"
             )
         candidate = ascii_upper(top_token.strip())
@@ -482,7 +483,7 @@ def _logprob_readout(
         # normalizing over it alone would report certainty the provider never expressed.
         raise _LogprobsUnavailable(
             f"the provider returned {token.reported_alternatives} top_logprobs for the answer token "
-            f"{token.token!r} (method={method!r}), none of which was an alternative among the "
+            f"{bounded_text(token.token)!r} (method={method!r}), none of which was an alternative among the "
             f"options {list(labels)!r}; use method='structured' for the model's own probabilities, "
             f"or method='discrete' for one label",
             evidence="readout",
@@ -578,7 +579,7 @@ def parse_json_object(text: str, note: str = "") -> dict[str, Any]:
 
 def _number(value: Any, *, where: str, upper: float | None = None) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise MalformedAnswerError(f"{where} must be a finite number, got {value!r}")
+        raise MalformedAnswerError(f"{where} must be a finite number, got {bounded_text(str(value))!r}")
     try:
         number = float(value)
     except OverflowError:
@@ -590,7 +591,7 @@ def _number(value: Any, *, where: str, upper: float | None = None) -> float:
             f"{len(str(abs(value)))} digits"
         ) from None
     if not math.isfinite(number):
-        raise MalformedAnswerError(f"{where} must be a finite number, got {value!r}")
+        raise MalformedAnswerError(f"{where} must be a finite number, got {bounded_text(str(value))!r}")
     if number < 0 or (upper is not None and number > upper):
         bound = ">= 0" if upper is None else f"in [0, {upper}]"
         raise MalformedAnswerError(f"{where} must be {bound}, got {number!r}")
@@ -628,9 +629,13 @@ def readout_structured(result: CallResult, question: Question) -> Readout:
         keys = list(question.criteria)
         raw = payload.get("probabilities")
         if not isinstance(raw, Mapping) or set(raw) != set(keys):
+            shown = (
+                sorted(bounded_text(str(key), 200) for key in raw)
+                if isinstance(raw, Mapping)
+                else bounded_text(str(raw))
+            )
             raise MalformedAnswerError(
-                f"'probabilities' must have exactly the option keys {sorted(keys)}, got keys "
-                f"{sorted(str(key) for key in raw) if isinstance(raw, Mapping) else raw!r}"
+                f"'probabilities' must have exactly the option keys {sorted(keys)}, got keys {shown!r}"
             )
         return Readout(
             probabilities={key: _number(raw[key], where=f"probability for {key!r}") for key in keys},
@@ -645,9 +650,13 @@ def readout_structured(result: CallResult, question: Question) -> Readout:
     expected = [str(level) for level in range(len(question.criteria))]
     raw = payload.get("probabilities")
     if not isinstance(raw, Mapping) or set(raw) != set(expected):
+        shown = (
+            sorted(bounded_text(str(key), 200) for key in raw)
+            if isinstance(raw, Mapping)
+            else bounded_text(str(raw))
+        )
         raise MalformedAnswerError(
-            f"'probabilities' must have exactly the level keys {expected}, got keys "
-            f"{sorted(str(key) for key in raw) if isinstance(raw, Mapping) else raw!r}"
+            f"'probabilities' must have exactly the level keys {expected}, got keys {shown!r}"
         )
     return Readout(
         probabilities={
@@ -729,7 +738,7 @@ def readout_discrete(result: CallResult, question: Question, labels: Sequence[st
                     label = ascii_upper(candidate)
         if label is None:
             raise MalformedAnswerError(
-                f"'choice' must be one of the labels {list(labels)!r} or the option keys {keys!r}, got {raw!r}"
+                f"'choice' must be one of the labels {list(labels)!r} or the option keys {keys!r}, got {bounded_text(str(raw))!r}"
             )
         chosen = label_to_key(question, labels)[label]
         return Readout(
@@ -741,7 +750,7 @@ def readout_discrete(result: CallResult, question: Question, labels: Sequence[st
         raw = payload.get("noul")
         flag = _boolean(raw)
         if flag is None:
-            raise MalformedAnswerError(f"'noul' must be a boolean, got {raw!r}")
+            raise MalformedAnswerError(f"'noul' must be a boolean, got {bounded_text(str(raw))!r}")
         return Readout(
             probabilities={True: 1.0 if flag else 0.0, False: 0.0 if flag else 1.0},
             source="discrete",
@@ -751,7 +760,7 @@ def readout_discrete(result: CallResult, question: Question, labels: Sequence[st
     raw = payload.get("score")
     level = _level_index(raw, levels)
     if level is None:
-        raise MalformedAnswerError(f"'score' must be one of the level indexes {levels!r}, got {raw!r}")
+        raise MalformedAnswerError(f"'score' must be one of the level indexes {levels!r}, got {bounded_text(str(raw))!r}")
     return Readout(
         probabilities={candidate: (1.0 if candidate == level else 0.0) for candidate in levels},
         source="discrete",

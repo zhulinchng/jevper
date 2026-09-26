@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
@@ -482,3 +483,29 @@ def test_an_ordinary_lowercase_example_answer_still_resolves(stub_server):
     )
 
     assert response.answers["q"].choice == "billing"
+
+
+def test_a_padded_answer_token_is_bounded_out_of_the_message_and_the_retry(stub_server):
+    """A provider that pads its first answer token does not put the padding in the retry body.
+
+    The message names the token and is quoted into the next request, so the rendering is bounded; the
+    token itself is still read whole, and the refusal is still about the token that was not a label.
+    """
+    padding = "t" * 1_000_000
+    body = chat_body(content=padding, logprobs=[(padding, -0.1), ("A", -0.2), ("B", -3.0)])
+    stub = stub_server(chat=lambda _: (200, body))
+    client = SystemOneClient(
+        openai_client(stub), model="stub", api="chat_completions", n_retry_malformed=1
+    )
+
+    with pytest.raises(LabelReadoutError) as error:
+        client.system_one(state="s", questions={"q": Choice(criteria={"billing": None, "sales": None})})
+
+    message = str(error.value)
+    assert "not one of the labels" in message
+    assert "… (+" in message
+    assert len(message) < 1000
+    sent = stub.bodies("/chat/completions")
+    assert len(sent) == 2
+    assert padding not in json.dumps(sent[1])
+    assert len(json.dumps(sent[1])) < 4000

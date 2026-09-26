@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextvars
 import json
 import threading
@@ -3194,3 +3195,154 @@ def test_a_refusal_about_the_model_or_a_field_is_still_not_a_missing_route(stub_
     # The provider's own verdict, not a surface rotation that found a different error to report.
     assert caught.value.status_code == 400
     assert not stub.bodies("/chat/completions"), "a refusal about the model or a field moved the call"
+
+
+# -- what the library measures, shuts down, or refuses to count ---------------------------------
+
+
+SYSTEMONE_CHOICE = {
+    "type": "choice",
+    "choice": "billing",
+    "confidence": 0.8,
+    "probabilities": {"billing": 0.8, "technical": 0.2, "sales": 0.0},
+}
+
+
+def test_usage_latency_is_the_measured_wall_clock_of_the_request(stub_server):
+    """``Usage.latency`` is a measurement of this call, not a field that merely satisfies its bound.
+
+    Asserting ``>= 0.0`` cannot fail against a field bounded at ``0.0``; a stub that takes a known
+    time to answer is what tells the measurement apart from the default.
+    """
+    slept = 0.35
+
+    def script(_body):
+        time.sleep(slept)
+        return 200, {
+            "model": "stub",
+            "answers": {"q": SYSTEMONE_CHOICE},
+            "usage": {"input_tokens": 4, "output_tokens": 1},
+        }
+
+    stub = stub_server(systemone=script)
+    client = SystemOneClient(openai_client(stub), model="stub", api="systemone")
+
+    response = client.system_one(state="The charge appeared twice", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.usage.latency >= slept
+
+
+def test_closing_the_client_shuts_the_pool_down_and_never_the_callers_client(stub_server, monkeypatch):
+    """``close()`` shuts the internal pool down, is idempotent, and leaves the caller's client alone.
+
+    The context manager yields the client itself; the pool is proved shut down by spying on the one
+    call that shuts it, and a call after ``close()`` — which builds a fresh pool and still reaches
+    the provider — is what proves the caller's own SDK client was not closed with it.
+    """
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    sdk = openai_client(stub)
+    client = SystemOneClient(sdk, model="stub", api="chat_completions")
+    questions = {"intent": Choice(criteria=CRITERIA), "duplicate": Noul()}
+
+    shuts: list[bool] = []
+    real_shutdown = concurrent.futures.ThreadPoolExecutor.shutdown
+
+    def spy(self, wait=True, **kwargs):
+        shuts.append(wait)
+        return real_shutdown(self, wait=wait, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "shutdown", spy)
+
+    with client as entered:
+        assert entered is client
+        response = entered.system_one(state="The charge appeared twice", questions=questions)
+        assert list(response.answers) == ["intent", "duplicate"]
+        assert client._executor is not None, "two questions run on the internal pool"
+
+    assert client._executor is None
+    assert shuts == [True], "close() must shut the pool down, and __exit__ must call it"
+
+    client.close()
+    assert shuts == [True], "close() twice is safe and shuts nothing down twice"
+
+    assert sdk.is_closed() is False, "the caller's provider client is the caller's to close"
+    again = client.system_one(state="The charge appeared twice", questions=questions)
+    assert list(again.answers) == ["intent", "duplicate"]
+    client.close()
+
+
+def test_a_close_landing_during_the_submits_is_never_a_bare_runtime_error(stub_server, monkeypatch):
+    """A ``close()`` racing a multi-question call fails as a ``JevperError``, or not at all.
+
+    The interleaving is forced rather than hoped for: the first ``submit`` starts a ``close()`` on
+    another thread and, when the caller's lock is not held across the submits, waits for it to finish
+    before delegating. A pool shut down in that gap turns the next real submit into ``RuntimeError:
+    cannot schedule new futures after shutdown``, which is not what this method's failures are
+    documented as. A single-question call would never reach the pool, so this asks for two.
+    """
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub", api="chat_completions")
+    real_submit = concurrent.futures.ThreadPoolExecutor.submit
+    first = [True]
+
+    def spy(self, fn, /, *args, **kwargs):
+        if first[0]:
+            first[0] = False
+            finished = threading.Event()
+            closer = threading.Thread(target=lambda: (client.close(), finished.set()), daemon=True)
+            closer.start()
+            if not client._executor_lock.locked():
+                # The lock was released before the submits, so close() can land in the gap.
+                assert finished.wait(timeout=5), "close() never returned"
+            closer.join(timeout=5)
+        return real_submit(self, fn, *args, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "submit", spy)
+
+    try:
+        response = client.system_one(
+            state="The charge appeared twice",
+            questions={"intent": Choice(criteria=CRITERIA), "duplicate": Noul()},
+        )
+    except JevperError:
+        response = None
+    except Exception as exc:  # noqa: BLE001 - the failure being pinned is exactly this escape
+        pytest.fail(f"a close() racing the call escaped the error contract: {exc!r}")
+    assert response is None or list(response.answers) == ["intent", "duplicate"]
+
+    client.close()
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [
+        ("top_logprobs", 21, "top_logprobs must be <= 20"),
+        ("max_concurrency", 0, "max_concurrency must be >= 1"),
+        ("n_retry_malformed", -1, "n_retry_malformed must be >= 0"),
+    ],
+)
+def test_a_count_option_outside_its_documented_bound_is_refused(option, value, message):
+    """Each bound is the option's own: 20 alternatives, one worker, and no corrective retry at all."""
+    with pytest.raises(JevperError) as error:
+        SystemOneClient(object(), model="m", **{option: value})
+
+    assert message in str(error.value)
+
+
+def test_an_unknown_api_is_refused_by_name():
+    """The surface is a member of ``APIS`` or the constructor says which values are."""
+    with pytest.raises(JevperError) as error:
+        SystemOneClient(object(), model="m", api="bogus")
+
+    assert "api must be one of" in str(error.value)
+
+
+def test_a_call_with_no_questions_is_refused_before_any_request(stub_server):
+    """An empty mapping cannot be answered, and finding that out must not cost a request."""
+    stub = stub_server(chat=lambda _: (200, chat_body(content="A", logprobs=CHOICE_LOGS)))
+    client = SystemOneClient(openai_client(stub), model="stub")
+
+    with pytest.raises(InvalidQuestionError, match="at least one question is required"):
+        client.system_one(state="The charge appeared twice", questions={})
+
+    assert stub.requests == []

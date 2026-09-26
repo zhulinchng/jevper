@@ -18,6 +18,7 @@ from fakes import (
     chat_body,
     messages_body,
     openai_client,
+    openai_root_client,
 )
 
 from jevper import (
@@ -26,6 +27,7 @@ from jevper import (
     ClientCapabilityError,
     InvalidQuestionError,
     JevperError,
+    Noul,
     ProviderError,
     RetryPolicy,
     SystemOneClient,
@@ -364,6 +366,23 @@ def test_extra_body_cannot_carry_the_model(stub_server):
     assert stub.requests == []
 
 
+@pytest.mark.parametrize("value", [False, 0, None])
+def test_the_remedy_the_stream_refusal_names_leaves_no_stream_field(stub_server, value):
+    """The refusal tells the caller to remove the field, or to set it to false.
+
+    Following that advice has to leave a body with no such field: a route that reserves the name reads
+    its presence rather than its truth. Forwarded as a falsy value, the request still named the field
+    the refusal was about.
+    """
+    stub = stub_server(chat=lambda _: (200, chat_body(content=STRUCTURED)))
+    client = chat_client(stub, extra_body={"stream": value})
+
+    response = client.system_one(state="s", questions={"q": question()})
+
+    assert response.answers["q"].choice == "billing"
+    assert "stream" not in stub.requests[0]
+
+
 def test_a_header_spelled_differently_replaces_rather_than_duplicates(stub_server):
     """The SDK merges default and request headers case-sensitively, then sends them case-insensitively.
 
@@ -666,3 +685,117 @@ def test_a_header_mapping_edited_after_construction_is_not_what_gets_sent(stub_s
 
     sent = {name.lower(): value for name, value in stub.header_pairs[0]}
     assert sent["x-tenant"] == "ok"
+
+
+# ------------------------------------------------ the native route's two request fields
+
+
+def one_noul_body() -> dict[str, Any]:
+    """The smallest System One body that answers one question, on either of the two routes."""
+    return {"model": "laya:en", "answers": {"q": {"type": "noul", "noul": 0.8}}, "usage": {}}
+
+
+def systemone_question() -> Noul:
+    return Noul(instructions="Does the customer ask for a refund?")
+
+
+def test_the_callers_extra_body_outranks_the_typed_native_fields(stub_server):
+    """``extras`` and ``keep_alive`` are the caller's wherever they say so, ``extra_body`` included.
+
+    A caller who names a field in both places named ``extra_body`` last, on this surface as on every
+    other: that is the value the SDK merges into the request, and the one the provider receives. A
+    typed value written over it makes the request jevper records disagree with the one it sends.
+    """
+    stub = stub_server(decide=lambda _: (200, one_noul_body()))
+    client = SystemOneClient(
+        openai_root_client(stub), model="laya:en", api="systemone", native=True,
+        extra_body={"extras": ["zzz"], "keep_alive": "1h"}, retry=NO_RETRY,
+    )
+
+    client.system_one(
+        state="s", questions={"q": systemone_question()}, extras=["laya"], keep_alive="10m"
+    )
+
+    sent = stub.bodies("/api/decide")[0]
+    assert sent["extras"] == ["zzz"]
+    assert sent["keep_alive"] == "1h"
+
+
+def test_extra_body_cannot_smuggle_the_native_fields_past_the_typesafe_route(stub_server):
+    """The refusal guarding these two fields lives in the client, which sees the typed parameters.
+
+    Named in ``extra_body`` instead, they reached the TypeSafe route, which answers ``200`` and
+    ignores them: the caller asked for ``laya`` on every answer, read every answer without it, and
+    was told nothing. A field of the other endpoint is refused by name on this one, before the
+    request, exactly as the typed parameter is.
+    """
+    stub = stub_server(systemone=lambda _: (200, one_noul_body()))
+    client = SystemOneClient(
+        openai_client(stub), model="laya:en", api="systemone",
+        extra_body={"extras": ["laya"], "keep_alive": "10m"}, retry=NO_RETRY,
+    )
+
+    with pytest.raises(ClientCapabilityError) as error:
+        client.system_one(state="s", questions={"q": systemone_question()})
+
+    message = str(error.value)
+    assert "extras" in message and "keep_alive" in message
+    assert "native=True" in message
+    assert stub.requests == []
+
+
+# ------------------------------------------------ a body whose carrier is not a list
+
+
+def raw_body_client(answered: Any) -> Any:
+    """A client whose resources hand back a body the SDK never validated.
+
+    A duck-typed client, or the official one returning something it could not model, reaches the
+    normalizers with whatever the provider sent. These shapes are what that layer has to refuse.
+    """
+
+    class Resource:
+        def create(self, **kwargs: Any) -> Any:
+            return answered
+
+    resource = Resource()
+    client = type("Client", (), {})()
+    client.chat = type("Chat", (), {"completions": resource})()  # type: ignore[attr-defined]
+    client.responses = resource  # type: ignore[attr-defined]
+    client.messages = resource  # type: ignore[attr-defined]
+    return client
+
+
+@pytest.mark.parametrize(
+    "api,body,carrier",
+    [
+        ("chat_completions", {"choices": {"0": {"message": {"content": "A"}}}}, "no choices"),
+        ("chat_completions", {"choices": 5}, "no choices"),
+        ("responses", {"output": 5, "status": "completed"}, "no output items"),
+        ("responses", {"output": {"a": 1}, "status": "completed"}, "no output items"),
+        ("messages", {"content": 5}, "no content blocks"),
+        ("messages", {"content": {"a": 1}}, "no content blocks"),
+    ],
+    ids=[
+        "choices-mapping",
+        "choices-number",
+        "output-number",
+        "output-mapping",
+        "content-number",
+        "content-mapping",
+    ],
+)
+def test_a_carrier_that_is_not_a_list_is_a_capability_error(api, body, carrier):
+    """``choices``, ``output`` and ``content`` are lists, and every reader here walks one.
+
+    A number was indexed or iterated into a ``TypeError``, a mapping into a ``KeyError`` — or, walked
+    as its keys, into an empty answer that no provider sent. Both are the unreadable body an empty
+    list already is, reported the same way and named by the field that was missing.
+    """
+    client = SystemOneClient(
+        raw_body_client(body), model="m", api=api, method="structured",
+        retry=NO_RETRY, n_retry_malformed=0,
+    )
+
+    with pytest.raises(ClientCapabilityError, match=carrier):
+        client.system_one(state="s", questions={"q": question()})
