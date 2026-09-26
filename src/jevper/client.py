@@ -19,7 +19,7 @@ from datetime import timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from . import methods
 from .errors import (
@@ -92,6 +92,7 @@ from .types import (
     SystemOnePayload,
     SystemOneResponse,
     Usage,
+    _validation_message,
     bounded_text,
     ensure_encodable,
     noul_carries_a_question,
@@ -1183,6 +1184,24 @@ def _is_bare_scalar(value: Any) -> bool:
     return isinstance(value, (bool, int, float))
 
 
+def _routing(raw: Any) -> Routing | None:
+    """The router's own report, or ``None`` when the body carried none to read.
+
+    Wrapped like every other provider payload in this library. An object that does not hold the
+    fields it is documented to hold is a response that could not be read, and that is reported as
+    this library's error rather than as a pydantic one escaping from inside assembly — where a
+    caller writing the documented ``except JevperError`` would not catch it.
+    """
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        return Routing(**raw)
+    except ValidationError as exc:
+        raise MalformedAnswerError(
+            f"the routing report could not be read: {_validation_message(exc)}"
+        ) from None
+
+
 def _native_fields(body: Any) -> dict[str, Any]:
     """The fields ollaya's native endpoint adds to a TypeSafe response, as its response type wants them.
 
@@ -1197,7 +1216,7 @@ def _native_fields(body: Any) -> dict[str, Any]:
         return {}
     routing = body.get("routing")
     fields: dict[str, Any] = {
-        "routing": Routing(**routing) if isinstance(routing, Mapping) else None,
+        "routing": _routing(routing),
         "state_truncated": bool(body.get("state_truncated", False)),
         "done_reason": str(body.get("done_reason", "decide")),
         "created_at": str(body.get("created_at", "")),

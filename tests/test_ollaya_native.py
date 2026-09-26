@@ -33,6 +33,7 @@ from jevper import (
     AsyncSystemOneClient,
     Choice,
     ClientCapabilityError,
+    MalformedAnswerError,
     NativeSystemOneResponse,
     Noul,
     Routing,
@@ -340,6 +341,28 @@ def test_neither_option_is_sent_when_the_caller_asks_for_nothing(stub_server):
         client.system_one(state=STATE, questions=QUESTIONS, extras=(), keep_alive=None)
 
     assert not {"extras", "keep_alive"} & set(stub.requests[0])
+
+
+def test_a_routing_report_that_cannot_be_read_is_a_jevper_error(stub_server):
+    """The documented ``except JevperError`` has to catch it. A body reporting a router without the
+    fields a router reports is a response that could not be read, which is this library's error and
+    not a pydantic one escaping from inside assembly."""
+    stub = stub_server(decide=answering(native_body(routing={"route": "english"})))
+
+    client = native_client(stub)
+    with pytest.raises(MalformedAnswerError, match="routing report could not be read"):
+        client.system_one(state=STATE, questions=QUESTIONS)
+
+
+def test_a_routing_field_that_is_not_an_object_reads_as_no_routing(stub_server):
+    """A value of the wrong type is the endpoint not reporting a router at all, and there is nothing
+    there to fail to read."""
+    stub = stub_server(decide=answering(native_body(routing="english")))
+
+    with native_client(stub) as client:
+        response = client.system_one(state=STATE, questions=QUESTIONS)
+
+    assert response.routing is None
 
 
 @pytest.mark.parametrize(
