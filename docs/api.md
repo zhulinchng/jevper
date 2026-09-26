@@ -461,6 +461,14 @@ does not — so under `api="auto"` a 404 that does not name the model is read as
 route*: the call is re-issued on `chat_completions` and the verdict is remembered for the rest of the client's
 life. A 404 that names the model is the model, and `api="responses"` asked for explicitly is never overridden.
 
+A gateway can also say the protocol is the problem while naming the model in the same breath, which is why the
+rule reads the evidence before the model markers. Measured on opencode Zen, 2026-09-26:
+`muse-spark-1.3-contributor` answers every Chat Completions request with
+`400 {"type": "ModelProtocolUnsupported", "message": "Model does not support this protocol."}` and answers the
+same question on Responses, so under `api="auto"` the call moves and is answered, and afterwards goes straight
+there. The marker has to name a protocol or a route — a 400 that says only `unsupported` is about a field, and
+that is the field-downgrade path rather than a change of surface.
+
 A surface that cannot deliver a distribution — it answered without logprobs, or refused the logprob fields —
 is the same kind of verdict: under `api="auto"` the readout moves to the other surface once, and the surface
 that failed is marked so later calls for that model start where the distribution is. `reasoning="native"` keeps

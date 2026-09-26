@@ -3063,3 +3063,134 @@ def test_a_route_404_still_rotates(stub_server):
 
     assert response.debug["api"] == "chat_completions"
     assert stub.bodies("/responses") and stub.bodies("/chat/completions")
+
+
+def test_a_protocol_refusal_rotates_to_the_surface_that_speaks_it(stub_server):
+    """A gateway whose model speaks one protocol says so in a 400, and the next surface is the answer.
+
+    Measured on opencode Zen 2026-09-26: ``muse-spark-1.3-contributor`` answers every Chat
+    Completions request with ``400 {"type": "ModelProtocolUnsupported", "message": "Model does not
+    support this protocol."}`` and answers the same question on Responses. Read as a dead end, the
+    call never reached the surface that works — and the message names the model, so the 404 rule that
+    protects a real model error would have hidden it too.
+    """
+
+    # The duck client answers on whichever surface is not refused, so the test does not depend on
+    # which one auto reaches first. Against opencode Zen the roles are the other way round: auto
+    # reaches Chat Completions, is refused, and answers on Responses.
+    def script(body):
+        if "input" in body:
+            return 400, {
+                "error": {
+                    "type": "ModelProtocolUnsupported",
+                    "message": "Model does not support this protocol.",
+                }
+            }
+        return 200, chat_body(
+            content=json.dumps({"probabilities": {"billing": 0.7, "technical": 0.2, "sales": 0.1}})
+        )
+
+    stub = stub_server(chat=script, responses=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="muse-spark-1.3-contributor",
+        api="auto",
+        method="structured",
+        retry=RetryPolicy(n_retries=0),
+        n_retry_malformed=0,
+    )
+
+    response = client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert response.debug["api"] == "chat_completions"
+    assert stub.bodies("/responses"), "the refused protocol was tried"
+    assert stub.bodies("/chat/completions"), "the surface that speaks it was reached"
+
+
+def test_a_protocol_refusal_is_remembered_like_a_missing_route(stub_server):
+    """One refusal is enough: later calls on the same client go straight to the surface that works."""
+
+    def script(body):
+        if "input" in body:
+            return 400, {"error": {"message": "Model does not support this protocol."}}
+        return 200, chat_body(
+            content=json.dumps({"probabilities": {"billing": 0.7, "technical": 0.2, "sales": 0.1}})
+        )
+
+    stub = stub_server(chat=script, responses=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="muse-spark-1.3-contributor",
+        api="auto",
+        method="structured",
+        retry=RetryPolicy(n_retries=0),
+        n_retry_malformed=0,
+    )
+
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+    first = len(stub.bodies("/responses"))
+    client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert len(stub.bodies("/responses")) == first, "the refused protocol was tried again"
+
+
+def test_an_explicit_surface_still_reports_the_protocol_refusal(stub_server):
+    """Naming the surface is a choice, so the refusal is the answer rather than a reason to move."""
+
+    def script(body):
+        return 400, {
+            "error": {"type": "ModelProtocolUnsupported", "message": "Model does not support this protocol."}
+        }
+
+    stub = stub_server(chat=script, responses=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="muse-spark-1.3-contributor",
+        api="responses",
+        method="structured",
+        retry=RetryPolicy(n_retries=0),
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(ProviderError) as caught:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    assert caught.value.status_code == 400
+    assert not stub.bodies("/chat/completions")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": {"message": "Unknown model", "code": "model_not_found"}},
+        {"error": {"message": "The model 'muse-spark' does not exist"}},
+        {"error": {"message": "Unsupported parameter: 'include' is not supported with this model"}},
+    ],
+    ids=["model_not_found", "names-the-model", "a-field"],
+)
+def test_a_refusal_about_the_model_or_a_field_is_still_not_a_missing_route(stub_server, body):
+    """The new markers are about a protocol, and a model or a field must not read as one.
+
+    Without this, the field downgrade and the model-error paths would be bypassed: a 400 naming a
+    field would rotate the surface and retry the same field on it.
+    """
+
+    def script(_body):
+        return 400, body
+
+    stub = stub_server(chat=script, responses=script)
+    client = SystemOneClient(
+        openai_client(stub),
+        model="muse-spark",
+        api="auto",
+        method="structured",
+        retry=RetryPolicy(n_retries=0),
+        n_retry_malformed=0,
+    )
+
+    with pytest.raises(ProviderError) as caught:
+        client.system_one(state="s", questions={"q": Choice(criteria=CRITERIA)})
+
+    # The provider's own verdict, not a surface rotation that found a different error to report.
+    assert caught.value.status_code == 400
+    assert not stub.bodies("/chat/completions"), "a refusal about the model or a field moved the call"

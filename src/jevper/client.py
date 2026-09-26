@@ -192,6 +192,27 @@ _MODEL_ERROR_CODES = (
     "invalid_model",
     "unsupported_model",
 )
+# A refusal that says the *protocol* is the problem, rather than the request or the model. Measured on
+# opencode Zen 2026-09-26: `muse-spark-1.3-contributor` answers every Chat Completions request with
+# `400 {"type": "ModelProtocolUnsupported", "message": "Model does not support this protocol."}` and
+# answers the same question on Responses without complaint, so a client that reads this as a dead end
+# never reaches the surface that works. Both a route and a protocol are "this server will not speak
+# this surface here", and the marker is deliberately about the protocol rather than the model: a
+# 400 naming a model is about the model, and the next surface would refuse it the same way.
+_PROTOCOL_REFUSAL_MARKERS = (
+    "does not support this protocol",
+    "modelprotocolunsupported",
+    "unsupported protocol",
+    "protocol not supported",
+    "does not support this endpoint",
+    "does not support this route",
+    "unsupported endpoint",
+    "unsupported route",
+    "not implemented for this model",
+)
+# A 400 that says only "unsupported" is about a field, not a surface, and is left alone: the field
+# downgrade path reads those. A protocol refusal has to say so.
+_PROTOCOL_REFUSAL_STATUSES = frozenset({400, 404, 405, 415, 422})
 _SHOULD_RETRY = "x-should-retry"
 _TRANSIENT_EXCEPTION_CLASSES = frozenset(
     {
@@ -609,23 +630,38 @@ def _error_evidence(exc: BaseException) -> str:
 
 
 def _route_missing(exc: BaseException, *, surface: Surface, model: str) -> bool:
-    """The server has no route for this surface, rather than a problem with what was sent.
+    """This surface is not spoken here, rather than a problem with what was sent.
 
-    An OpenAI-compatible server that does not implement a surface's route answers 404 for it, and the
-    ``openai`` client object exposes ``responses.create`` either way. A 404 that names the model is
-    about the model — the same error would come back from the other surface — so it is left alone,
-    and so is one that says so in the only field a provider can be relied on to fill in: the code.
-    ``{"error": {"message": "Unknown model", "code": "model_not_found"}}`` names no id at all, and
-    treating it as a missing route would answer the question on another surface — or write the
-    route off for the rest of the client's life — over a model that is simply not there.
+    An OpenAI-compatible server that does not implement a surface's route answers 404 for it, and
+    the ``openai`` client object exposes ``responses.create`` either way. A gateway whose *model*
+    speaks only one protocol says so instead: opencode Zen answers every Chat Completions request for
+    ``muse-spark-1.3-contributor`` with ``400 ModelProtocolUnsupported — Model does not support this
+    protocol.`` and answers the same question on Responses, so a client that reads that as a dead end
+    never reaches the surface that works. Both are the same fact — this server, this model, this
+    surface — and both mean the next surface is worth trying.
+
+    What is *not* that fact is a refusal about the model rather than the protocol, or about a field.
+    A 404 that names the model is about the model, and so is ``{"error": {"message": "Unknown
+    model", "code": "model_not_found"}}``, which names no id at all: the other surface would answer
+    the same way, so switching would hide the real problem, and a protocol refusal has to say
+    ``protocol`` or ``route`` in as many words before this reads one.
     """
-    if _status_code(exc) != 404:
+    status = _status_code(exc)
+    if status not in _PROTOCOL_REFUSAL_STATUSES:
         return False
     evidence = _error_evidence(exc)
     if getattr(exc, "embedded", False):
         # The status came from the body of a ``200``, not from the status line: a body that says
         # ``404`` is the provider reporting a failure inside a successful response, and treating it
         # as a missing route would answer the question on another surface and hide the error.
+        return False
+    if any(marker in evidence for marker in _PROTOCOL_REFUSAL_MARKERS):
+        # Said in as many words, whatever the status. The evidence is read before the model markers
+        # below because a protocol refusal usually names the model too — opencode's own message
+        # starts "Model does not support this protocol." — and that is exactly the case where the
+        # next surface is the answer rather than a repeat of the same error.
+        return True
+    if status != 404:
         return False
     if any(marker in evidence for marker in _MODEL_ERROR_CODES):
         return False
