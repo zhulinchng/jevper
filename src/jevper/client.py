@@ -975,10 +975,14 @@ def _systemone_spec(
     questions: Mapping[str, Question],
     question_ids: Sequence[str],
 ) -> CallSpec:
-    """The request for ``question_ids``, and only those: the service takes a map, and which
-    entries it carries is the batching decision rather than the wire format's."""
+    """The request for ``question_ids``, and only those.
+
+    The service takes a map, and which entries it carries is the batching decision rather than the
+    wire format's.
+    """
     selected = {question_id: questions[question_id] for question_id in question_ids}
     return CallSpec(messages=[], systemone=SystemOnePayload(state=state, questions=selected))
+
 
 def _systemone_outcome(
     log: _CallLog,
@@ -1025,6 +1029,47 @@ def _systemone_outcome(
         method="systemone",
     )
 
+
+def _batch_failure(exc: BaseException, log: _CallLog, question_ids: Sequence[str]) -> None:
+    """Attribute a failed batch request's trail to every question it was asked for.
+
+    One request was made for the whole batch, so a trail naming only the first question would read as
+    though the rest were never asked. A failure carrying no trail — a capability refusal, a
+    connection error before the first try — is left alone, because there is nothing to reattribute.
+    """
+    if getattr(exc, "attempts", None):
+        exc.attempts = [
+            record for question_id in question_ids for record in _attempts_for(log, question_id)
+        ]
+
+
+def _batch_outcomes(
+    log: _CallLog,
+    result: CallResult,
+    parsed: Mapping[str, Question],
+) -> tuple[dict[str, _QuestionOutcome], tuple[dict[str, int | None], int, int]]:
+    """Every question answered by one request, and that request's totals, which they all share.
+
+    The point of the System One surface is that the questions travel together: measured against the
+    live endpoint on 2026-09-26, eleven questions came back from one request in 1.08 s, where the
+    per-question path spends a round trip each. The price is granularity — a transient failure re-asks
+    the whole batch, and a missing or mistyped answer fails the call rather than one question of it —
+    and the totals come back with the outcomes because counted per question they would report N
+    times what the service charged.
+    """
+    totals = (log.tokens, log.n_calls, log.n_retries)
+    outcomes = {
+        question_id: _systemone_outcome(
+            log,
+            result,
+            question_id,
+            parsed[question_id],
+            totals=totals,
+            attempts=_attempts_for(log, question_id),
+        )
+        for question_id in parsed
+    }
+    return outcomes, totals
 
 
 class _BaseClient:
@@ -1480,12 +1525,15 @@ class _BaseClient:
         neither of which repeating the request would change. Anything else is the SDK's exception
         type, which is re-raised the way every other request jevper makes reports one: a
         ``ProviderError`` carrying the status the provider gave.
+
+        A ``ProviderError`` is returned scrubbed rather than re-raised, because a provider can quote
+        the credential it rejected and this message is what every log line downstream carries.
         """
         failure = _provider_error_from(exc)
         if isinstance(failure, ProviderError):
-            failure.attempts = []
-            # Scrubbed the way ``_call_failure`` scrubs it: a provider can quote the credential it
-            # rejected, and this message is what every log line downstream will carry.
+            # No attempt history to clear: a ProviderError built here has none, and a duck client
+            # that raised one of its own brought its own trail, which is the caller's to keep. A
+            # subclass is returned as it is, carrying the subclass a caller may be catching.
             scrubbed = self._scrub(str(failure))
             if scrubbed != str(failure) and type(failure) is ProviderError:
                 return ProviderError(
@@ -1733,6 +1781,7 @@ class _BaseClient:
             analysis_reasoning=None,
             prompt_cache_key=None,
         )
+
     def _resolve_examples(
         self, question: Question, labels: Sequence[str], question_id: str, examples: Examples
     ) -> tuple[Example, ...]:
@@ -2146,42 +2195,16 @@ class SystemOneClient(_BaseClient):
         parsed: Mapping[str, Question],
         context: _CallContext,
     ) -> tuple[dict[str, _QuestionOutcome], tuple[dict[str, int | None], int, int]]:
-        """Every question in one request, which is the shape the service is built for.
-
-        Measured against the live endpoint on 2026-09-26: eleven questions came back from one request
-        in 1.08 s, where the per-question path spends a round trip each. The price is granularity: a
-        transient failure re-asks the whole batch, and a missing or mistyped answer fails the call
-        rather than one question of it. The usage comes back with the outcomes because they all share
-        one request: counted per question it would report N times what the service charged.
-        """
+        """Every question in one request; see ``_batch_outcomes`` for what that costs and buys."""
         log = _CallLog()
         question_ids = list(parsed)
         spec = _systemone_spec(state, parsed, question_ids)
         try:
             result = self._call(log, question_ids[0], spec, context)
-        except Exception as exc:  # re-raised below, with the trail reattributed
-            # The request was asked for every question in the batch, so its failure is theirs: a
-            # trail naming only the first would read as though the rest were never asked.
-            if getattr(exc, "attempts", None):
-                exc.attempts = [
-                    record
-                    for question_id in question_ids
-                    for record in _attempts_for(log, question_id)
-                ]
+        except Exception as exc:
+            _batch_failure(exc, log, question_ids)
             raise
-        totals = (log.tokens, log.n_calls, log.n_retries)
-        outcomes = {
-            question_id: _systemone_outcome(
-                log,
-                result,
-                question_id,
-                parsed[question_id],
-                totals=totals,
-                attempts=_attempts_for(log, question_id),
-            )
-            for question_id in question_ids
-        }
-        return outcomes, totals
+        return _batch_outcomes(log, result, parsed)
 
     def _call(
         self, log: _CallLog, question_id: str, spec: CallSpec, context: _CallContext
@@ -2415,32 +2438,16 @@ class AsyncSystemOneClient(_BaseClient):
         parsed: Mapping[str, Question],
         context: _CallContext,
     ) -> tuple[dict[str, _QuestionOutcome], tuple[dict[str, int | None], int, int]]:
+        """The async twin of the batching path; see ``_batch_outcomes`` for what it costs and buys."""
         log = _CallLog()
         question_ids = list(parsed)
         spec = _systemone_spec(state, parsed, question_ids)
         try:
             result = await self._call(log, question_ids[0], spec, context)
-        except Exception as exc:  # re-raised below, with the trail reattributed
-            if getattr(exc, "attempts", None):
-                exc.attempts = [
-                    record
-                    for question_id in question_ids
-                    for record in _attempts_for(log, question_id)
-                ]
+        except Exception as exc:
+            _batch_failure(exc, log, question_ids)
             raise
-        totals = (log.tokens, log.n_calls, log.n_retries)
-        outcomes = {
-            question_id: _systemone_outcome(
-                log,
-                result,
-                question_id,
-                parsed[question_id],
-                totals=totals,
-                attempts=_attempts_for(log, question_id),
-            )
-            for question_id in question_ids
-        }
-        return outcomes, totals
+        return _batch_outcomes(log, result, parsed)
 
     async def system_one(
         self,

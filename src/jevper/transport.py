@@ -1382,7 +1382,6 @@ class Transport:
             endpoint = getattr(endpoint, name)
         return endpoint
 
-
     def call(self, spec: CallSpec, model: str) -> CallResult:
         kwargs = self.kwargs(spec, model)
         try:
@@ -1402,21 +1401,21 @@ class Transport:
 
     async def acall(self, spec: CallSpec, model: str) -> CallResult:
         kwargs = self.kwargs(spec, model)
-        create = self._endpoint()
+        endpoint = self._endpoint()
         if (
-            not inspect.iscoroutinefunction(create)
+            not inspect.iscoroutinefunction(endpoint)
             and type(self.client).__module__.split(".")[0] in ("openai", "anthropic")
             and not inspect.iscoroutinefunction(getattr(type(self.client), "__aenter__", None))
         ):
             # An official blocking client in the async facade: asking anyway would make a blocking
             # request on the event loop before the mismatch is noticed. Duck clients are left to the
-            # check on the result below, because a duck ``create`` may be an ordinary function that
+            # check on the result below, because a duck method may be an ordinary function that
             # returns an awaitable, and a mock of one is neither.
             raise ClientCapabilityError(
                 "this client answers synchronously; use SystemOneClient for it"
             )
         try:
-            response = create(**kwargs)
+            response = endpoint(**kwargs)
         except Exception as exc:  # noqa: BLE001 - re-raised below, carrying the provider's own error
             raise _provider_error_from(exc) from None
         if not inspect.isawaitable(response):
