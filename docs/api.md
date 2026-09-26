@@ -197,8 +197,13 @@ list_models() -> list[ModelMetadata]
 The models the deployment offers, from the System One endpoint's `GET /v1/models`, read through the
 same client object and parsed as the service's own OpenAPI declares it —
 `{"models": [{"name", "description", "release_date"}]}`. A gateway answering that path with a list of
-its own is reported as the wrong shape rather than half-read. `ModelMetadata.description` defaults to
-`""` and `release_date` to `None` when the service omits them. `alist_models()` is the async twin.
+its own is reported as the wrong shape rather than half-read — measured on opencode Zen, which serves
+`system_one` on the same host and answers `GET /v1/models` OpenAI-style, so the call raises
+`MalformedAnswerError` naming the `{"object": "list", "data": [...]}` that arrived. That is the right
+verdict rather than a gap in jevper: the route belongs to the gateway, not to the decision service,
+and a model list that omits the decision models anyway is no use to the caller.
+`ModelMetadata.description` defaults to `""` and `release_date` to `None` when the service omits them.
+`alist_models()` is the async twin.
 No `api=` is needed: the path is the service's, and the client is the caller's own. It is jevper's
 request, so it follows the `retry` policy and arrives as a `ProviderError` carrying the provider's
 status, exactly as `system_one` reports the same failure; a client whose `get` is a coroutine (or is

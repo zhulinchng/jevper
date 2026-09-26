@@ -12,7 +12,7 @@ Where something could not be measured, it says so rather than guessing — see
 | Service | `POST https://opencode.ai/zen/v1/systemone`, the Jev endpoint opencode Zen serves |
 | Model | `jev-1.13-free`; the paid `jev-1.13` answered HTTP 402 on this account |
 | Reference client | `typesafe-sdk` 0.7.1 from PyPI, installed and read for the contract it encodes |
-| jevper | 0.7.11 on this branch, `.venv` (Python 3.14, openai 3.19.0). The confidence and score arithmetic below was measured on 0.7.4, before the System One surface existed; every Jev wire-format measurement was taken on 2026-09-26 against 0.7.8, which this page does not re-measure. The Ollaya run in [local servers](local-servers.md#ollaya-the-decision-server) is 0.7.11 |
+| jevper | 0.7.11 on this branch, `.venv` (Python 3.14, openai 3.19.0). The confidence and score arithmetic below was measured on 0.7.4, before the System One surface existed. The wire format, the live run and the determinism figures elsewhere on this page were re-measured on 2026-09-26 against 0.7.11; the arithmetic in [The numbers agree](#the-numbers-agree) and the published-table comparisons still come from the earlier passes, and the recorded answers behind them have not been re-taken. The Ollaya run in [local servers](local-servers.md#ollaya-the-decision-server) is 0.7.11 |
 | Published docs | TypeSafe's API reference, confidence page, and the `jev-1.13` jaggedness page (reviewed 2026-09-17) |
 
 ## jevper can call this endpoint
@@ -49,9 +49,43 @@ response = client.system_one(
 )
 ```
 
+The numbers below were measured against **opencode Zen**, which serves the same wire format at a
+different host under a different model name. Point the client there to reproduce them:
+
+```python
+client = SystemOneClient(
+    OpenAI(base_url="https://opencode.ai/zen/v1", api_key=key),
+    model="jev-1.13-free",
+    api="systemone",
+)
+```
+
+**The base URL is the host, not the endpoint.** jevper appends `/systemone` itself, so the value
+that belongs in `base_url` is `https://opencode.ai/zen/v1` — dropping the trailing `/systemone` is
+what makes it work. Passing the full endpoint instead is a quiet, confusing failure rather than a
+one: the path is doubled to `/zen/v1/systemone/systemone` and the gateway answers `404` with an
+HTML page, which jevper reports as a `ProviderError` carrying that markup. The same variable is
+used both ways in this page, so the distinction is worth stating once: in the `curl` under
+[Reproducing this](#reproducing-this) the *full endpoint* is correct, because `curl` posts to the
+path you give it and has no base to append to.
+
 Measured against the live endpoint on 2026-09-26, that call returned in 1.10 s: `refund` 0.72,
 `team` billing at confidence 0.99, `usage.n_calls` 1, and one attempt record per question naming the
-request it was read from. `client.list_models()` reads the service's other route the same way.
+request it was read from. `client.list_models()` does **not** read the same way on this deployment:
+opencode Zen answers `GET /v1/models` in the OpenAI gateway shape `{"object": "list", "data": [...]}`
+rather than the `{"models": [...]}` the System One route documents, so the call raises
+`MalformedAnswerError` naming the shape that arrived. That is the correct verdict — the path is a
+gateway's, not the decision service's — but it means `list_models()` is not usable against Zen, and
+the 35 models that listing does carry do not include `jev-1.13-free`, so the model name cannot be
+discovered through it either.
+
+Those figures come from a recording fake client, which is what pinned the request counts, the prompt
+shapes and the validator behaviour. A live re-run the same day, with 0.7.11 against opencode Zen,
+closed the gap that left: jevper called the service for real, and its answer was compared with the
+service's on the same state. On `"The invoice total does not match the amount I was charged."` the
+noul for `"Do the numbers disagree?"` came back **0.94 from both** — the value the `curl` under
+[Reproducing this](#reproducing-this) returns. That is one question's worth of agreement, not a
+survey, and the free model's wobble below means a second run will not match it to the digit.
 
 Three things about this surface are worth knowing before you point a call at it.
 
@@ -269,13 +303,17 @@ service's arithmetic to 0.015, but arithmetic agreement is not calibration, and 
 can make an arbitrary model's distribution as trustworthy as a model trained for the decision. Use
 [confidence](methods.md) to route, never as a guarantee.
 
+One more, measured here rather than taken from the published list, because it is the one that most
+easily gets mistaken for a jevper bug: **the free model is not deterministic between identical
+calls.** Three byte-identical requests for the same noul on the same state returned 0.93, 0.93 and
+0.94; a later run of three returned 0.94 throughout. The wobble is about ±0.01 — small enough to
+pass for a rounding difference, large enough to move a threshold set near it, and wide enough that a
+sync and an async call on identical input can disagree in the last digit. jevper is not smoothing
+it: the value in `answers` is the one the service returned, reported as it arrived. Read every
+number on this page as *the value that run got*, not as a value to assert on.
+
 ## What was not measured
 
-- **A live jevper run.** OpenRouter's free daily allowance was exhausted (`X-RateLimit-Remaining: 0`)
-  during this comparison, so every jevper figure here comes from a recording fake client, and no
-  jevper answer was compared with a jev answer on the same state. The request counts, prompt shapes
-  and validator behaviour are jevper's own and do not depend on the backend; the answer *quality*
-  comparison is simply absent.
 - **The paid `jev-1.13`.** Every call returned HTTP 402 on this account, so `jev-1.13-free` is the
   only model measured. The free alias may be quantised or otherwise degraded relative to the paid
   one; the arithmetic in [The numbers agree](#the-numbers-agree) is the model's, but the
@@ -303,6 +341,11 @@ curl -sS -X POST "$JEV_BASE_URL" \
        "questions": {"wrong": {"type": "noul", "instructions": "Do the numbers disagree?"}}}'
 ```
 
+`$JEV_BASE_URL` there is the **full endpoint**, and it is correct there because `curl` posts to
+exactly the path it is given. The jevper client wants the base without `/systemone` on the end, as
+[above](#jevper-can-call-this-endpoint) — the same variable in two shapes is the one thing worth
+watching when copying between the two.
+
 The jevper side needs no network at all: a client object exposing `chat.completions.create` that
 records its kwargs and returns a schema-conforming distribution is enough to count requests, read
 the prompts and check the validators — the shape [`examples/duck_client.py`](https://github.com/zhulinchng/jevper/blob/main/examples/duck_client.py)
@@ -311,5 +354,8 @@ already demonstrates. Feeding a captured response back through
 
 The numbers in this page are pinned by `tests/test_jev_agreement.py`, which asserts jevper's
 arithmetic against these recorded service answers and the response model's acceptance of the
-recorded payloads. What it cannot pin is the service: third-party answers drift with the model, so
-re-run the `curl` above when `jev-1.13-free` moves and expect the distributions to differ.
+recorded payloads. What it cannot pin is the service, in either direction: third-party answers drift
+with the model, so re-run the `curl` above when `jev-1.13-free` moves and expect the distributions to
+differ — and re-run it against the *same* model to watch them differ anyway, since identical calls
+disagree in the last digit. A live jevper call is the direct check when the question is whether the
+two paths agree; it is one request against the endpoint the `curl` already uses.
