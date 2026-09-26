@@ -209,6 +209,35 @@ vllm serve Qwen/Qwen3-8B --served-model-name qwen3-8b --runner pooling \
 clm-serve
 ```
 
+On a card that cannot hold Qwen3-8B in bf16, the encoder can come from a published GGUF under
+llama.cpp instead, which is the same Qwen3-8B with last-token pooling baked in. Nothing in jevper
+changes — `clm-serve` only ever talks to an OpenAI-compatible `/v1/embeddings` — and this is the
+combination measured on a 12 GB RTX 3080 on 2026-09-27, with `contrastive-lm` 0.1.0, jevper 0.7.11
+and the reference head from the official `Contrastive-LM` org (the GGUF is a third-party quantisation;
+only the heads come from the model author, and `clm-serve` fetches those itself):
+
+```bash
+# the encoder: 8.71 GB of weights, 4096-d last-token-pooled embeddings
+llama-server -m Qwen3-8B-Q8_0.gguf --embedding --pooling last \
+  -c 8192 -np 1 -ngl 99 --port 8090 &
+
+# the API on :8700 against that encoder; --max-tokens has to match the slot window above
+clm-serve --emb-url http://127.0.0.1:8090/v1/embeddings --emb-model qwen3-8b --max-tokens 8192
+```
+
+Two things to get right there. `-c` is the **total** context split across the `-np` slots, so
+`-c 2048 -np 8` is 256 tokens per slot and will refuse ordinary states; and the heads need no GPU at
+all — they are 20M parameters, so `pip install contrastive-lm` against a CPU torch leaves the whole
+card to the encoder, which is what the 9.4 GB of 12 GB above measures. `--pooling last` is worth
+passing even though the quant bakes it in: llama.cpp logs
+`model default pooling_type is [-1], but [3] was specified`, and that line is the only thing
+confirming the pooling the heads were trained against.
+
+Measured through jevper on that stack: three typed questions answered in one request at
+`usage.n_calls == 1`, the score rubric read back under its own integer levels, `list_models()`
+returning both names, and `CLMClient.rank` agreeing to four decimals with the equivalent
+`Choice` question described below.
+
 ```python
 from openai import OpenAI
 from jevper import Choice, Noul, Score, SystemOneClient
@@ -310,31 +339,67 @@ request that answered three questions reports `n_calls == 1` and not 3. Nothing 
 count is in the recorded body, at `response.debug["llm_attempts"][0]["response"]["usage"]` — `debug` has
 no `usage` key of its own — and the two are different facts about the same call.
 
-### The state is truncated silently, and nothing reports it
+### A long state: cut silently on vLLM, refused outright on llama.cpp
 
-This is the one caveat that matters on a decision surface, and it is the server's rather than the
-format's. `clm-serve` truncates every text it embeds to `--max-tokens` (2048 by default), which has to
-match the encoder's `--max-model-len` — a state past it is cut, and `POST /v1/systemone` **does not report
-that it did**. Ollaya's native endpoint at least answers with `state_truncated`; here a truncated state
-reads as a complete one, and the decision is then about a prefix the caller never wrote.
+This is the one caveat that matters on a decision surface, and what happens is decided by the
+**encoder behind the server**, not by `clm-serve`. Measured on 2026-09-27 against `clm-serve` 0.1.0
+with a llama.cpp encoder: a state past the window is **not** truncated. It is refused, with a 502
+naming the exact token count.
 
-So size the state for it: raise both limits together (`--max-model-len 8192` on `vllm serve` and
-`clm-serve --max-tokens 8192`, which needs more GPU memory) or keep the state inside the default. The
-heads are trained on prose, and the server renders a structured state to `key: value` lines itself, so
-that part is not a risk — the token count is.
+The reason is a field the server sends and only one backend understands. `clm/embedder.py` puts
+`truncate_prompt_tokens: 2048` in every embedding request, which is vLLM's parameter, so on the
+documented `vllm serve` path the state is genuinely cut to fit and `POST /v1/systemone` **does not
+report that it did** — Ollaya's native endpoint at least answers with `state_truncated`, and here a
+truncated state reads as a complete one. llama.cpp's `/v1/embeddings` ignores that field, and its own
+`truncate` flag with it — both were sent at a 3201-token text and both came back the same
+`exceed_context_size_error`:
+
+```text
+ProviderError  status_code=502
+embedder error 400: request (5607 tokens) exceeds the available context size (2048 tokens)
+```
+
+The loud failure is the better one, but it costs three requests: 502 is a 5xx, so the default retry
+policy spends all three attempts on a condition that cannot succeed. Pass
+`RetryPolicy(n_retries=0)` if a state you know is long should fail once.
+
+Either way the fix is the same, and it is to raise **both** limits together. On llama.cpp that is the
+server's `-c` (total, split across its slots) and `clm-serve --max-tokens`; measured at
+`-c 8192 -np 1` with `--max-tokens 8192`, a 5631-token state answers in one attempt and the card sits
+at 9.4 GB of 12 GB. `-c 2048 -np 8` would give each slot 256 tokens, not 2048 — the same footgun
+the GGUF model card warns about. The heads are trained on prose, and the server renders a structured
+state to `key: value` lines itself, so the shape is not a risk; the token count is.
 
 ### The heads are locked to their encoder
 
 `CLM-v0.1-8B` is a 20M-parameter pair of heads over a frozen Qwen3-8B, and a head only means anything
 with the encoder and the pooling it was trained against: **Qwen3-8B, last-token pooling**. A different
-backbone, a different pooling, or a quantized encoder produces embeddings the head was never fitted to,
-and the answers are then well-formed and wrong. That is what makes this server awkward to fit on a small
-card: Qwen3-8B in bf16 is about 16 GB of weights by arithmetic alone (8B parameters at two bytes each),
-so a 12 GB GPU cannot hold it at all, and the obvious workaround — quantizing the encoder — is the one
-thing that invalidates the numbers. Two further consequences worth stating plainly: CLM **only scores**
-the candidates it is given, so its probabilities are relative to that set, and the SOTA agentic numbers
-on its model page (DeepSWE 81.6%, Terminal-Bench 2.1 87.6%) come from fine-tuned heads rather than from
-this checkpoint zero-shot.
+backbone, or a pooling other than last-token, produces embeddings the head was never fitted to, and
+the answers are then well-formed and wrong. That is what makes this server awkward to fit on a small
+card: Qwen3-8B in bf16 is about 16 GB of weights by arithmetic alone, so a 12 GB GPU cannot hold it.
+
+**Quantizing the encoder is not automatically that**, and this page previously said it was, which
+was too strong to be useful. A published Q8_0 GGUF of this encoder was measured on 23,926 System
+One questions against a same-runtime bf16 reference and holds every decisive decision
+(`top-1 (decisive)` 1.0000, planner accuracy **+0.46 points**); the head stack multiplies a cosine
+error by 100 before the softmax, so the question is never "is it quantized" but "is this quant
+one somebody measured against the head". Verified here on 2026-09-27 — Q8_0 under llama.cpp on a
+12 GB card — by the only check that settles it: the anchor case from the encoder's own model card
+(`department` over billing/technical) came back **0.98742** against the **0.98775** the card publishes
+for bf16 on vLLM, a difference of 0.0003. The lower quants are not equivalent — the same card rates
+Q6_K and Q5_K_M usable and Q4_K_M not recommended — so pick from its table rather than from size.
+
+Two further consequences worth stating plainly. CLM **only scores the candidates it is given**, so
+its probabilities are relative to that set and a probability is not a claim about the world. And the
+SOTA agentic numbers on its model page (DeepSWE 81.6%, Terminal-Bench 2.1 87.6%) come from
+fine-tuned heads rather than from this checkpoint zero-shot.
+
+One measured caveat about the numbers themselves. This server is **deterministic** — five identical
+calls returned bitwise identical floats, which is what a ranker should be and is the opposite of the
+hosted Jev service's ±0.01. But a probability is only stable for a *fixed set of questions*: the
+same `department` question answered alone came back 0.98742 and answered in a batch of three came
+back 0.98390, because the encoder's batched arithmetic reassociates. Compare distributions across
+runs, not to the digit.
 
 ### Using a `CLMClient` you already have
 

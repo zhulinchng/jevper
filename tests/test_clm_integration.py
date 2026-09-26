@@ -473,26 +473,39 @@ def test_the_recipe_gives_a_server_failure_the_status_jevper_retries_on() -> Non
 #
 # Skipped unless CLM_BASE_URL is set, e.g.
 #   CLM_BASE_URL=http://127.0.0.1:8700/v1 CLM_MODEL=clm-latest pytest tests/test_clm_integration.py
+#
+# Last run on 2026-09-27 against clm-serve 0.1.0 with the reference head over a Qwen3-8B Q8_0 GGUF
+# under llama.cpp on a 12 GB card, which is a real encoder rather than a mock one. The encoder is the
+# reference head's own, not a stand-in, so a probability can be held against a published figure --
+# `clm-serve` is a ranker and returns the same float for the same request every time, five calls
+# measured bitwise identical. The Jev service, by contrast, wobbles about +-0.01 and gets no such
+# assertion anywhere on this page.
 CLM_BASE_URL = os.environ.get("CLM_BASE_URL")
 CLM_MODEL = os.environ.get("CLM_MODEL", "clm-latest")
+# Which encoder is behind the server decides what an over-long state does: vLLM honours the
+# `truncate_prompt_tokens` the server sends and cuts the state silently, llama.cpp ignores it and
+# refuses. Only the refusing behaviour can be asserted, so it is opt-in.
+CLM_ENCODER = os.environ.get("CLM_ENCODER", "vllm")
+
+
+def _live_client(**kwargs: Any) -> SystemOneClient:
+    from openai import OpenAI
+
+    return SystemOneClient(
+        OpenAI(base_url=CLM_BASE_URL, api_key="clm"), model=CLM_MODEL, api="systemone", **kwargs
+    )
 
 
 @pytest.mark.skipif(not CLM_BASE_URL, reason="CLM_BASE_URL is not set")
 def test_a_real_clm_answers_three_questions_and_lists_its_models() -> None:
-    """The route this document is about, end to end.
+    """The route this document is about, end to end, against a real encoder.
 
-    ``clm-serve`` needs a Qwen3-8B pooling encoder behind it, which is about 16 GB of weights in
-    bf16 — more than the GPU this was measured on has — so the numbers below are not checked,
-    only the contract. ``docs/local-servers.md`` records what that leaves unverified.
+    ``STATE`` and ``QUESTIONS["department"]`` are the encoder's own published anchor case, so the
+    distribution is checked against the figure its model card prints rather than only for shape: a
+    mis-paired head, the wrong pooling, or the ``clm-raw`` ablation all land far outside this
+    window, while bf16 on vLLM and Q8_0 on llama.cpp both land inside it.
     """
-    from openai import OpenAI
-
-    clm = SystemOneClient(
-        OpenAI(base_url=CLM_BASE_URL, api_key="clm"),
-        model=CLM_MODEL,
-        api="systemone",
-        noul_requires_question=False,
-    )
+    clm = _live_client(noul_requires_question=False)
 
     response = clm.system_one(state=STATE, questions=QUESTIONS)
 
@@ -503,3 +516,56 @@ def test_a_real_clm_answers_three_questions_and_lists_its_models() -> None:
     assert sorted(response.answers["frustration"].legend) == [0, 1, 2]
     assert response.usage.n_calls == 1
     assert CLM_MODEL in {m.name for m in clm.list_models()}
+
+    # The card publishes 0.98775 for this case on bf16/vLLM; Q8_0 under llama.cpp measured 0.98390
+    # in the same batch. 0.01 covers both and is an order of magnitude tighter than the gap to the
+    # ablation (0.77) or to a mis-paired head.
+    assert abs(response.answers["department"].probabilities["billing"] - 0.98775) < 0.01
+
+
+@pytest.mark.skipif(not CLM_BASE_URL, reason="CLM_BASE_URL is not set")
+def test_a_real_clm_counts_requests_the_same_way_the_questions_were_billed() -> None:
+    """``usage.n_calls`` counts requests and the server's own count counts questions; both survive."""
+    response = _live_client().system_one(state=STATE, questions=QUESTIONS)
+
+    assert response.usage.n_calls == 1
+    assert response.debug["llm_attempts"][0]["response"]["usage"]["billing_units"] == len(QUESTIONS)
+
+
+@pytest.mark.skipif(
+    not CLM_BASE_URL or CLM_ENCODER != "llamacpp",
+    reason="needs CLM_BASE_URL and CLM_ENCODER=llamacpp; vLLM truncates instead of refusing",
+)
+def test_an_over_long_state_is_refused_rather_than_truncated() -> None:
+    """What this backend does with a state past the window, and what it costs the caller.
+
+    ``clm-serve`` asks the encoder to cut the text with ``truncate_prompt_tokens``, which is
+    vLLM's parameter; llama.cpp ignores it and answers 400, which the server relays as 502. A 502
+    is a 5xx, so the default policy spends every attempt on a condition that cannot improve --
+    which is the part worth pinning, since the fix is the caller's window and not a retry.
+    """
+    # The window is the operator's setting, not this test's, so the state is grown until the
+    # server refuses it. Each step that still answers is one real encoder pass, and the refusal
+    # itself is immediate -- the encoder rejects on length before it computes anything.
+    client = _live_client()
+    long_state, refusal = "", None
+    for repeats in (700, 2800, 11200, 44800):
+        long_state = "Customer wrote: " + ("the invoice is wrong and nobody helps. " * repeats)
+        try:
+            client.system_one(state=long_state, questions={"q": Noul(instructions="Urgent?")})
+        except JevperError as exc:
+            refusal = exc
+            break
+    if refusal is None:
+        pytest.skip("this server's window is wider than a state this test can build")
+
+    assert getattr(refusal, "status_code", None) == 502
+    # The default policy is two retries, so this permanent failure is attempted three times.
+    assert len(getattr(refusal, "attempts", [])) == 3
+
+    with pytest.raises(JevperError) as once:
+        _live_client(retry=RetryPolicy(n_retries=0, base_delay=0, max_delay=0)).system_one(
+            state=long_state, questions={"q": Noul(instructions="Urgent?")}
+        )
+
+    assert len(getattr(once.value, "attempts", [])) == 1
