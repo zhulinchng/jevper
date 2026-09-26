@@ -1,0 +1,24 @@
+name: context7-refresh
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: context7-refresh
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Context7 Refresh
+        run: |
+          curl -s -X POST https://context7.com/api/v1/refresh \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.CONTEXT7_API_KEY }}" \
+            -d '{"libraryName": "/zhulinchng/jevper"}'
