@@ -211,11 +211,13 @@ class StubServer:
         messages: Script | None = None,
         systemone: Script | None = None,
         models: Any = None,
+        decide: Script | None = None,
     ) -> None:
         self.chat = chat
         self.responses = responses
         self.messages = messages
         self.systemone = systemone
+        self.decide = decide
         self.models = models
         self.requests: list[dict[str, Any]] = []
         self.paths: list[str] = []
@@ -243,6 +245,8 @@ class StubServer:
                     script = stub.messages
                 elif self.path.endswith("/systemone"):
                     script = stub.systemone
+                elif self.path.endswith("/api/decide"):
+                    script = stub.decide
                 else:
                     script = stub.chat
                 answered: tuple[Any, ...]
@@ -310,6 +314,17 @@ class StubServer:
         host, port = self._server.server_address[:2]
         return f"http://{host}:{port}/v1"
 
+    @property
+    def root_base_url(self) -> str:
+        """The server's root, for the routes Ollaya puts outside the version prefix.
+
+        ``/api/decide`` answers at the root and the TypeSafe routes answer under ``/v1``. An SDK
+        client appends its path to whichever base URL it was handed, so the two are not reachable
+        from one object; this property is what makes that split testable.
+        """
+        host, port = self._server.server_address[:2]
+        return f"http://{host}:{port}"
+
     def bodies(self, path_suffix: str) -> list[dict[str, Any]]:
         return [body for path, body in zip(self.paths, self.requests) if path.endswith(path_suffix)]
 
@@ -353,10 +368,24 @@ def openai_client(stub: StubServer) -> Any:
     return OpenAI(base_url=stub.base_url, api_key="test", max_retries=0, timeout=10)
 
 
+def openai_root_client(stub: StubServer) -> Any:
+    """The real SDK against the server root, which is where Ollaya's native endpoint lives."""
+    from openai import OpenAI
+
+    return OpenAI(base_url=stub.root_base_url, api_key="test", max_retries=0, timeout=10)
+
+
 def async_openai_client(stub: StubServer) -> Any:
     from openai import AsyncOpenAI
 
     return AsyncOpenAI(base_url=stub.base_url, api_key="test", max_retries=0, timeout=10)
+
+
+def async_openai_root_client(stub: StubServer) -> Any:
+    """The async SDK against the server root, which is where Ollaya's native endpoint lives."""
+    from openai import AsyncOpenAI
+
+    return AsyncOpenAI(base_url=stub.root_base_url, api_key="test", max_retries=0, timeout=10)
 
 
 def anthropic_client(stub: StubServer) -> Any:

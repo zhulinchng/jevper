@@ -12,7 +12,7 @@ Where something could not be measured, it says so rather than guessing — see
 | Service | `POST https://opencode.ai/zen/v1/systemone`, the Jev endpoint opencode Zen serves |
 | Model | `jev-1.13-free`; the paid `jev-1.13` answered HTTP 402 on this account |
 | Reference client | `typesafe-sdk` 0.7.1 from PyPI, installed and read for the contract it encodes |
-| jevper | 0.7.8 on this branch, `.venv` (Python 3.14, openai 3.19.0). The confidence and score arithmetic below was measured on 0.7.4, before the System One surface existed; every wire-format measurement was taken on 2026-09-26 against 0.7.8 |
+| jevper | 0.7.9 on this branch, `.venv` (Python 3.14, openai 3.19.0). The confidence and score arithmetic below was measured on 0.7.4, before the System One surface existed; every Jev wire-format measurement was taken on 2026-09-26 against 0.7.8, which this page does not re-measure. The Ollaya run in [local servers](local-servers.md#ollaya-the-decision-server) is 0.7.9 |
 | Published docs | TypeSafe's API reference, confidence page, and the `jev-1.13` jaggedness page (reviewed 2026-09-17) |
 
 ## jevper can call this endpoint
@@ -162,6 +162,27 @@ names what answered, which for an alias like `jev-latest` is the concrete build.
 model the call asked for, on every surface including this one, because that is the one it validated
 and keyed its state on; the service's answer to the question "which build was that" is not on the
 wire jevper hands back.
+
+## An open model on the same wire format
+
+[Ollaya](https://github.com/ollaya-dev/ollaya) is an independent, open implementation of this same
+documented format, serving open decision models locally, and jevper's `api="systemone"` surface talks to
+it unchanged — the measured run is in [local servers](local-servers.md#ollaya-the-decision-server). It
+belongs on this page because it is the only accuracy figure available for this wire format that was not
+published by TypeSafe.
+
+Ollaya's own model page scores its `laya:typed-decisions` — a fine-tune of a 421M-parameter
+ModernBERT-large — at **0.766 on typed-decisions, against 0.727 published for Jev 1.13**. Both numbers are
+Ollaya's: jevper computed neither and has no opinion on the benchmark. What the pair is worth is that a
+local, open model on this wire format is not far off the hosted one, so a rubric can be developed
+entirely against Ollaya and pointed at the hosted service afterwards without changing a line.
+
+Two things differ from the hosted service, and both are the server's rather than the format's. Ollaya's
+own `/api/decide` adds a report on the request — which checkpoint a router chose, whether the state was
+truncated, how long the forward pass took — which jevper reads behind `native=True`. And its `model`
+field behaves as the hosted one does, naming the checkpoint that answered rather than the alias, so
+`native=True` reports that as `routing.model` while `response.model` stays the name the caller asked for,
+as it does on every other surface.
 
 ## Where the two disagree about input
 

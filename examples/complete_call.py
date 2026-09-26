@@ -189,6 +189,18 @@ def main() -> None:
             # Set it to group requests your own way — and pass your own when the
             # derived key is a fingerprint of your rubric at the provider.
             prompt_cache_key="complete-example",
+            # Two System One policies, which a prompt call like the one below
+            # never consults. Set here because this is how the System One surface
+            # is configured, not because this program exercises them. native=True
+            # sends System One requests to Ollaya's native /api/decide rather than
+            # the TypeSafe /v1/systemone route, and needs a client whose base URL
+            # is the server root, since the two routes sit at different depths.
+            # noul_requires_question=False lets a noul carrying neither
+            # instructions nor criteria reach the server, which Ollaya answers by
+            # reading the question id in their place. The hosted Jev API answers
+            # 400 for one, so True is the default and is right for it.
+            native=False,
+            noul_requires_question=True,
         ) as client:
             # The state under judgement. A string, a list of chat turns,
             # {"messages": [...]}, or any JSON value; it is rendered after the
@@ -232,8 +244,16 @@ def main() -> None:
                 reasoning=ReasoningConfig(mode="native", effort="low"),
                 temperature=0.0,
                 prompt_cache_key="complete-example",
+                # Ollaya's own request fields, which only its native System One
+                # endpoint carries: extras=["laya"] adds a laya object to every
+                # answer, and keep_alive is Ollama's model lifecycle control in
+                # that server's own units. A System One call without native=True
+                # refuses both by name rather than dropping them in silence. This
+                # program is a prompt call, which has neither field, so — like
+                # top_logprobs above — they are not sent.
+                extras=["laya"],
+                keep_alive="10m",
             )
-
             # One typed answer per question, in the order the questions were given.
             # NoulAnswer carries only ``noul``. ChoiceAnswer also carries
             # ``choice``, ``probabilities`` and ``confidence``; ScoreAnswer also

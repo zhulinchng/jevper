@@ -358,6 +358,39 @@ def test_a_noul_with_nothing_to_judge_is_refused_as_the_service_refuses_it(stub_
     assert stub.requests == []
 
 
+@pytest.mark.parametrize(
+    "question",
+    [Noul(), Noul(instructions=""), Noul(criteria={})],
+    ids=["bare", "empty_instructions", "empty_criteria"],
+)
+def test_a_caller_who_allows_a_bare_noul_reaches_the_server(stub_server, question):
+    """Ollaya answers one of these by reading the question id in place of the missing instruction,
+    so whether it is allowed is a property of the server being asked and a caller's policy to set.
+    Measured against ollaya 0.7.0 on 2026-09-26: 200, and a noul, on both of its routes. Every shape
+    the hosted service refuses is the same shape this option relaxes, and no other."""
+    stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.1249}}))
+
+    with client_for(stub, noul_requires_question=False) as client:
+        response = client.system_one(state=STATE, questions={"n": question})
+
+    assert len(stub.requests) == 1
+    assert response.answers["n"].noul == 0.1249
+
+
+def test_the_relaxed_rule_is_this_client_s_choice_and_not_a_mode(stub_server):
+    """The default is unchanged beside a relaxed one, so a caller who wants the hosted service's
+    refusal never has to remember to ask for it back."""
+    stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.12}}))
+
+    with client_for(stub, noul_requires_question=False) as relaxed:
+        relaxed.system_one(state=STATE, questions={"n": Noul()})
+
+    with pytest.raises(InvalidQuestionError, match="must carry instructions or criteria"):
+        client_for(stub).system_one(state=STATE, questions={"n": Noul()})
+
+    assert len(stub.requests) == 1
+
+
 def test_a_noul_with_either_criterion_side_is_sent(stub_server):
     """Either value alone is enough for the service, and so it is enough here."""
     stub = stub_server(systemone=answering({"n": {"type": "noul", "noul": 0.5}}))

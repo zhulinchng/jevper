@@ -32,20 +32,23 @@ from .types import (
     ChoiceAnswer,
     Example,
     JSONContent,
+    LayaExtras,
     Method,
     MethodSelection,
     ModelMetadata,
+    NativeSystemOneResponse,
     Noul,
     NoulAnswer,
     NoulCriteria,
     Question,
+    Routing,
     Score,
     ScoreAnswer,
     SystemOneResponse,
     Usage,
 )
 
-__version__ = "0.7.8"
+__version__ = "0.7.9"
 
 __all__ = [
     "Answer",
@@ -61,11 +64,13 @@ __all__ = [
     "JSONContent",
     "JevperError",
     "LabelReadoutError",
+    "LayaExtras",
     "MalformedAnswerError",
     "Method",
     "MethodSelection",
     "ModelMetadata",
     "ModelRefusalError",
+    "NativeSystemOneResponse",
     "Noul",
     "NoulAnswer",
     "NoulCriteria",
@@ -77,6 +82,7 @@ __all__ = [
     "ReasoningSummaryPart",
     "ReasoningTextPart",
     "RetryPolicy",
+    "Routing",
     "Score",
     "ScoreAnswer",
     "SystemOneClient",

@@ -19,6 +19,14 @@ jevper posts the Jev request body to `/v1/systemone` and reads the Jev answer sh
 `list_models()` reads the service's model list. That path is measured in
 [docs/jev-comparison.md](https://github.com/zhulinchng/jevper/blob/main/docs/jev-comparison.md).
 
+That same surface reaches [Ollaya](https://github.com/ollaya-dev/ollaya), the open local server for
+decision models, whose `/v1` API is the Jev wire format and whose `GET /v1/models` returns the Jev
+model-list shape — so `list_models()` works there and does not against a gateway that answers that
+path its own way. Ollaya also serves a native `POST /api/decide`; `native=True` posts there and returns
+a `NativeSystemOneResponse` carrying which checkpoint a router chose, whether the state was truncated
+and the run's own timings. Both are measured in
+[docs/local-servers.md](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md#ollaya-the-decision-server).
+
 The `responses` surface speaks both OpenAI's Responses API and the [OpenResponses](https://www.openresponses.org)
 specification, and both live at the same `/v1/responses` path — the OpenResponses site lists LM Studio among
 the ecosystem's implementers, [vLLM says its route "aligns with" it](https://github.com/vllm-project/vllm/issues/32850)

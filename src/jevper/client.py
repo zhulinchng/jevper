@@ -83,9 +83,11 @@ from .types import (
     Method,
     MethodSelection,
     ModelMetadata,
+    NativeSystemOneResponse,
     NoulAnswer,
     NoulCriteria,
     Question,
+    Routing,
     ScoreAnswer,
     SystemOnePayload,
     SystemOneResponse,
@@ -937,6 +939,12 @@ class _CallContext:
     ``api="responses"`` is a decision: its 404 belongs to the caller, not to a fallback."""
     prompt_cache_key: str | None = None
     """The caller's cache key, or ``None`` to derive one per question from the prefix it can reuse."""
+    native: bool = False
+    """The System One request goes to ollaya's native endpoint. Resolved once with the rest of the
+    call, so every question on a shared batch is built from the same decision."""
+    extras: tuple[str, ...] = ()
+    keep_alive: str | int | None = None
+    """Ollaya's own request options for that endpoint; see ``CallSpec.extras``."""
 
 
 @dataclass
@@ -1011,14 +1019,22 @@ def _systemone_spec(
     state: Any,
     questions: Mapping[str, Question],
     question_ids: Sequence[str],
+    context: _CallContext,
 ) -> CallSpec:
     """The request for ``question_ids``, and only those.
 
     The service takes a map, and which entries it carries is the batching decision rather than the
-    wire format's.
+    wire format's. ``context`` supplies which of the two System One endpoints this call is for and
+    the options only that one takes, which are properties of the call rather than of any question.
     """
     selected = {question_id: questions[question_id] for question_id in question_ids}
-    return CallSpec(messages=[], systemone=SystemOnePayload(state=state, questions=selected))
+    return CallSpec(
+        messages=[],
+        systemone=SystemOnePayload(state=state, questions=selected),
+        native=context.native,
+        extras=context.extras,
+        keep_alive=context.keep_alive,
+    )
 
 
 def _systemone_outcome(
@@ -1167,6 +1183,31 @@ def _is_bare_scalar(value: Any) -> bool:
     return isinstance(value, (bool, int, float))
 
 
+def _native_fields(body: Any) -> dict[str, Any]:
+    """The fields ollaya's native endpoint adds to a TypeSafe response, as its response type wants them.
+
+    Read the way the answers are: a field the endpoint left out keeps the type's own default rather
+    than being filled with a value the service never sent. ``state_truncated`` and ``done_reason``
+    are the exception — they describe the one request that was made, so a body without them is a
+    body that made no decision, and the defaults are the honest reading of that. A duration is a
+    measurement, so a reported ``0`` — a warm model, a call that generated nothing — is kept as one
+    and only an absent field is ``None``.
+    """
+    if not isinstance(body, Mapping):
+        return {}
+    routing = body.get("routing")
+    fields: dict[str, Any] = {
+        "routing": Routing(**routing) if isinstance(routing, Mapping) else None,
+        "state_truncated": bool(body.get("state_truncated", False)),
+        "done_reason": str(body.get("done_reason", "decide")),
+        "created_at": str(body.get("created_at", "")),
+    }
+    for name in ("total_duration", "load_duration", "eval_duration"):
+        value = body.get(name)
+        fields[name] = value if isinstance(value, int) and not isinstance(value, bool) else None
+    return fields
+
+
 class _BaseClient:
     def __init__(
         self,
@@ -1187,6 +1228,8 @@ class _BaseClient:
         extra_body: Mapping[str, Any] | None = None,
         extra_headers: Mapping[str, str] | None = None,
         prompt_cache_key: str | None = None,
+        native: bool = False,
+        noul_requires_question: bool = True,
     ) -> None:
         if method not in METHOD_SELECTIONS:
             raise JevperError(f"method must be one of {METHOD_SELECTIONS!r}, got {method!r}")
@@ -1245,6 +1288,11 @@ class _BaseClient:
         self.extra_body = dict(extra_body) if extra_body is not None else None
         self.extra_headers = dict(extra_headers) if extra_headers is not None else None
         self.prompt_cache_key = prompt_cache_key
+        self.native = native
+        """Whether System One calls go to ollaya's native endpoint rather than the TypeSafe one. A
+        policy the caller sets rather than one jevper probes for: both routes are one server on one
+        port, so nothing a call returns says which of the two the caller meant."""
+        self.noul_requires_question = noul_requires_question
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._executor_lock = threading.Lock()
         # What method="auto" has learned about this provider, per (model, surface).
@@ -1684,6 +1732,8 @@ class _BaseClient:
         reasoning: ReasoningConfig | None,
         temperature: float | None,
         prompt_cache_key: str | None = None,
+        extras: Sequence[str] = (),
+        keep_alive: str | int | None = None,
     ) -> tuple[_CallContext, dict[str, Question]]:
         if not questions:
             raise InvalidQuestionError("at least one question is required")
@@ -1734,6 +1784,8 @@ class _BaseClient:
                 reasoning,
                 temperature,
                 prompt_cache_key,
+                extras,
+                keep_alive,
             ), parsed
         # The rendered turns are reused for every question, so the state is rendered once.
         state_messages = tuple(render_state_messages(state))
@@ -1814,6 +1866,8 @@ class _BaseClient:
         reasoning: ReasoningConfig | None,
         temperature: float | None,
         prompt_cache_key: str | None,
+        extras: Sequence[str],
+        keep_alive: str | int | None,
     ) -> _CallContext:
         """A call on the System One surface, which is the wire format rather than a prompt.
 
@@ -1826,7 +1880,13 @@ class _BaseClient:
         for question_id, question in parsed.items():
             # The one question rule the service itself enforces, mirrored where it is enforced: a
             # prompt surface can render the question from a few-shot example, this wire format cannot.
-            if question.type == "noul" and not noul_carries_a_question(question):
+            # Ollaya reads the question id in place of a missing instruction, so whether that is
+            # allowed is a property of the server being asked — the caller's policy, not jevper's.
+            if (
+                self.noul_requires_question
+                and question.type == "noul"
+                and not noul_carries_a_question(question)
+            ):
                 raise InvalidQuestionError(
                     f"question {question_id!r}: a noul must carry instructions or criteria; the Jev "
                     "API answers 400 for one with neither"
@@ -1870,6 +1930,22 @@ class _BaseClient:
         )
         if effective_cache_key is not None:
             refused.append("prompt_cache_key= (there is no prompt here to cache)")
+        # Ollaya's native options, refused on the TypeSafe route with the fix that reaches them.
+        # Checked apart from the list below because its advice is the opposite of theirs: these are
+        # not fields to drop, they are fields of the other endpoint.
+        if not self.native and (extras or keep_alive is not None):
+            asked = [
+                name
+                for name, given in (
+                    ("extras", bool(extras)),
+                    ("keep_alive", keep_alive is not None),
+                )
+                if given
+            ]
+            raise ClientCapabilityError(
+                f"api='systemone' cannot carry {', '.join(asked)}; those belong to ollaya's native "
+                "endpoint, so build the client with native=True to reach them"
+            )
         if refused:
             raise ClientCapabilityError(
                 "api='systemone' cannot carry "
@@ -1896,6 +1972,9 @@ class _BaseClient:
             answer_reasoning=None,
             analysis_reasoning=None,
             prompt_cache_key=None,
+            native=self.native,
+            extras=tuple(extras),
+            keep_alive=keep_alive,
         )
 
     def _resolve_examples(
@@ -2172,12 +2251,17 @@ class _BaseClient:
         outcomes: Mapping[str, _QuestionOutcome],
         latency: float,
         totals: tuple[dict[str, int | None], int, int] | None = None,
+        body: Mapping[str, Any] | None = None,
     ) -> SystemOneResponse:
         """The call's response, from its per-question outcomes.
 
         ``totals`` replaces the summed usage when every outcome came from one shared request — a
         System One batch answers N questions with one request, and counting its tokens once per
         question would report N times what the service charged.
+
+        ``body`` is that same shared request's response, and it carries the native response's extra
+        report on the one request this call made. Without it a native call still answers; it simply
+        has no endpoint report to carry, so every extra field keeps its own default.
         """
         answers: dict[str, Answer] = {}
         reasoning: list[ReasoningContentPart] = []
@@ -2263,15 +2347,16 @@ class _BaseClient:
             debug["server_limits"] = {
                 entry.name: getattr(limits, entry.name) for entry in dataclass_fields(Limits)
             }
-        return SystemOneResponse(
-            model=context.model,
-            answers=answers,
-            usage=Usage(
-                **tokens, n_calls=n_calls, n_retries=n_retries, latency=latency
-            ),
-            reasoning=tuple(reasoning),
-            debug=debug,
-        )
+        common: dict[str, Any] = {
+            "model": context.model,
+            "answers": answers,
+            "usage": Usage(**tokens, n_calls=n_calls, n_retries=n_retries, latency=latency),
+            "reasoning": tuple(reasoning),
+            "debug": debug,
+        }
+        if context.native:
+            return NativeSystemOneResponse(**common, **_native_fields(body))
+        return SystemOneResponse(**common)
 
 
 class SystemOneClient(_BaseClient):
@@ -2310,17 +2395,24 @@ class SystemOneClient(_BaseClient):
         state: Any,
         parsed: Mapping[str, Question],
         context: _CallContext,
-    ) -> tuple[dict[str, _QuestionOutcome], tuple[dict[str, int | None], int, int]]:
-        """Every question in one request; see ``_batch_outcomes`` for what that costs and buys."""
+    ) -> tuple[
+        dict[str, _QuestionOutcome], tuple[dict[str, int | None], int, int], Mapping[str, Any]
+    ]:
+        """Every question in one request; see ``_batch_outcomes`` for what that costs and buys.
+
+        The body travels back too, because one request answered the whole call: it is the only place
+        the endpoint's own report on that request — routing, truncation, its timings — can be read.
+        """
         log = _CallLog()
         question_ids = list(parsed)
-        spec = _systemone_spec(state, parsed, question_ids)
+        spec = _systemone_spec(state, parsed, question_ids, context)
         try:
             result = self._call(log, question_ids[0], spec, context)
         except Exception as exc:
             _batch_failure(exc, log, question_ids)
             raise
-        return _batch_outcomes(log, result, parsed)
+        outcomes, totals = _batch_outcomes(log, result, parsed)
+        return outcomes, totals, result.response
 
     def _call(
         self, log: _CallLog, question_id: str, spec: CallSpec, context: _CallContext
@@ -2389,10 +2481,22 @@ class SystemOneClient(_BaseClient):
         reasoning: ReasoningConfig | None = None,
         temperature: float | None = None,
         prompt_cache_key: str | None = None,
+        extras: Sequence[str] = (),
+        keep_alive: str | int | None = None,
     ) -> SystemOneResponse:
         start = time.perf_counter()
         context, parsed = self._prepare(
-            state, questions, examples, model, method, api, reasoning, temperature, prompt_cache_key
+            state,
+            questions,
+            examples,
+            model,
+            method,
+            api,
+            reasoning,
+            temperature,
+            prompt_cache_key,
+            extras,
+            keep_alive,
         )
         if context.transport.surface == "systemone":
             # One request for every question, which is the shape the service is built to be asked:
@@ -2400,9 +2504,14 @@ class SystemOneClient(_BaseClient):
             # There is no per-question option here on purpose — on this surface the questions travel
             # together because the service evaluates them together, and a caller who wants them apart
             # is asking a different service.
-            outcomes, totals = self._run_systemone_batch(state, parsed, context)
+            outcomes, totals, body = self._run_systemone_batch(state, parsed, context)
             return self._assemble(
-                context, parsed, outcomes, time.perf_counter() - start, totals=totals
+                context,
+                parsed,
+                outcomes,
+                time.perf_counter() - start,
+                totals=totals,
+                body=body,
             )
 
         outcomes: dict[str, _QuestionOutcome] = {}
@@ -2553,17 +2662,20 @@ class AsyncSystemOneClient(_BaseClient):
         state: Any,
         parsed: Mapping[str, Question],
         context: _CallContext,
-    ) -> tuple[dict[str, _QuestionOutcome], tuple[dict[str, int | None], int, int]]:
+    ) -> tuple[
+        dict[str, _QuestionOutcome], tuple[dict[str, int | None], int, int], Mapping[str, Any]
+    ]:
         """The async twin of the batching path; see ``_batch_outcomes`` for what it costs and buys."""
         log = _CallLog()
         question_ids = list(parsed)
-        spec = _systemone_spec(state, parsed, question_ids)
+        spec = _systemone_spec(state, parsed, question_ids, context)
         try:
             result = await self._call(log, question_ids[0], spec, context)
         except Exception as exc:
             _batch_failure(exc, log, question_ids)
             raise
-        return _batch_outcomes(log, result, parsed)
+        outcomes, totals = _batch_outcomes(log, result, parsed)
+        return outcomes, totals, result.response
 
     async def system_one(
         self,
@@ -2577,15 +2689,32 @@ class AsyncSystemOneClient(_BaseClient):
         reasoning: ReasoningConfig | None = None,
         temperature: float | None = None,
         prompt_cache_key: str | None = None,
+        extras: Sequence[str] = (),
+        keep_alive: str | int | None = None,
     ) -> SystemOneResponse:
         start = time.perf_counter()
         context, parsed = self._prepare(
-            state, questions, examples, model, method, api, reasoning, temperature, prompt_cache_key
+            state,
+            questions,
+            examples,
+            model,
+            method,
+            api,
+            reasoning,
+            temperature,
+            prompt_cache_key,
+            extras,
+            keep_alive,
         )
         if context.transport.surface == "systemone":
-            outcomes, totals = await self._run_systemone_batch(state, parsed, context)
+            outcomes, totals, body = await self._run_systemone_batch(state, parsed, context)
             return self._assemble(
-                context, parsed, outcomes, time.perf_counter() - start, totals=totals
+                context,
+                parsed,
+                outcomes,
+                time.perf_counter() - start,
+                totals=totals,
+                body=body,
             )
         semaphore = asyncio.Semaphore(self.max_concurrency)
 

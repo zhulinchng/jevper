@@ -36,6 +36,13 @@ DEFAULT_MAX_TOKENS = 1024
 SYSTEMONE_PATH = "/systemone"
 MODELS_PATH = "/models"
 
+# Ollaya's native decision endpoint, relative to the client's base URL as the two above are. It sits
+# at the root rather than under the version prefix, so the two are not interchangeable on one client:
+# `base_url=.../v1` reaches the TypeSafe routes and 404s this one, and a root base URL reaches this
+# and misses those. jevper names no host, so a caller wanting both points two client objects at the
+# one server — the same way the other three surfaces are reached.
+DECIDE_PATH = "/api/decide"
+
 
 @dataclass(frozen=True)
 class CallSpec:
@@ -53,6 +60,16 @@ class CallSpec:
     """The Jev request body, for the System One surface. The other fields describe a prompt; this one
     is the wire format itself, so it is built once and sent as it is. Which questions it carries is
     the caller's choice: one per request, as every jevper surface does, or all of them at once."""
+    native: bool = False
+    """Ollaya's native endpoint rather than the TypeSafe one. The request body is that same body plus
+    the two fields below, and the response adds routing, truncation and timings; see ``DECIDE_PATH``."""
+    extras: tuple[str, ...] = ()
+    """Model-family outputs to ask for. Ollaya's closed set is ``("laya",)`` today, which adds a
+    ``laya`` object to every answer; the set is the endpoint's to widen, so an unknown value is its
+    422 to report rather than a refusal made here."""
+    keep_alive: str | int | None = None
+    """Ollama's lifecycle control, in that server's own units. ``None`` sends no field, so the
+    service's own ``OLLAYA_KEEP_ALIVE`` applies as it would to a request that never mentioned it."""
 
 
 @dataclass(frozen=True)
@@ -1189,7 +1206,17 @@ def build_systemone_kwargs(
         },
         **caller,
     }
-    kwargs: dict[str, Any] = {"path": SYSTEMONE_PATH, "body": body, "cast_to": dict}
+    if spec.extras:
+        body["extras"] = list(spec.extras)
+    if spec.keep_alive is not None:
+        # Absent and null mean the same thing there, so a caller who set nothing sends no field and
+        # the service's own default stands.
+        body["keep_alive"] = spec.keep_alive
+    kwargs: dict[str, Any] = {
+        "path": DECIDE_PATH if spec.native else SYSTEMONE_PATH,
+        "body": body,
+        "cast_to": dict,
+    }
     if extra_headers:
         # A low-level ``post`` takes its headers in ``options``; an SDK method with a typed field
         # for them is not the same method. Left out when there is nothing to send, so a duck client

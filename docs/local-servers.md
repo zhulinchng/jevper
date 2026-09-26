@@ -45,6 +45,145 @@ response = client.system_one(
 response.answers["intent"].probabilities  # a real distribution, read from the server's logprobs
 ```
 
+## Ollaya, the decision server
+
+[Ollaya](https://github.com/ollaya-dev/ollaya) (lowercase, no second `l`) is **not** the Ollama in the table
+below. It serves open *decision* models — models trained to answer a typed question about a state in one
+forward pass, with no generation at all — and its `/v1` API is declared wire-identical to TypeSafe's. That
+is the format jevper's `api="systemone"` surface already speaks, so ollaya is reached by base URL like any
+other server, and its `GET /v1/models` returns TypeSafe's own `{"models": [...]}` shape, which is the one
+`list_models()` reads. A gateway that answers that path OpenAI-style is reported as the wrong shape; ollaya
+is not such a gateway.
+
+Install, pull and serve, then point a client at it:
+
+```bash
+curl -fsSL https://ollaya.dev/install.sh | sh      # 0.7.0; no root installs to ~/.local
+export PATH="$HOME/.local/bin:$PATH"
+ollaya pull laya:en
+ollaya pull laya:typed-decisions
+ollaya serve                                       # 127.0.0.1:11435
+```
+
+```python
+from openai import OpenAI
+from jevper import Noul, SystemOneClient
+
+with SystemOneClient(
+    OpenAI(base_url="http://127.0.0.1:11435/v1", api_key="ollama"),
+    model="laya:en",
+    api="systemone",
+) as client:
+    response = client.system_one(
+        state="I was charged twice for my subscription this month.",
+        questions={"refund": Noul(instructions="Does the customer ask for a refund?")},
+    )
+
+response.answers["refund"].noul   # 0.8551, measured 2026-09-26
+```
+
+The `api_key` is never checked unless the daemon was started with `OLLAYA_API_KEY` set; any non-empty
+string works. Three questions of mixed type travel in one request, as on any System One call.
+
+### The two routes sit at different depths
+
+Ollaya serves the TypeSafe routes under `/v1` and its own native endpoint, `/api/decide`, at the server
+root. An SDK client appends its path to whichever base URL it was handed, so one client object reaches
+exactly one of them — measured 2026-09-26 against ollaya 0.7.0:
+
+| `base_url` | `SYSTEMONE_PATH` → | `MODELS_PATH` → | `/api/decide` → |
+| --- | --- | --- | --- |
+| `http://127.0.0.1:11435/v1` | `/v1/systemone` 200 | `/v1/models` 200 | `/v1/api/decide` **404** |
+| `http://127.0.0.1:11435` | `/systemone` 404 | `/models` 404 | `/api/decide` 200 |
+
+So a caller who wants decisions *and* the model list points two client objects at the one server. The 404
+is ollaya's own, reported as `ProviderError`:
+`{'error': '/v1/api/decide not found', 'code': 'NOT_FOUND'}`.
+
+### The native endpoint, with `native=True`
+
+`/api/decide` takes the same request body and answers in the same format, then adds a report on the
+request that produced it. Build the client with `native=True` and jevper posts there and returns a
+`NativeSystemOneResponse`:
+
+```python
+with SystemOneClient(
+    OpenAI(base_url="http://127.0.0.1:11435", api_key="ollama"),
+    model="laya",                       # a router: picks laya:en or laya:multilingual
+    api="systemone",
+    native=True,
+) as client:
+    response = client.system_one(state=state, questions=questions)
+
+response.routing.route      # 'english' — the stable key to branch on
+response.routing.model      # 'laya:en' — the checkpoint that answered
+response.state_truncated    # whether part of the state was dropped to fit the context
+response.eval_duration      # 21_954_691 ns, the service's own nanoseconds, passed through as sent
+response.done_reason        # 'decide'
+```
+
+`response.model` stays the name the caller asked for — `laya` above, not `laya:en`. On the wire ollaya's
+`model` is the checkpoint that answered, and reading that instead would make one field mean two things
+across jevper's surfaces; `routing.model` carries it. `/v1/systemone` reports no routing at all, so
+`native=True` is the only way to see it.
+
+Two more fields are that route's own, and jevper refuses them on the TypeSafe one by name rather than
+dropping them in silence:
+
+* `extras=["laya"]` adds a `laya` object to **every** answer, carrying the model's own confidence
+  (`1 − H(p)/ln K`, or `max(p, 1 − p)` for a noul) beside TypeSafe's, plus `act_probability`. The two
+  confidences are different numbers from different heads and are not interchangeable — measured on
+  `laya:en`, 0.615 against 0.8496 for the same choice. `act_probability` is `None` for a model with no
+  act head, which the service reports as null. `"laya"` is a closed set that belongs to ollaya, so
+  jevper passes the caller's value through and an unknown one is the server's to reject — 400,
+  `Input should be 'laya'`, naming the expected value.
+* `keep_alive` is Ollama's model lifecycle control in that server's own units. `0` unloads the model and
+  is sent like any other value.
+
+### A noul with nothing to judge
+
+jevper refuses a noul carrying neither instructions nor criteria, because the hosted Jev service answers
+400 for one. **Ollaya answers one**, reading the question id in place of the missing instruction —
+measured 200 on both of its routes. A caller who wants that reach for it:
+
+```python
+SystemOneClient(provider, model="laya:en", api="systemone",
+                 native=True, noul_requires_question=False)
+```
+
+The default is unchanged, so a caller on the hosted service never has to ask for its refusal back.
+
+### What ollaya refuses, and at what size
+
+These are the answering model's own budgets, measured 2026-09-26 against `laya:en`, not jevper's. jevper
+surfaces each refusal as the server wrote it:
+
+| Limit | Measured | Refusal |
+| --- | --- | --- |
+| Options in one question | **127** with a 4-character instruction, 126 with a 100-character one | 422 `TOO_MANY_OPTIONS` — "128 options do not fit the option budget of laya:en". The budget is the whole question, so the instruction spends it too |
+| Options in one question, absolute | 255 | 422 `INVALID_REQUEST` — "Dictionary should have at most 255 items" |
+| Questions in one request | **256** (11 and 64 answered; 257 refused) | 422 `INVALID_REQUEST` — "Dictionary should have at most 256 items" |
+| `state` | **65,536 tokens** (200,000 characters answered; 1,000,000 refused) | 422 `INPUT_TOO_LONG` — "state is 200001 tokens long; the limit is 65536" |
+
+jevper enforces none of these: they are properties of the model that answered, and a rubric sized for one
+server is not sized for another.
+
+### What was measured, and on what
+
+All the figures on this section come from one run on **2026-09-26** against **ollaya 0.7.0** on the same
+remote box the rest of this page uses: Ubuntu 24.04.5 under WSL2, x86_64, glibc 2.39, driver 617.14, one
+RTX 3080 (12 GB). `laya:en` and `laya:typed-decisions` are 854 MB each; the `laya` router is 11 KB and
+pulls `laya:multilingual` (684 MB) as its second target. The daemon chose **F16 on `cuda:0`**, which
+`ollaya ps` reports and which is worth knowing: ollaya's own model card notes the F16 graph can differ
+from F32 when the top two options are within 0.01 of each other, so a near-tied answer is not stable
+across precisions. All of it is jevper 0.7.9 driven through the public API, plus raw HTTP for the tables
+above.
+
+`laya:en` is a 421M-parameter ModernBERT-large, ONNX, onnxruntime, with `choice` and `score` capabilities;
+`laya:typed-decisions` is the same architecture fine-tuned on the typed-decisions workflows, which its own
+model list describes as **0.766** accuracy. For the Jev side of that comparison, see
+[`jev-comparison.md`](jev-comparison.md).
+
 ## What to pass per server
 
 | Server | `base_url` | `model` | Thinking off | Notes |

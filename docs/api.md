@@ -19,7 +19,8 @@ from jevper import SystemOneClient, AsyncSystemOneClient, Choice, Noul, Score, E
 SystemOneClient(client, *, model, method="auto", api="auto", reasoning=None, examples=(),
                 structured_outputs=True, normalize_probabilities=True, top_logprobs=20,
                 max_concurrency=8, n_retry_malformed=1, retry=None, temperature=None,
-                extra_body=None, extra_headers=None, prompt_cache_key=None)
+                extra_body=None, extra_headers=None, prompt_cache_key=None,
+                native=False, noul_requires_question=True)
 ```
 
 Only `client` is positional; every option is keyword-only, and an unknown keyword is a `TypeError`
@@ -66,6 +67,8 @@ refuses a blocking one, before any request, naming the class to use instead.
 | `prompt_cache_key` | `None` | The provider's cache-routing key. Unset, jevper derives one per question from the parts of the prompt that do not change between calls, so a rubric's requests are routed together; set it to group (or account for) requests your own way. It travels in the request *body* on both OpenAI surfaces: the field belongs to the API, and only newer SDK releases type it — `openai` grew `prompt_cache_key` on Chat Completions and Responses after 1.92, the floor this package declares — while the body is identical either way, since the SDK merges `extra_body` into the same JSON. A keyword a supported release does not type is a `TypeError` from inside the call, with the caller's remedy nowhere in the message |
 | `extra_body` | `None` | Merged into every request body (the grammar field is merged here too). A key it names is the value that reaches the wire — the SDK merges `extra_body` *after* the typed parameters — so jevper leaves that field alone rather than sending a typed value the caller's own key would override. `response_format`/`text`/`output_config` named here therefore also puts the JSON Schema in the prompt, since no schema of jevper's is in the request. On the Messages surface, `max_tokens` comes from here — jevper always sends one there, defaulting to `DEFAULT_MAX_TOKENS` (1024), or 1024 plus `ReasoningConfig(budget_tokens=…)`; a `max_tokens` that cannot hold the thinking budget asked for raises `JevperError` locally, naming both numbers, rather than earning the API's own refusal. Every other key travels on all three surfaces, whether or not a temperature was set |
 | `extra_headers` | `None` | Sent with every request. A name spelled differently from the client's own (`authorization` against the SDK's `Authorization`) is renamed to the client's spelling, so it replaces the default header instead of joining it on the wire. Names and values must be what a header can carry — an HTTP token name and a printable-ASCII value, horizontal tabs allowed — and a name or value that is not is refused here, not by the SDK's encoder from inside the request |
+| `native` | `False` | Post System One requests to [Ollaya](local-servers.md#ollaya-the-decision-server)'s native `POST /api/decide` rather than the TypeSafe `POST /v1/systemone`, and return a `NativeSystemOneResponse` carrying that endpoint's report. A caller's choice rather than one jevper probes for: both routes are one server on one port, so nothing a call returns says which was meant. The two sit at different depths, so this needs a client whose `base_url` is the server root |
+| `noul_requires_question` | `True` | Refuse a noul carrying neither instructions nor criteria, as the hosted Jev service does with a 400. `False` sends one anyway, for a server that answers it by reading the question id in their place — [Ollaya](local-servers.md#ollaya-the-decision-server) does, measured. Unrelated to `api`, and ignored by a prompt call |
 
 The [OpenResponses schema](https://github.com/openresponses/openresponses/blob/main/public/openapi/openapi.json)
 documents a 64-character maximum for `prompt_cache_key`; OpenAI's own API reference states no length
@@ -104,7 +107,8 @@ key when the examples or the question text are sensitive and that link is not wa
 ### `system_one`
 
 ```python
-system_one(*, state, questions, examples=(), model=None, method=None, api=None, reasoning=None, temperature=None, prompt_cache_key=None)
+system_one(*, state, questions, examples=(), model=None, method=None, api=None, reasoning=None,
+           temperature=None, prompt_cache_key=None, extras=(), keep_alive=None)
     -> SystemOneResponse
 ```
 
@@ -119,14 +123,20 @@ system_one(*, state, questions, examples=(), model=None, method=None, api=None, 
 | `reasoning` | `None` | Overrides the constructor reasoning |
 | `temperature` | `None` | Overrides the constructor temperature |
 | `prompt_cache_key` | `None` | Overrides the constructor cache key; `None` keeps the constructor's (or the derived one) |
+| `extras` | `()` | Ollaya's own model-family outputs for its native endpoint, passed through as given. The closed set today is `("laya",)`, which adds a `laya` object to every answer; the set is the endpoint's to widen, so an unknown value is its refusal to report rather than one made here |
+| `keep_alive` | `None` | Ollama's model lifecycle control, in that server's own units; `0` unloads the model. `None` sends no field, so the service's own `OLLAYA_KEEP_ALIVE` applies |
 
 On `api="systemone"` every question goes in one request — that is the shape the service is built to be
 asked — and four of the options above have no field on that wire, so they are refused by name in one
 error before anything is sent: a `method` other than `auto`, a `reasoning`, `examples`, a
 `temperature` and a `prompt_cache_key`. A noul carrying neither instructions nor criteria is refused
-there too, because the service answers 400 for one. The service's own `score`, `confidence`, `choice`
-and `legend` are read as they arrived rather than recomputed, and the request's usage is counted once
-for the whole call however many questions it answered.
+there too, because the hosted service answers 400 for one; `noul_requires_question=False` lifts that,
+for a server that answers one by reading the question id in its place. The service's own `score`,
+`confidence`, `choice` and `legend` are read as they arrived rather than recomputed, and the request's
+usage is counted once for the whole call however many questions it answered.
+
+`extras` and `keep_alive` belong to `native=True` alone, and are refused on the TypeSafe route by name
+before anything is sent, since the fix there is the other route rather than dropping the field.
 
 Per-call values win over constructor defaults. Everything is resolved and validated before the first provider
 call, so a bad question, an empty `questions` mapping, an unusable `state`, or `grammar` on the Responses
@@ -282,13 +292,44 @@ ScoreAnswer(type="score", score=1.05, legend={0: "Calm", 1: "Frustrated", 2: "Ve
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `model` | `str` | Effective model |
+| `model` | `str` | The model the call asked for. On Ollaya's native endpoint this is the *alias* the caller named — a router's `laya`, not the checkpoint that answered — so one field means one thing on every surface; the checkpoint is `NativeSystemOneResponse.routing.model` |
 | `answers` | `dict[str, Answer]` | Keyed by question id, in insertion order |
 | `usage` | `Usage` | Aggregated over every provider call and retry |
 | `reasoning` | `tuple[ReasoningContentPart, ...]` | Trace, in question order; see [reasoning.md](reasoning.md) |
 | `debug` | `dict[str, Any]` | Attempts and normalization notes; see below |
 
 `nouls`, `choices` and `scores` are cached properties returning `answers` filtered by answer type.
+
+### `NativeSystemOneResponse`
+
+Returned instead when the client was built with `native=True`, so the answers and usage above are the
+same response carrying Ollaya's report on the one request that answered it. It is a subclass, so code
+that reads a `SystemOneResponse` reads this one unchanged.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `routing` | `Routing` or `None` | A router's choice of checkpoint, or `None` when a model named directly answered |
+| `state_truncated` | `bool` | Whether part of the `state` was dropped to fit the model's context |
+| `done_reason` | `str` | `"decide"`, or `"load"`/`"unload"` |
+| `created_at` | `str` | When the endpoint produced the response, in the service's own timestamp format |
+| `total_duration` | `int` or `None` | Request to response, queueing included, in nanoseconds |
+| `load_duration` | `int` or `None` | Time spent waiting for the model to load; `0` when it was warm |
+| `eval_duration` | `int` or `None` | Tokenization, forward pass and calibration, in nanoseconds |
+
+Durations are the service's own nanoseconds, passed through as sent rather than converted, so a number
+read here can be compared with the service's own log. A reported `0` is kept as the measurement it is
+and only an absent field reads as `None`.
+
+```python
+Routing(router="laya:latest", model="laya:en", route="english", reason="English Latin text")
+LayaExtras(confidence=0.615, act_probability=1.0)
+```
+
+`route` is the stable key to branch on. `reason` is the router's own prose, which the service documents
+as informative and free to change in any release, so it is carried but never parsed. `LayaExtras` is the
+`laya` object `extras=["laya"]` puts on every answer: the model's own confidence, a different number
+computed by a different head from the `confidence` beside it, and `act_probability`, which is `None`
+for a model with no act head. It is `None` on every answer on every other surface.
 
 ```python
 Usage(input_tokens=None, output_tokens=None, reasoning_tokens=None, cached_tokens=None, n_calls=0, n_retries=0, latency=0.0)

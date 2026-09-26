@@ -335,10 +335,40 @@ def parse_question(question_id: str, raw: Question | Mapping[str, Any]) -> Quest
     return question
 
 
+class LayaExtras(BaseModel):
+    """Ollaya's own per-answer readout, added by ``extras=["laya"]`` on its native endpoint.
+
+    Namespaced under ``laya`` so it cannot be read as the ``confidence`` beside it: the two are
+    different numbers from different heads — this one is 1 − H(p)/ln K for a choice or a score and
+    max(p, 1 − p) for a noul. ``None`` on an answer means the request did not ask for it, which is
+    what every other surface sees, so nothing that reads a ``confidence`` changes meaning.
+    """
+
+    confidence: float = Field(ge=0.0, le=1.0)
+    act_probability: float | None = None
+    """Whether acting on this answer is appropriate, or ``None`` for a model with no act head — the
+    service reports the absence as null rather than omitting the number, and jevper says ``None``."""
+
+
+class Routing(BaseModel):
+    """Which checkpoint a router model chose, as ollaya's native endpoint reports it.
+
+    ``route`` is the stable key to branch on. ``reason`` is the router's own prose, which the service
+    documents as informative and free to change in any release, so it is carried but never parsed.
+    """
+
+    router: str
+    model: str
+    route: str
+    reason: str = ""
+
+
 class NoulAnswer(BaseModel):
     type: Literal["noul"] = "noul"
     noul: float
     """A regression output, so any real number is a score; only a non-number is not an answer."""
+    laya: LayaExtras | None = None
+    """Ollaya's own confidence, when its native endpoint was asked for it. ``None`` everywhere else."""
 
 
 class _Probability(BaseModel):
@@ -353,6 +383,8 @@ class _Probability(BaseModel):
 
     probabilities: dict[Any, float]
     confidence: float = Field(ge=0.0, le=1.0)
+    laya: LayaExtras | None = None
+    """Ollaya's own confidence, when its native endpoint was asked for it. ``None`` everywhere else."""
 
 
 class ChoiceAnswer(_Probability):
@@ -405,6 +437,33 @@ class SystemOneResponse(BaseModel):
     @functools.cached_property
     def scores(self) -> dict[str, ScoreAnswer]:
         return {key: answer for key, answer in self.answers.items() if isinstance(answer, ScoreAnswer)}
+
+
+class NativeSystemOneResponse(SystemOneResponse):
+    """A System One response from ollaya's native endpoint, which reports more than TypeSafe's.
+
+    Every field the native endpoint adds is additive, so the answers and the usage are the ones above
+    and this is that same response with the endpoint's own report beside them. ``model`` above stays
+    the name the caller asked for: on the wire it is the checkpoint that answered, and reading that
+    here instead would make one field mean two things across jevper's surfaces. The checkpoint is
+    ``routing.model``.
+
+    Durations are the service's own nanoseconds, passed through as sent rather than converted, so a
+    number read here is one that can be compared against the service's own log. ``None`` means the
+    endpoint reported nothing, which is what every other surface says about a field it has no value
+    for.
+    """
+
+    routing: Routing | None = None
+    """The router's decision, or ``None`` when a model named directly answered."""
+    state_truncated: bool = False
+    """Whether part of the state was dropped to fit the model's context."""
+    done_reason: str = "decide"
+    created_at: str = ""
+    """When the endpoint produced the response, in the service's own timestamp format."""
+    total_duration: int | None = None
+    load_duration: int | None = None
+    eval_duration: int | None = None
 
 
 class ModelMetadata(BaseModel):
