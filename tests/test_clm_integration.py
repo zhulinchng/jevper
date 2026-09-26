@@ -54,6 +54,7 @@ from fakes import async_openai_client, openai_client
 from jevper import (
     AsyncSystemOneClient,
     Choice,
+    ClientCapabilityError,
     InvalidQuestionError,
     JevperError,
     Noul,
@@ -292,13 +293,27 @@ def test_lifting_the_rule_lets_this_server_answer_it(stub_server):
 
 def test_temperature_reaches_this_server_where_it_sharpens_rather_than_samples(stub_server):
     """CLM's own field: it divides the logits before the softmax, so it flattens above 1 and
-    sharpens below. jevper has no typed field for it on this wire, and ``extra_body`` is where a
-    caller's own body goes."""
+    sharpens below. ``extra_body`` is where a caller's own body goes, and a key named there is the
+    value that reaches the wire."""
     stub = stub_server(systemone=answering(clm_body()))
 
     client(stub, extra_body={"temperature": 0.2}).system_one(state=STATE, questions=QUESTIONS)
 
     assert stub.requests[0]["temperature"] == 0.2
+
+
+def test_the_typed_temperature_is_refused_on_this_wire_rather_than_ignored(stub_server):
+    """The same field means one thing on the prompt surfaces — which token to sample — and something
+    else here, where it sets how decisive the distribution is. A typed option that silently did
+    nothing would leave a caller believing they had sharpened it, so jevper refuses it by name
+    instead; the test above is the way to reach the field.
+    """
+    stub = stub_server(systemone=answering(clm_body()))
+
+    with pytest.raises(ClientCapabilityError, match="this wire format takes none"):
+        client(stub).system_one(state=STATE, questions=QUESTIONS, temperature=0.2)
+
+    assert stub.requests == []
 
 
 def test_a_fastapi_error_body_reaches_the_caller_as_the_providers_own_sentence(stub_server):

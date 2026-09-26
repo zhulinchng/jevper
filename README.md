@@ -29,7 +29,7 @@ and the run's own timings. Both are measured in
 
 The same surface also reaches [CLM](https://github.com/Contrastive-LM/CLM), which serves the Jev wire
 format at `/v1/systemone` and `/v1/models` and needs no option jevper does not already have — its own
-documentation says a request written for the Jev format replays there unchanged. Its `temperature`
+documentation says "a request written for TypeSafe replays here unchanged". Its `temperature`
 sharpens a distribution rather than sampling, and its state is truncated at 2048 tokens without saying
 so, which is the one caveat worth reading before pointing a decision at it. Measured in
 [docs/local-servers.md](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md#clm-the-contrastive-decision-model).

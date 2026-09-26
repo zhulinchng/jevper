@@ -267,7 +267,13 @@ server being asked, not of the format.
 CLM's `temperature` is not a sampling parameter. It divides the logits *before* the softmax, so a value
 below 1 sharpens the distribution and one above 1 flattens it, within `(0, 100]`. The same field on a
 prompt surface picks a token; here it sets how decisive the model is allowed to be, and it is worth
-reaching deliberately. jevper has no typed option for it on this wire, so it goes in `extra_body`:
+reaching deliberately.
+
+jevper's own `temperature=` is **refused by name** on this wire rather than ignored:
+`ClientCapabilityError: api='systemone' cannot carry temperature=0.2 (this wire format takes none)`.
+That is the right way round — the field means one thing on the prompt surfaces and something else here,
+and an option that silently did nothing is worse than one that says so. `extra_body` is the way to name
+it, and a key there is the value that reaches the wire:
 
 ```python
 SystemOneClient(provider, model="clm-latest", api="systemone",
@@ -301,7 +307,8 @@ as the key when it is short and you want the answer to be readable on its own.
 CLM reports `usage.billing_units` — the number of *questions* — beside `input_tokens`, which counts
 encoder tokens spent on cache misses. jevper's `usage.n_calls` counts the *requests it made*, so one
 request that answered three questions reports `n_calls == 1` and not 3. Nothing is lost: the server's own
-count is in `response.debug`, and the two are different facts about the same call.
+count is in the recorded body, at `response.debug["llm_attempts"][0]["response"]["usage"]` — `debug` has
+no `usage` key of its own — and the two are different facts about the same call.
 
 ### The state is truncated silently, and nothing reports it
 
@@ -322,12 +329,12 @@ that part is not a risk — the token count is.
 with the encoder and the pooling it was trained against: **Qwen3-8B, last-token pooling**. A different
 backbone, a different pooling, or a quantized encoder produces embeddings the head was never fitted to,
 and the answers are then well-formed and wrong. That is what makes this server awkward to fit on a small
-card: Qwen3-8B in bf16 is roughly 16 GB of weights before anything else, so a 12 GB GPU cannot hold it
-at all, and the obvious workaround — quantizing the encoder — is the one thing that invalidates the
-numbers. Two further consequences worth stating plainly: CLM **only scores** the candidates it is given,
-so its probabilities are relative to that set, and the SOTA agentic numbers on its model page
-(DeepSWE 81.6%, Terminal-Bench 2.1 87.6%) come from fine-tuned heads rather than from this checkpoint
-zero-shot.
+card: Qwen3-8B in bf16 is about 16 GB of weights by arithmetic alone (8B parameters at two bytes each),
+so a 12 GB GPU cannot hold it at all, and the obvious workaround — quantizing the encoder — is the one
+thing that invalidates the numbers. Two further consequences worth stating plainly: CLM **only scores**
+the candidates it is given, so its probabilities are relative to that set, and the SOTA agentic numbers
+on its model page (DeepSWE 81.6%, Terminal-Bench 2.1 87.6%) come from fine-tuned heads rather than from
+this checkpoint zero-shot.
 
 ### Using a `CLMClient` you already have
 
@@ -340,7 +347,7 @@ System One surface is reached through two low-level methods, `post(path, body=�
 --8<-- "examples/clm_transport.py"
 ```
 
-Two caveats come from `CLMClient`'s own surface rather than from jevper, and both are in the file's
+Three caveats come from `CLMClient`'s own surface rather than from jevper, and all three are in the
 docstring. It needs the **private** `_post`, which is the only way to get a raw response body out of a
 `CLMClient` — its public `system_one()` answers dataclasses, and jevper reads the body as sent because the
 answers are the provider's numbers — so the recipe is tied to the `contrastive-lm` version you test it
