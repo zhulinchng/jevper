@@ -174,6 +174,34 @@ Completions. Six requests for three questions is three answers plus three probes
 in `debug["llm_attempts"]`; `usage.n_calls` counts the results, not the wire. vLLM, SGLang and LM Studio
 answer on the Responses route on the first try, so `auto` costs them nothing.
 
+### The output budget is bounded below by the thinking and above by the context window
+
+An 18-scenario edge matrix was run over all five servers at the end of 2026-09-26, against jevper
+0.7.8, and the one thing that needed tuning was the probe's own output budget. It is worth writing
+down because both ends of it are the server's, not jevper's.
+
+At **512** output tokens the always-thinking Qwen3 templates truncated before answering on nearly
+every scenario — `IncompleteAnswerError` on ollama, llama.cpp, vLLM, SGLang and LM Studio alike, which
+reads like a library fault and is not one. At **2048** that is gone on ollama and vLLM, and what
+remains on llama.cpp, SGLang and LM Studio is the thinking itself: `docs/reasoning.md` records that
+those templates ignore `enable_thinking: false`, so a thinking span is charged to the output budget.
+jevper's verdict is the useful one either way —
+`IncompleteAnswerError: the provider ran out of output tokens before the answer was complete
+('max_output_tokens')` — because it names the knob and the server's own reason.
+
+At **4096** the same three servers answer `400 Requested token count exceeds the model's maximum
+context length of 4096 tokens. You requested a total of 4237 tokens`. They are all launched with
+`--max-model-len 4096`, so a 4096-token *output* request leaves nothing for the prompt. 2048 is
+therefore the right budget for a 4096-token window, and the useful rule is the window's own: keep
+`max_output_tokens` well under `max_model_len`, and treat an `IncompleteAnswerError` naming
+`max_output_tokens` as "raise the budget, if the window allows it" rather than as a defect.
+
+The Messages scenarios `messages-budget-with-room` and `messages-thinking-temperature` refuse on vLLM
+and SGLang for the same reason and for one more: a thinking budget is added to the output budget,
+because that is Anthropic's rule — the budget must sit strictly below `max_tokens` — so a 2048 budget
+on top of a 2048 output request is 4096, which is the whole window. jevper cannot know a server's
+window, so the server's 400 arrives as a `ProviderError` carrying its own status and wording.
+
 ### Launching these three on a 12 GB card
 
 Measured on the RTX 3080 test box under WSL2, where vLLM's own free-memory query reports **10.84 of
