@@ -6,40 +6,10 @@
 
 The [Jev](https://docs.typesafe.ai) interface — `state` in, typed `questions` (`noul`, `choice`, `score`) out,
 `choice` and `score` answers carrying probabilities and confidence and a `noul` answer its `noul` — on top of
-any OpenAI-compatible model.
-
-The same call shape as `typesafe-sdk`, a different backend: point `jevper` at a hosted LLM or a self-hosted
-llama.cpp server and the `system_one(state=..., questions=...)` code reads the same, though the two packages
-are independent and neither imports the other.
-
-It does not depend on `typesafe-sdk` or `openai` at runtime — the client object is duck-typed. Any
-object exposing `responses.create` or `chat.completions.create` works, including a self-hosted
-llama.cpp server. With `api="systemone"` the same client object reaches the hosted Jev service instead:
-jevper posts the Jev request body to `/v1/systemone` and reads the Jev answer shapes back, and
-`list_models()` reads the service's model list. That path is measured in
-[docs/jev-comparison.md](https://github.com/zhulinchng/jevper/blob/main/docs/jev-comparison.md).
-
-That same surface reaches [Ollaya](https://github.com/ollaya-dev/ollaya), the open local server for
-decision models, whose `/v1` API is the Jev wire format and whose `GET /v1/models` returns the Jev
-model-list shape — so `list_models()` works there and does not against a gateway that answers that
-path its own way. Ollaya also serves a native `POST /api/decide`; `native=True` posts there and returns
-a `NativeSystemOneResponse` carrying which checkpoint a router chose, whether the state was truncated
-and the run's own timings. Both are measured in
-[docs/local-servers.md](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md#ollaya-the-decision-server).
-
-The same surface also reaches [CLM](https://github.com/Contrastive-LM/CLM), which serves the Jev wire
-format at `/v1/systemone` and `/v1/models` and needs no option jevper does not already have — its own
-documentation says "a request written for TypeSafe replays here unchanged". Its `temperature`
-sharpens a distribution rather than sampling, and its state is truncated at 2048 tokens without saying
-so, which is the one caveat worth reading before pointing a decision at it. Measured in
-[docs/local-servers.md](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md#clm-the-contrastive-decision-model).
-
-The `responses` surface speaks both OpenAI's Responses API and the [OpenResponses](https://www.openresponses.org)
-specification, and both live at the same `/v1/responses` path — the OpenResponses site lists LM Studio among
-the ecosystem's implementers, [vLLM says its route "aligns with" it](https://github.com/vllm-project/vllm/issues/32850)
-while extending it with fields of its own, and what each of the five
-local servers does with the fields jevper sends is measured in
-[docs/local-servers.md](docs/local-servers.md).
+any OpenAI-compatible model. The same `system_one(state=..., questions=...)` call reads the same against the
+hosted Jev endpoint, a self-hosted llama.cpp server, or `typesafe-sdk`'s own wire format, and the two packages
+are independent: neither imports the other, and jevper imports no provider SDK at all — any object exposing
+`responses.create`, `chat.completions.create` or `messages.create` works as the client.
 
 ```python
 from openai import OpenAI
@@ -69,9 +39,13 @@ answer.confidence    # 0.83
 
 `method` defaults to `auto`: it asks for logprobs where the provider has them and answers in JSON where it
 does not, remembering the verdict per model and surface. `gpt-5.6-terra` is a reasoning model and returns
-none, so the probabilities above arrive as JSON. Point `method="logprobs"` at a provider that does return
-them — a local ollama, llama.cpp or vLLM server, or a non-reasoning OpenAI model — to read the model's
-real distribution instead of its self-report.
+none, so the probabilities above arrive as JSON; point `method="logprobs"` at a provider that does return
+them — a local ollama, llama.cpp or vLLM server, or a non-reasoning OpenAI model — to read the model's real
+distribution instead of its self-report.
+
+The same call also reaches the hosted Jev endpoint, [Ollaya](docs/local-servers.md#ollaya-the-decision-server)
+and [CLM](docs/local-servers.md#clm-the-contrastive-decision-model) through `api="systemone"` — every surface
+and backend, measured per server, in [Backends and surfaces](#backends-and-surfaces).
 
 Every public option in one runnable program — the output budget per surface, async, and a client
 that is not an SDK — is in the [complete example](docs/complete-example.md).
@@ -240,6 +214,44 @@ Confidence is a share in `[0, 1]` and the call counters are counts, because jevp
 probabilities beside them are the model's own numbers on the `structured` path when
 `normalize_probabilities=False`. See [docs/api.md](https://github.com/zhulinchng/jevper/blob/main/docs/api.md)
 for the full reference.
+
+## Backends and surfaces
+
+`api=` names the wire format and the client method that carries it. Under `auto` jevper probes the object you
+passed in and takes the first of `responses.create`, `chat.completions.create`, `messages.create` it finds —
+so a plain `OpenAI()` answers over the Responses surface — and `systemone` is never chosen for you.
+
+| `api=` | Carried by | Reaches |
+| --- | --- | --- |
+| `chat_completions` | `chat.completions.create` | any OpenAI-compatible server, and the only surface that carries a `grammar` |
+| `responses` | `responses.create` | OpenAI's Responses API and the [OpenResponses](https://www.openresponses.org) specification, both served at `/v1/responses` |
+| `messages` | `messages.create` | the Anthropic Messages API — [Anthropic-compatible servers](#anthropic-compatible-servers) below |
+| `systemone` | `post(path=…, body=…, cast_to=…)` | the Jev wire format itself: the hosted endpoint, and the servers that serve it |
+
+The OpenResponses site lists LM Studio among the ecosystem's implementers, and
+[vLLM says its route "aligns with" the spec](https://github.com/vllm-project/vllm/issues/32850) while extending
+it with fields of its own; what each of the five local servers does with the fields jevper sends is measured
+in [docs/local-servers.md](docs/local-servers.md#the-openresponses-route).
+
+`api="systemone"` posts the Jev request body — `state`, `model`, `questions` — to `/systemone` relative to the
+client's base URL, so the base URL is the host, not the endpoint: `OpenAI(base_url="https://api.typesafe.ai/v1",
+api_key=…)` reaches the service, and passing the full endpoint doubles the path and 404s. `list_models()` reads
+`GET /models` through the same object, and needs a server that answers the Jev `{"models": [...]}` shape rather
+than a gateway's own. Measured in [docs/jev-comparison.md](docs/jev-comparison.md).
+
+**Ollaya** is an open local server for decision models whose `/v1` API is the Jev wire format, so
+`list_models()` works there. Its native `POST /api/decide` sits at the server root rather than under the
+version prefix, so it takes a second client pointed at the root: `native=True` with `api="systemone"` posts
+there and returns a `NativeSystemOneResponse` carrying `routing.model` — the checkpoint a router chose —
+`state_truncated`, and the run's own `total_duration`, `load_duration` and `eval_duration`. Measured in
+[docs/local-servers.md](docs/local-servers.md#ollaya-the-decision-server).
+
+**CLM** serves that same wire format at `/v1/systemone` and `/v1/models`, and nothing had to be added to reach
+it. Two caveats, both measured: its `temperature` divides the logits before the softmax, so it sharpens or
+flattens a distribution rather than sampling — jevper refuses `temperature=` on this surface and
+`extra_body={"temperature": n}` is the way in — and on its documented vLLM encoder it truncates the state at
+2048 tokens without saying so, where a llama.cpp encoder refuses the state instead. See
+[docs/local-servers.md](docs/local-servers.md#clm-the-contrastive-decision-model).
 
 ## Prompt caching
 
