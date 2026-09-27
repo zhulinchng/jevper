@@ -456,12 +456,21 @@ client = SystemOneClient(
 )
 ```
 
-Install and serve:
+!!! warning "PyPI name collision"
 
-```bash
-pip install kev
-python -m kev.serve --run jaredpalmer/kev-4b --port 8009
-```
+    `pip install kev` installs a **different package** — [K.E.V. ORM](https://pypi.org/project/kev/)
+    (Brian Jinwright, 2016-2021), a key-value store ORM. This project is **not** published to PyPI.
+
+    Install from source instead:
+
+    ```bash
+    git clone https://github.com/jaredpalmer/kev.git && cd kev
+    pip install -e ".[serve]"
+    python -m kev.serve --run jaredpalmer/kev-4b --port 8009
+    ```
+
+    See [jaredpalmer/kev#159](https://github.com/jaredpalmer/kev/issues/159) and
+    [PR #160](https://github.com/jaredpalmer/kev/pull/160) for the upstream fix.
 
 The first run downloads the adapter and base model from HuggingFace. Kev-4B is the recommended starting
 point; Kev-0.8B runs on a laptop, Kev-9B needs a bigger GPU, Kev-27B needs an 80 GB card. The server
