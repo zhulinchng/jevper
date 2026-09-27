@@ -4,8 +4,10 @@ kev (https://github.com/jaredpalmer/kev) is a family of small decision models
 built on Qwen3.5/Qwen3.8. Its API matches TypeSafe's System One exactly, so
 jevper's `api="systemone"` surface works against it unchanged.
 
-Start a kev server first:
-    pip install kev
+Start a kev server first (note: pip install kev is a different package —
+install from source):
+    git clone https://github.com/jaredpalmer/kev.git && cd kev
+    pip install -e ".[serve]"
     python -m kev.serve --run jaredpalmer/kev-4b --port 8009
 
 Then run this example:
