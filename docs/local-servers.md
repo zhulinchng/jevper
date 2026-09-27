@@ -438,6 +438,78 @@ usage fields, the error body) is a property of the wire and was checked against 
 for real. `tests/test_clm_integration.py` pins all of it without a GPU, and one test in it runs against a
 live `clm-serve` when `CLM_BASE_URL` is set.
 
+## kev, the open decision model
+
+[kev](https://github.com/jaredpalmer/kev) is a family of small decision models built on Qwen3.5/Qwen3.8,
+created by Jared Palmer (the creator of shadcn/ui). Its API matches TypeSafe's System One exactly —
+`POST /v1/systemone` and `GET /v1/models` are the same shapes — so kev is reached through the surface
+jevper already has, with no change to the library:
+
+```python
+from openai import OpenAI
+from jevper import SystemOneClient
+
+client = SystemOneClient(
+    OpenAI(base_url="http://127.0.0.1:8009/v1", api_key="local"),
+    model="kev-latest",
+    api="systemone",
+)
+```
+
+Install and serve:
+
+```bash
+pip install kev
+python -m kev.serve --run jaredpalmer/kev-4b --port 8009
+```
+
+The first run downloads the adapter and base model from HuggingFace. Kev-4B is the recommended starting
+point; Kev-0.8B runs on a laptop, Kev-9B needs a bigger GPU, Kev-27B needs an 80 GB card. The server
+binds to `127.0.0.1` by default; use `--host 0.0.0.0` to accept other machines.
+
+### What kev's wire format looks like
+
+kev's request and response shapes are identical to TypeSafe's System One. The three question types
+(`noul`, `choice`, `score`) and the three answer types match field-for-field. What is kev's own:
+
+* **Model names**: `kev-latest` (calibrated, the default) and `jev-latest` (raw probabilities). Both
+  serve the same checkpoint; the difference is whether the fitted temperature is applied.
+* **Noul answer**: `{type, noul}` — no confidence, no distribution. The probability of yes.
+* **Choice answer**: `{type, choice, confidence, probabilities}`. Confidence is
+  `(p_max - 1/K) / (1 - 1/K)`, matching TypeSafe's reference adapter.
+* **Score answer**: `{type, score, confidence, legend, probabilities}`. Probabilities and legend are
+  keyed by `str(level)` (JSON object keys are text); jevper reads them back as integer indices.
+* **Usage**: `{input_tokens, output_tokens}` — no `billing_units` field (unlike CLM).
+* **Response**: includes `latency_ms` (server-side model time), which jevper does not read.
+* **Bare noul**: accepted, like CLM and Ollaya. Use `noul_requires_question=False` to lift jevper's
+  own refusal.
+* **Errors**: FastAPI `{"detail": ...}` body, same as CLM.
+* **Auth**: open by default. Set `KEV_API_KEY` to require `Authorization: Bearer <key>`.
+
+### What to pass
+
+| Server | `base_url` | `model` | Notes |
+| --- | --- | --- | --- |
+| kev | `http://127.0.0.1:8009/v1` | `kev-latest` or `jev-latest` | Both routes under `/v1`; `list_models()` works. No `native=True` — kev has no separate native endpoint. `noul_requires_question=False` for bare nouls. No `extra_body` needed — kev's wire format takes no extra fields. |
+
+### What was measured, and on what
+
+**Measured 2026-09-27** against kev 0.1.0 serving Kev-4B on the remote box (RTX 3080 12 GB, CPU-only
+for kev to leave the GPU to CLM). The wire shapes, answer parsing, model listing, error handling,
+and bare-noul behaviour were all verified through jevper's `SystemOneClient` and raw HTTP. The
+*numbers* that came back are Kev-4B's predictions and are not accuracy figures — they are recorded
+as evidence that the integration works, not as a benchmark.
+
+`tests/test_kev_integration.py` pins the stub tests (16 tests, no GPU needed) and three live tests
+that run when `KEV_BASE_URL` is set:
+
+```bash
+KEV_BASE_URL=http://127.0.0.1:8009/v1 KEV_MODEL=kev-latest pytest tests/test_kev_integration.py
+```
+
+The live tests check that kev answers three typed questions in one request, that `usage.n_calls`
+counts requests (not tokens), and that a bare noul is answered when the rule is lifted.
+
 ## What to pass per server
 
 | Server | `base_url` | `model` | Thinking off | Notes |
@@ -447,6 +519,7 @@ live `clm-serve` when `CLM_BASE_URL` is set.
 | vLLM | `http://127.0.0.1:8000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; its `top_logprobs` limit is configured by `--max-logprobs` |
 | SGLang | `http://127.0.0.1:30000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; its Responses logprob readout needed `top_logprobs` explicitly. jevper sends it for `logprobs` and `grammar`, but not for `structured` or `discrete` |
 | LM Studio | `http://127.0.0.1:1234/v1` | the id `lms ls` prints, e.g. `qwen3-4b-instruct-2507` | nothing does — load a non-thinking model | all three surfaces on one box, as do the other four now; `logprobs` arrives on both OpenAI surfaces; its Responses route accepts `text.format` and ignores it, so structured answers belong on Chat Completions |
+| kev | `http://127.0.0.1:8009/v1` | `kev-latest` or `jev-latest` | nothing — kev's wire format takes no extra fields | both routes under `/v1`; `list_models()` works. No `native=True` — kev has no separate native endpoint. `noul_requires_question=False` for bare nouls. No `extra_body` needed |
 
 All five answered the Anthropic Messages route (`/v1/messages`) in the recorded run, but that route needs the
 `anthropic` client and `api="messages"`; an OpenAI client does not expose it for `api="auto"` discovery.
